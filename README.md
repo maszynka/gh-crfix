@@ -1,4 +1,6 @@
-# gh fix
+# gh-crfix
+
+> https://github.com/maszynka/gh-crfix
 
 Hybrid GitHub PR review fixer — automatically addresses unresolved review comments using deterministic triage + AI.
 
