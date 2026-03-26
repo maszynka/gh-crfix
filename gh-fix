@@ -1,0 +1,1821 @@
+#!/usr/bin/env bash
+# gh fix — hybrid PR review fixer
+#
+# Strategy:
+#   1) deterministic triage
+#   2) optional repo-local autofix hook
+#   3) Haiku gate decides whether advanced model is needed
+#   4) Sonnet/Opus only for residual hard cases
+#   5) post-fix review cycle + merge base branch
+#   6) TUI dashboard for parallel mode
+#
+# Usage:
+#   gh fix 123
+#   gh fix 123-126
+#   gh fix [123,125,130]
+#   gh fix https://github.com/owner/repo/pull/123
+#   gh fix https://github.com/owner/repo/pull/93-95
+#   gh fix https://github.com/owner/repo/pull/[93,94,95]
+#
+# Flags:
+#   -c N, --concurrency N        max parallel PR workers (default: 3)
+#   --seq                        same as -c 1
+#   --no-tui                     disable TUI dashboard (plain output)
+#   --no-post-fix                skip post-fix review cycle
+#   --setup-only                 only setup worktrees + collect triage
+#   --no-resolve                 do not resolve GitHub threads
+#   --include-outdated           include outdated unresolved threads in triage
+#   --gate-model MODEL           small model for gate (default: haiku)
+#   --fix-model MODEL            advanced model for actual fixing (default: sonnet)
+#   --max-threads N              max threads fetched per PR (default: 100)
+#   --autofix-hook PATH          repo-local deterministic autofix script
+#   --no-autofix                 skip autofix hook even if present
+#   --resolve-skipped            also resolve skipped threads
+#   --dry-run                    no writes to GitHub, no Claude fix run
+#   -h, --help
+#
+# Env:
+#   GH_FIX_DIR                 override local repo path
+#   GH_FIX_REVIEW_WAIT         seconds to wait for re-review (default: 90)
+#   GH_FIX_GATE_MODEL          gate model override
+#   GH_FIX_FIX_MODEL           fix model override
+
+set -euo pipefail
+
+WORKTREE_SUBDIR=".gh-fix/worktrees"
+OWNER_REPO=""
+PR_NUMBERS=""
+CONCURRENCY=3
+SETUP_ONLY=false
+NO_RESOLVE=false
+NO_TUI=false
+NO_POST_FIX=false
+INCLUDE_OUTDATED=false
+GATE_MODEL="${GH_FIX_GATE_MODEL:-haiku}"
+FIX_MODEL="${GH_FIX_FIX_MODEL:-sonnet}"
+MAX_THREADS=100
+AUTO_FIX_HOOK=""
+NO_AUTOFIX=false
+RESOLVE_SKIPPED=false
+DRY_RUN=false
+REVIEW_WAIT_SECS="${GH_FIX_REVIEW_WAIT:-90}"
+LOG_DIR=""
+SEMAPHORE=""
+BG_PIDS=""
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+note() { echo "[$(date +%H:%M:%S)] $*" >&2; }
+
+json_escape() {
+  jq -Rs . <<< "${1:-}"
+}
+
+# ── tiny fs kv ───────────────────────────────────────────────────────────────
+
+kv_set()    { mkdir -p "$LOG_DIR/kv"; printf '%s' "$3" > "$LOG_DIR/kv/${1}__${2}"; }
+kv_get()    { cat "$LOG_DIR/kv/${1}__${2}" 2>/dev/null || true; }
+kv_append() { mkdir -p "$LOG_DIR/kv"; echo "$2" >> "$LOG_DIR/kv/list__${1}"; }
+kv_list()   { cat "$LOG_DIR/kv/list__${1}" 2>/dev/null || true; }
+
+# ── usage ────────────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<'EOF'
+gh fix — hybrid PR review fixer (triage + gate + TUI + conflict resolution + post-fix)
+
+Usage:
+  gh fix <url>            single PR
+  gh fix <url-range>      range   e.g. .../pull/93-95
+  gh fix <url-list>       list    e.g. .../pull/[93,94,95]
+  gh fix <number>         uses current repo
+  gh fix <n1>-<n2>        uses current repo
+  gh fix <n1>,<n2>,<n3>   uses current repo
+
+Flags:
+  -c N, --concurrency N        max parallel PR workers (default: 3)
+  --seq                        sequential mode (same as -c 1)
+  --no-tui                     disable TUI dashboard (plain output)
+  --no-post-fix                skip post-fix review cycle (wait + merge master)
+  --setup-only                 only setup worktrees + collect triage
+  --no-resolve                 do not resolve GitHub threads
+  --include-outdated           include outdated unresolved threads
+  --gate-model MODEL           small model for gate (default: haiku)
+  --fix-model MODEL            advanced model for fixing (default: sonnet)
+  --max-threads N              max threads fetched per PR (default: 100)
+  --autofix-hook PATH          deterministic repo-local autofix script
+  --no-autofix                 disable autofix hook
+  --resolve-skipped            also resolve skipped threads
+  --dry-run                    do not mutate GitHub or push commits
+
+Flow:
+  1. Setup      — fetch PR info, create worktrees, merge base branch,
+                  get review threads, deterministic triage (sequential)
+  2. Autofix    — run repo-local autofix hook if available
+  3. Gate       — ask Haiku gate if advanced model is needed
+  4. Fix        — run Sonnet only if gate says yes
+                  TUI dashboard shows live progress (parallel mode)
+  5. Resolve    — reply to threads, mark resolved, request Copilot re-review
+  6. Post-fix   — wait for re-review; if no new comments: merge base branch,
+                  add PR comment, request final re-review
+  7. Report     — print per-PR summary
+
+Repo autofix discovery:
+  - --autofix-hook PATH
+  - .gh-fix/autofix.sh
+  - scripts/gh-fix-autofix.sh
+
+Worktrees: <repo>/.gh-fix/worktrees/pr-{number}
+
+Env vars:
+  GH_FIX_DIR            force the local repo path (auto-detected otherwise)
+  GH_FIX_REVIEW_WAIT    seconds to wait for re-review (default: 90)
+  GH_FIX_GATE_MODEL     gate model override (default: haiku)
+  GH_FIX_FIX_MODEL      fix model override (default: sonnet)
+EOF
+}
+
+# ── parse args ───────────────────────────────────────────────────────────────
+
+parse_flags() {
+  local args=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -c|--concurrency)
+        shift; CONCURRENCY="${1:?missing value for -c}"
+        case "$CONCURRENCY" in *[!0-9]*) die "-c requires a number" ;; esac
+        [ "$CONCURRENCY" -ge 1 ] || die "-c must be >= 1"
+        ;;
+      --seq) CONCURRENCY=1 ;;
+      --no-tui) NO_TUI=true ;;
+      --no-post-fix) NO_POST_FIX=true ;;
+      --setup-only) SETUP_ONLY=true ;;
+      --no-resolve) NO_RESOLVE=true ;;
+      --include-outdated) INCLUDE_OUTDATED=true ;;
+      --gate-model) shift; GATE_MODEL="${1:?missing value}" ;;
+      --fix-model) shift; FIX_MODEL="${1:?missing value}" ;;
+      --max-threads)
+        shift; MAX_THREADS="${1:?missing value}"
+        case "$MAX_THREADS" in *[!0-9]*) die "--max-threads requires a number" ;; esac
+        [ "$MAX_THREADS" -ge 1 ] || die "--max-threads must be >= 1"
+        ;;
+      --autofix-hook) shift; AUTO_FIX_HOOK="${1:?missing value}" ;;
+      --no-autofix) NO_AUTOFIX=true ;;
+      --resolve-skipped) RESOLVE_SKIPPED=true ;;
+      --dry-run) DRY_RUN=true ;;
+      -h|--help) usage; exit 0 ;;
+      *) args="${args:+$args }$1" ;;
+    esac
+    shift
+  done
+
+  [ -n "$args" ] || { usage; exit 0; }
+  parse_input "$args"
+}
+
+# ── parse input ──────────────────────────────────────────────────────────────
+
+parse_input() {
+  local input="$1"
+  local pr_part
+
+  if echo "$input" | grep -qE 'github\.com/'; then
+    OWNER_REPO="$(echo "$input" | sed -E 's|.*github\.com/([^/]+/[^/]+)/pull/.*|\1|')"
+    pr_part="$(echo "$input" | sed -E 's|.*github\.com/[^/]+/[^/]+/pull/||; s|/$||')"
+  else
+    OWNER_REPO=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null) \
+      || die "Not inside a GitHub repo and no URL given."
+    pr_part="$(echo "$input" | sed 's|/$||')"
+  fi
+
+  pr_part="$(echo "$pr_part" | sed 's/^\[//; s/\]$//')"
+
+  if echo "$pr_part" | grep -qE '^[0-9]+-[0-9]+$'; then
+    local s="${pr_part%-*}" e="${pr_part#*-}" i
+    PR_NUMBERS=""
+    i="$s"
+    while [ "$i" -le "$e" ]; do
+      PR_NUMBERS="${PR_NUMBERS:+$PR_NUMBERS }$i"
+      i=$((i + 1))
+    done
+  elif echo "$pr_part" | grep -qE '^[0-9]+(,[0-9]+)+$'; then
+    PR_NUMBERS="$(echo "$pr_part" | tr ',' ' ')"
+  elif echo "$pr_part" | grep -qE '^[0-9]+$'; then
+    PR_NUMBERS="$pr_part"
+  else
+    die "Cannot parse PR number(s) from: $pr_part"
+  fi
+}
+
+# ── repo discovery ───────────────────────────────────────────────────────────
+
+find_local_repo() {
+  local owner_repo="$1"
+
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    local remote
+    remote=$(git remote get-url origin 2>/dev/null || true)
+    if echo "$remote" | grep -q "$owner_repo"; then
+      git rev-parse --show-toplevel
+      return 0
+    fi
+  fi
+
+  if [ -n "${GH_FIX_DIR:-}" ]; then
+    echo "$GH_FIX_DIR"
+    return 0
+  fi
+
+  local dir
+  for dir in "$HOME/projects" "$HOME/code" "$HOME/dev" "$HOME/work" "$HOME"; do
+    [ -d "$dir" ] || continue
+    while IFS= read -r git_dir; do
+      local repo_dir remote
+      repo_dir="$(dirname "$git_dir")"
+      remote=$(git -C "$repo_dir" remote get-url origin 2>/dev/null || true)
+      if echo "$remote" | grep -q "$owner_repo"; then
+        echo "$repo_dir"
+        return 0
+      fi
+    done < <(find "$dir" -maxdepth 4 -name ".git" -type d 2>/dev/null)
+  done
+
+  die "Cannot find local clone of $owner_repo. Set GH_FIX_DIR=/path/to/repo."
+}
+
+# ── autofix hook detection ───────────────────────────────────────────────────
+
+detect_autofix_hook() {
+  local repo_dir="$1"
+
+  if [ "$NO_AUTOFIX" = true ]; then
+    echo ""
+    return 0
+  fi
+
+  if [ -n "$AUTO_FIX_HOOK" ]; then
+    echo "$AUTO_FIX_HOOK"
+    return 0
+  fi
+
+  if [ -x "$repo_dir/.gh-fix/autofix.sh" ]; then
+    echo "$repo_dir/.gh-fix/autofix.sh"
+    return 0
+  fi
+
+  if [ -x "$repo_dir/scripts/gh-fix-autofix.sh" ]; then
+    echo "$repo_dir/scripts/gh-fix-autofix.sh"
+    return 0
+  fi
+
+  echo ""
+}
+
+run_autofix_hook() {
+  local worktree_path="$1" hook="$2" log_file="$3"
+
+  [ -n "$hook" ] || return 0
+  [ -x "$hook" ] || return 0
+
+  {
+    echo "[autofix] running: $hook"
+    (cd "$worktree_path" && "$hook")
+    echo "[autofix] done"
+  } >> "$log_file" 2>&1 || {
+    echo "[autofix] hook failed (continuing)" >> "$log_file"
+    return 0
+  }
+}
+
+# ── worktree setup ───────────────────────────────────────────────────────────
+
+setup_worktree() {
+  local pr_num="$1" repo_dir="$2" branch="$3"
+  local worktree_path="$repo_dir/$WORKTREE_SUBDIR/pr-$pr_num"
+
+  mkdir -p "$repo_dir/$WORKTREE_SUBDIR"
+
+  if git -C "$repo_dir" worktree list --porcelain | grep -qxF "worktree $worktree_path"; then
+    git -C "$worktree_path" fetch origin "$branch" --quiet 2>/dev/null || true
+    git -C "$worktree_path" checkout "$branch" >/dev/null 2>&1 || true
+    git -C "$worktree_path" pull --rebase origin "$branch" --quiet 2>/dev/null || true
+    echo "$worktree_path"
+    return 0
+  fi
+
+  local existing_wt
+  existing_wt=$(git -C "$repo_dir" worktree list --porcelain \
+    | awk -v b="$branch" '/^worktree /{wt=$2} /^branch refs\/heads\//{if($2=="refs/heads/"b) print wt}')
+
+  if [ -n "$existing_wt" ]; then
+    git -C "$existing_wt" fetch origin "$branch" --quiet 2>/dev/null || true
+    git -C "$existing_wt" pull --rebase origin "$branch" --quiet 2>/dev/null || true
+    echo "$existing_wt"
+    return 0
+  fi
+
+  git -C "$repo_dir" fetch origin "$branch" --quiet 2>/dev/null || true
+  if git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$branch"; then
+    git -C "$repo_dir" worktree add "$worktree_path" "$branch" >/dev/null 2>&1
+  else
+    git -C "$repo_dir" worktree add "$worktree_path" \
+      --track -b "$branch" "origin/$branch" >/dev/null 2>&1
+  fi
+  echo "$worktree_path"
+}
+
+# ── GitHub API helpers ───────────────────────────────────────────────────────
+
+get_unresolved_threads() {
+  local owner_repo="$1" pr_number="$2"
+  local owner="${owner_repo%%/*}"
+  local repo="${owner_repo##*/}"
+  local filter
+
+  if [ "$INCLUDE_OUTDATED" = true ]; then
+    filter='[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)]'
+  else
+    filter='[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false and .isOutdated == false)]'
+  fi
+
+  gh api graphql -f query='
+    query($owner: String!, $repo: String!, $pr: Int!, $threads: Int!) {
+      repository(owner: $owner, name: $repo) {
+        pullRequest(number: $pr) {
+          reviewThreads(first: $threads) {
+            nodes {
+              id
+              isResolved
+              isOutdated
+              line
+              path
+              comments(first: 20) {
+                nodes {
+                  id
+                  body
+                  path
+                  line
+                  originalLine
+                  author { login }
+                  createdAt
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ' -F owner="$owner" -F repo="$repo" -F pr="$pr_number" -F threads="$MAX_THREADS" \
+    --jq "$filter"
+}
+
+reply_to_thread() {
+  local thread_id="$1" body="$2"
+  [ "$DRY_RUN" = true ] && return 0
+
+  gh api graphql -f query='
+    mutation($threadId: ID!, $body: String!) {
+      addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $threadId, body: $body}) {
+        comment { id }
+      }
+    }
+  ' -F threadId="$thread_id" -F body="$body" --silent
+}
+
+resolve_thread() {
+  local thread_id="$1"
+  [ "$DRY_RUN" = true ] && return 0
+
+  gh api graphql -f query='
+    mutation($threadId: ID!) {
+      resolveReviewThread(input: {threadId: $threadId}) {
+        thread { isResolved }
+      }
+    }
+  ' -F threadId="$thread_id" --silent
+}
+
+request_copilot_review() {
+  local pr_num="$1"
+  [ "$DRY_RUN" = true ] && return 0
+  gh api --method POST "/repos/$OWNER_REPO/pulls/$pr_num/requested_reviewers" \
+    -f 'reviewers[]=Copilot' >/dev/null 2>&1 || true
+}
+
+pr_comment() {
+  local pr_num="$1" body="$2"
+  [ "$DRY_RUN" = true ] && return 0
+  gh pr comment "$pr_num" --repo "$OWNER_REPO" --body "$body" >/dev/null 2>&1 || true
+}
+
+# ── deterministic triage ─────────────────────────────────────────────────────
+
+comment_text_for_thread() {
+  local thread_json="$1"
+  jq -r '
+    [
+      .comments.nodes[]?.body // empty
+    ] | join("\n---\n")
+  ' <<< "$thread_json"
+}
+
+thread_primary_path() {
+  local thread_json="$1"
+  jq -r '.comments.nodes[0].path // .path // ""' <<< "$thread_json"
+}
+
+thread_primary_line() {
+  local thread_json="$1"
+  jq -r '.comments.nodes[0].line // .comments.nodes[0].originalLine // .line // 0' <<< "$thread_json"
+}
+
+thread_last_created_at() {
+  local thread_json="$1"
+  jq -r '[.comments.nodes[]?.createdAt] | map(select(. != null)) | last // ""' <<< "$thread_json"
+}
+
+file_changed_after_comment() {
+  local worktree_path="$1" file="$2" ts="$3"
+  [ -n "$file" ] || return 1
+  [ -f "$worktree_path/$file" ] || return 1
+  [ -n "$ts" ] || return 1
+  git -C "$worktree_path" log --since="$ts" --format='%H' -- "$file" 2>/dev/null | head -1 | grep -q .
+}
+
+is_question_only() {
+  local text="$1"
+  local compact
+  compact="$(echo "$text" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')"
+
+  echo "$compact" | grep -qiE '(could you|can you|why|what about|do we need|is this intentional|question|clarify)' || return 1
+  echo "$compact" | grep -qE '\?$' || return 1
+  echo "$compact" | grep -qiE '(rename|change|fix|remove|add|use|should|must|please|nit:|typo|format|lint)' && return 1
+  return 0
+}
+
+is_simple_mechanical() {
+  local text="$1"
+  echo "$text" | grep -qiE \
+    '(nit:|typo|spelling|grammar|format|formatting|prettier|eslint|lint|import order|unused import|sort imports|whitespace|newline|changelog|snapshot|generated file|docs?)'
+}
+
+is_non_actionable() {
+  local text="$1"
+  echo "$text" | grep -qiE '(lgtm|looks good|thanks|nice|great catch fixed\?|resolved\?)'
+}
+
+classify_one_thread() {
+  local worktree_path="$1" thread_json="$2"
+  local id path line text created
+  id="$(jq -r '.id' <<< "$thread_json")"
+  path="$(thread_primary_path "$thread_json")"
+  line="$(thread_primary_line "$thread_json")"
+  text="$(comment_text_for_thread "$thread_json")"
+  created="$(thread_last_created_at "$thread_json")"
+
+  local reason="needs semantic review"
+  local decision="needs_llm"
+
+  if [ "$(jq -r '.isOutdated' <<< "$thread_json")" = "true" ] && [ "$INCLUDE_OUTDATED" = false ]; then
+    decision="skip"
+    reason="outdated thread"
+  elif [ -z "$path" ]; then
+    decision="skip"
+    reason="missing file path"
+  elif is_non_actionable "$text"; then
+    decision="skip"
+    reason="non-actionable comment"
+  elif is_question_only "$text"; then
+    decision="skip"
+    reason="question-only thread"
+  elif [ ! -e "$worktree_path/$path" ]; then
+    decision="skip"
+    reason="file no longer exists in worktree"
+  elif file_changed_after_comment "$worktree_path" "$path" "$created"; then
+    if is_simple_mechanical "$text"; then
+      decision="already_likely_fixed"
+      reason="file changed after comment and issue looks mechanical"
+    fi
+  elif is_simple_mechanical "$text"; then
+    decision="auto"
+    reason="mechanical/simple comment"
+  fi
+
+  jq -n \
+    --arg id "$id" \
+    --arg path "$path" \
+    --argjson line "${line:-0}" \
+    --arg decision "$decision" \
+    --arg reason "$reason" \
+    --arg body "$text" \
+    '{
+      thread_id: $id,
+      path: $path,
+      line: $line,
+      decision: $decision,
+      reason: $reason,
+      body: $body
+    }'
+}
+
+triage_threads() {
+  local worktree_path="$1" threads_file="$2" out_file="$3"
+
+  local tmp="$LOG_DIR/triage.tmp.jsonl"
+  : > "$tmp"
+
+  local count i
+  count="$(jq 'length' < "$threads_file")"
+  i=0
+  while [ "$i" -lt "$count" ]; do
+    local one
+    one="$(jq -c ".[$i]" < "$threads_file")"
+    classify_one_thread "$worktree_path" "$one" >> "$tmp"
+    i=$((i + 1))
+  done
+
+  jq -s '
+    {
+      all: .,
+      skip: [ .[] | select(.decision == "skip") ],
+      auto: [ .[] | select(.decision == "auto") ],
+      already_likely_fixed: [ .[] | select(.decision == "already_likely_fixed") ],
+      needs_llm: [ .[] | select(.decision == "needs_llm") ]
+    }
+  ' "$tmp" > "$out_file"
+}
+
+# ── Haiku gate ───────────────────────────────────────────────────────────────
+
+gate_schema() {
+  cat <<'JSON'
+{
+  "type": "object",
+  "properties": {
+    "needs_advanced_model": { "type": "boolean" },
+    "reason": { "type": "string" },
+    "threads_to_fix": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "required": ["needs_advanced_model", "reason", "threads_to_fix"],
+  "additionalProperties": false
+}
+JSON
+}
+
+build_gate_prompt() {
+  local owner_repo="$1" pr_num="$2" triage_file="$3"
+
+  local auto_ct skip_ct fixed_ct llm_ct
+  auto_ct="$(jq '.auto | length' < "$triage_file")"
+  skip_ct="$(jq '.skip | length' < "$triage_file")"
+  fixed_ct="$(jq '.already_likely_fixed | length' < "$triage_file")"
+  llm_ct="$(jq '.needs_llm | length' < "$triage_file")"
+
+  cat <<EOF
+You are a tiny gating model for PR review comment automation.
+
+Goal:
+Decide whether an advanced coding model is needed at all.
+
+Rules:
+- Be conservative about cost, but do NOT request advanced model unless necessary.
+- If remaining threads are clearly non-actionable, already addressed, or better left unresolved for human discussion, say false.
+- If remaining threads likely require real code changes, semantic understanding, refactoring, or merge/conflict reasoning, say true.
+- Output ONLY valid JSON matching the schema.
+
+Context:
+Repo: $owner_repo
+PR: #$pr_num
+
+Deterministic triage summary:
+- skipped: $skip_ct
+- auto/mechanical: $auto_ct
+- already_likely_fixed: $fixed_ct
+- residual needs_llm candidates: $llm_ct
+
+Residual candidate threads:
+$(jq -r '
+  .needs_llm[]
+  | "Thread ID: \(.thread_id)\nFile: \(.path)\nLine: \(.line)\nReason: \(.reason)\nBody:\n\(.body)\n---"
+' < "$triage_file")
+
+Return:
+{
+  "needs_advanced_model": true|false,
+  "reason": "short explanation",
+  "threads_to_fix": ["thread-id-1", "thread-id-2"]
+}
+
+If zero residual candidates, return false and empty array.
+EOF
+}
+
+run_gate_model() {
+  local owner_repo="$1" pr_num="$2" triage_file="$3" out_file="$4" log_file="$5"
+  local prompt_file="$LOG_DIR/gate-$pr_num.txt"
+  local schema_file="$LOG_DIR/gate-$pr_num.schema.json"
+
+  build_gate_prompt "$owner_repo" "$pr_num" "$triage_file" > "$prompt_file"
+  gate_schema > "$schema_file"
+
+  {
+    echo "[gate] model=$GATE_MODEL"
+    if ! claude -p \
+      --model "$GATE_MODEL" \
+      --output-format json \
+      --json-schema "$(cat "$schema_file")" \
+      "$(cat "$prompt_file")" > "$out_file"; then
+      echo "[gate] failed; fallback to needs_advanced_model=true"
+      jq -n \
+        --arg reason "gate model failed" \
+        '{needs_advanced_model: true, reason: $reason, threads_to_fix: []}' > "$out_file"
+    fi
+    echo "[gate] result: $(cat "$out_file")"
+  } >> "$log_file" 2>&1
+}
+
+# ── advanced fixer ───────────────────────────────────────────────────────────
+
+build_fix_prompt() {
+  local owner_repo="$1" pr_num="$2" threads_file="$3" selected_file="$4"
+
+  cat <<EOF
+You are fixing a SMALL selected subset of unresolved PR review threads.
+
+Repo: $owner_repo
+PR: #$pr_num
+
+Rules:
+1. Read CLAUDE.md first if present.
+2. Only work on the selected threads below.
+3. Prefer minimal, correct changes.
+4. Skip threads that truly do not require code changes.
+5. If you edit files, stage, commit, and push.
+6. Write thread-responses.json in repo root with one entry for each selected thread:
+   [
+     {
+       "thread_id": "PRRT_xxx",
+       "action": "fixed|skipped|already_fixed",
+       "comment": "Concise explanation"
+     }
+   ]
+7. Do NOT include threads outside the selected set.
+8. If no code changes are needed, still write thread-responses.json.
+
+Selected thread IDs:
+$(cat "$selected_file")
+
+Selected thread details:
+$(jq -r --slurpfile ids "$selected_file" '
+  def selected($idlist): ($idlist[0] | split("\n") | map(select(length > 0)));
+  .[]
+  | select(.id as $id | (selected($ids) | index($id)))
+  | "Thread ID: \(.id)\nFile: \(.comments.nodes[0].path // .path // "unknown")\nLine: \(.comments.nodes[0].line // .comments.nodes[0].originalLine // .line // "unknown")\nComments:\n" +
+    ([.comments.nodes[] | "  @\(.author.login): \(.body)"] | join("\n")) + "\n---"
+' < "$threads_file")
+
+When done:
+- git status
+- if changed: git add -A && git commit -m "fix: address PR #$pr_num review comments" && git push
+- print short summary
+EOF
+}
+
+run_fix_model() {
+  local owner_repo="$1" pr_num="$2" worktree_path="$3" threads_file="$4" selected_file="$5" log_file="$6"
+  local prompt_file="$LOG_DIR/fix-$pr_num.txt"
+
+  build_fix_prompt "$owner_repo" "$pr_num" "$threads_file" "$selected_file" > "$prompt_file"
+
+  {
+    echo "[fix] model=$FIX_MODEL"
+    echo "[fix] selected threads:"
+    cat "$selected_file"
+    echo ""
+
+    if ! (cd "$worktree_path" && claude -p --model "$FIX_MODEL" --dangerously-skip-permissions "$(cat "$prompt_file")"); then
+      echo "[fix] FAILED"
+      return 1
+    fi
+    echo "[fix] done"
+  } >> "$log_file" 2>&1
+}
+
+# ── reply / resolve ──────────────────────────────────────────────────────────
+
+reply_and_resolve_from_responses() {
+  local responses_file="$1"
+  local resolved=0 replied=0 skipped=0
+
+  [ -f "$responses_file" ] || return 0
+  jq -e '.' "$responses_file" >/dev/null 2>&1 || return 0
+
+  local n i
+  n="$(jq 'length' < "$responses_file")"
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    local tid action comment
+    tid="$(jq -r ".[$i].thread_id // empty" < "$responses_file")"
+    action="$(jq -r ".[$i].action // empty" < "$responses_file")"
+    comment="$(jq -r ".[$i].comment // empty" < "$responses_file")"
+
+    [ -n "$tid" ] || { i=$((i + 1)); continue; }
+
+    if [ -n "$comment" ]; then
+      reply_to_thread "$tid" "$comment" && replied=$((replied + 1))
+    fi
+
+    case "$action" in
+      fixed|already_fixed)
+        resolve_thread "$tid" && resolved=$((resolved + 1))
+        ;;
+      skipped)
+        if [ "$RESOLVE_SKIPPED" = true ]; then
+          resolve_thread "$tid" && resolved=$((resolved + 1))
+        else
+          skipped=$((skipped + 1))
+        fi
+        ;;
+      *)
+        skipped=$((skipped + 1))
+        ;;
+    esac
+
+    i=$((i + 1))
+  done
+
+  echo "replied=$replied resolved=$resolved unresolved_skipped=$skipped"
+}
+
+write_deterministic_responses() {
+  local triage_file="$1" out_file="$2"
+
+  jq '
+    [
+      (.already_likely_fixed[]? | {
+        thread_id: .thread_id,
+        action: "already_fixed",
+        comment: ("Likely already addressed: " + .reason + ".")
+      }),
+      (.skip[]? | {
+        thread_id: .thread_id,
+        action: "skipped",
+        comment: ("Skipped automatically: " + .reason + ".")
+      })
+    ]
+  ' < "$triage_file" > "$out_file"
+}
+
+# ── conflict resolution ──────────────────────────────────────────────────────
+
+merge_base_branch() {
+  local pr_num="$1" worktree_path="$2" log_file="$3"
+  local base_branch
+  base_branch=$(gh pr view "$pr_num" --repo "$OWNER_REPO" --json baseRefName -q '.baseRefName' 2>/dev/null || echo "master")
+
+  {
+    echo "[merge] merging origin/$base_branch"
+    git -C "$worktree_path" fetch origin "$base_branch" --quiet 2>/dev/null || true
+    if git -C "$worktree_path" merge "origin/$base_branch" --no-edit -q 2>/dev/null; then
+      git -C "$worktree_path" push --quiet 2>/dev/null || true
+      echo "[merge] clean"
+      return 0
+    fi
+
+    echo "[merge] conflicts — auto-resolving..."
+    local conflicted
+    conflicted=$(git -C "$worktree_path" diff --name-only --diff-filter=U || true)
+
+    local file
+    while IFS= read -r file; do
+      [ -n "$file" ] || continue
+      case "$file" in
+        *.lock|*-lock.yaml|*-lock.json|*.tsbuildinfo|.github/.auto-fix-iterations)
+          git -C "$worktree_path" checkout --theirs "$file" 2>/dev/null
+          git -C "$worktree_path" add "$file" 2>/dev/null
+          echo "[merge] auto-resolve $file (theirs)" ;;
+        .github/workflows/*|.github/docs/*|CHANGELOG.md)
+          git -C "$worktree_path" checkout --ours "$file" 2>/dev/null
+          git -C "$worktree_path" add "$file" 2>/dev/null
+          echo "[merge] auto-resolve $file (ours)" ;;
+      esac
+    done <<< "$conflicted"
+
+    local remaining
+    remaining=$(git -C "$worktree_path" diff --name-only --diff-filter=U || true)
+    if [ -z "$remaining" ]; then
+      git -C "$worktree_path" commit --no-edit >/dev/null 2>&1
+      git -C "$worktree_path" push --quiet 2>/dev/null || true
+      echo "[merge] auto-resolved"
+      return 0
+    fi
+
+    if [ "$DRY_RUN" = true ]; then
+      git -C "$worktree_path" merge --abort 2>/dev/null || true
+      echo "[merge] dry-run: skipping LLM resolution"
+      return 1
+    fi
+
+    echo "[merge] $remaining — using Claude..."
+    local prompt="Resolve merge conflicts in: $remaining
+Keep both sides where possible. PR branch (ours/HEAD) takes priority.
+After resolving: git add each file, git commit --no-edit, git push."
+
+    if (cd "$worktree_path" && claude --dangerously-skip-permissions -p "$prompt" < /dev/null 2>&1 | tail -10); then
+      remaining=$(git -C "$worktree_path" diff --name-only --diff-filter=U || true)
+      [ -z "$remaining" ] && { echo "[merge] LLM resolved"; return 0; }
+    fi
+
+    git -C "$worktree_path" merge --abort 2>/dev/null || true
+    echo "[merge] could not resolve — aborted"
+    return 1
+  } >> "$log_file" 2>&1
+}
+
+# ── post-fix cycle + summary ─────────────────────────────────────────────────
+
+post_fix_summary() {
+  local pr_num="$1" triage_file="$2" responses_file="$3" log_file="$4"
+  [ "$DRY_RUN" = true ] && return 0
+
+  {
+    local skip_ct auto_ct fixed_ct llm_ct total_ct resolved
+    skip_ct="$(jq '.skip | length' < "$triage_file")"
+    auto_ct="$(jq '.auto | length' < "$triage_file")"
+    fixed_ct="$(jq '.already_likely_fixed | length' < "$triage_file")"
+    llm_ct="$(jq '.needs_llm | length' < "$triage_file")"
+    total_ct="$(jq '.all | length' < "$triage_file")"
+    resolved=0
+    [ -f "$responses_file" ] && resolved=$(jq '[.[] | select(.action == "fixed" or .action == "already_fixed")] | length' < "$responses_file" 2>/dev/null || echo "0")
+
+    printf -v body '%s\n' \
+      "🤖 **gh fix** — Fix Summary" "" \
+      "| Stage | Count |" "|-------|-------|" \
+      "| Total threads | $total_ct |" \
+      "| Skipped (deterministic) | $skip_ct |" \
+      "| Already likely fixed | $fixed_ct |" \
+      "| Auto/mechanical | $auto_ct |" \
+      "| Sent to LLM | $llm_ct |" \
+      "| Resolved | $resolved |"
+
+    pr_comment "$pr_num" "$body"
+    echo "[summary] posted"
+  } >> "$log_file" 2>&1
+}
+
+post_fix_review_cycle() {
+  local pr_num="$1" worktree_path="$2" fixed_count="$3" log_file="$4"
+  [ "$NO_POST_FIX" = true ] || [ "$DRY_RUN" = true ] && return 0
+
+  {
+    echo "[post-fix] waiting ${REVIEW_WAIT_SECS}s..."
+    sleep "$REVIEW_WAIT_SECS"
+
+    local new_threads new_count
+    new_threads="$(get_unresolved_threads "$OWNER_REPO" "$pr_num")"
+    new_count="$(echo "$new_threads" | jq 'length')"
+
+    if [ "$new_count" -eq 0 ]; then
+      echo "[post-fix] no new comments"
+      pr_comment "$pr_num" "🤖 **gh fix**: All $fixed_count comments addressed. No new issues after re-review."
+      merge_base_branch "$pr_num" "$worktree_path" "$log_file" || true
+      request_copilot_review "$pr_num"
+      echo "[post-fix] done"
+    else
+      echo "[post-fix] $new_count new comment(s)"
+      pr_comment "$pr_num" "🤖 **gh fix**: Fixed $fixed_count comments, but $new_count new issue(s) raised. Run again to address."
+    fi
+  } >> "$log_file" 2>&1
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TUI — Terminal dashboard for parallel mode
+# ══════════════════════════════════════════════════════════════════════════════
+
+SPINNER_FRAMES="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+SPINNER_IDX=0
+TUI_SELECTED=0
+TUI_VIEW="dashboard"     # dashboard | detail
+TUI_DETAIL_SCROLL=0       # scroll offset in detail view
+TUI_READY_LIST=""          # cached ready PR list
+TUI_READY_COUNT=0
+TUI_RUNNING=true
+
+# Get status of a PR: queued | running | done | failed
+pr_status() {
+  local pr_num="$1"
+  if [ -f "$LOG_DIR/pr-${pr_num}.status" ]; then
+    local s
+    s="$(cat "$LOG_DIR/pr-${pr_num}.status")"
+    if [ "$s" = "OK" ]; then echo "done"; else echo "failed"; fi
+  elif [ -f "$LOG_DIR/pr-${pr_num}.started" ]; then
+    echo "running"
+  else
+    echo "queued"
+  fi
+}
+
+# Elapsed time formatted as M:SS
+pr_elapsed() {
+  local pr_num="$1"
+  local start_file="$LOG_DIR/pr-${pr_num}.started"
+  if [ ! -f "$start_file" ]; then echo "    "; return; fi
+  local start now elapsed mins secs
+  start="$(cat "$start_file")"
+  now="$(date +%s)"
+  elapsed=$((now - start))
+  mins=$((elapsed / 60))
+  secs=$((elapsed % 60))
+  printf '%d:%02d' "$mins" "$secs"
+}
+
+# Get last non-empty line from log
+pr_last_line() {
+  local pr_num="$1" max_width="${2:-80}"
+  local log_file="$LOG_DIR/pr-${pr_num}.log"
+  if [ ! -f "$log_file" ]; then echo ""; return; fi
+  local line
+  line="$(tail -20 "$log_file" 2>/dev/null | grep -v '^$' | tail -1)"
+  # Truncate to width
+  if [ ${#line} -gt "$max_width" ]; then
+    line="${line:0:$((max_width - 1))}…"
+  fi
+  echo "$line"
+}
+
+# Get N-th PR number from ready list (0-indexed)
+pr_at_index() {
+  local idx="$1" i=0
+  for pr in $TUI_READY_LIST; do
+    if [ "$i" -eq "$idx" ]; then echo "$pr"; return; fi
+    i=$((i + 1))
+  done
+}
+
+# ── TUI: terminal input ─────────────────────────────────────────────────────
+# Open a dedicated fd for the terminal to avoid stdin conflicts
+TTY_FD=""
+tui_open_tty() {
+  exec 4</dev/tty
+  TTY_FD=4
+  # Set terminal to raw-ish mode on the tty
+  stty -echo -icanon min 0 time 0 </dev/tty 2>/dev/null || true
+}
+tui_close_tty() {
+  stty echo icanon </dev/tty 2>/dev/null || true
+  exec 4<&- 2>/dev/null || true
+  TTY_FD=""
+}
+
+# Read one keypress (non-blocking, ~0.4s timeout via loop)
+tui_read_key() {
+  local key=""
+  # Use the dedicated tty fd
+  IFS= read -rsn1 -t 1 key <&4 2>/dev/null || true
+
+  if [ -z "$key" ]; then
+    # Timeout — no input
+    echo ""
+    return
+  fi
+
+  # ESC character (decimal 27)
+  local esc_char
+  esc_char="$(printf '\033')"
+
+  if [ "$key" = "$esc_char" ]; then
+    # Read rest of escape sequence — arrow keys send ESC [ A/B/C/D
+    local c1="" c2=""
+    IFS= read -rsn1 -t 1 c1 <&4 2>/dev/null || true
+    IFS= read -rsn1 -t 1 c2 <&4 2>/dev/null || true
+    case "${c1}${c2}" in
+      '[A') echo "UP" ;;
+      '[B') echo "DOWN" ;;
+      *)    echo "ESC" ;;
+    esac
+  elif [ "$key" = "q" ] || [ "$key" = "Q" ]; then
+    echo "QUIT"
+  elif [ "$key" = "" ]; then
+    echo "ENTER"
+  else
+    echo "$key"
+  fi
+}
+
+# ANSI escape helpers — inline codes for buffered rendering (no tput calls)
+RST=$'\033[0m'
+BOLD=$'\033[1m'
+CLR=$'\033[K'       # clear to end of line
+c_yellow=$'\033[33m'
+c_green=$'\033[32m'
+c_red=$'\033[31m'
+c_gray=$'\033[90m'
+c_white=$'\033[37m'
+
+spinner_char() {
+  local simple_frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  local idx=$((SPINNER_IDX % 10))
+  echo "${simple_frames[$idx]}"
+}
+
+# ── TUI: render dashboard (buffered — single write) ─────────────────────────
+
+tui_render_dashboard() {
+  local cols rows
+  cols=$(tput cols 2>/dev/null || echo 80)
+  rows=$(tput lines 2>/dev/null || echo 24)
+
+  local buf=""
+  buf="${buf}\033[H"  # cursor home
+
+  # Count states
+  local n_running=0 n_done=0 n_failed=0 n_queued=0
+  for pr in $TUI_READY_LIST; do
+    case "$(pr_status "$pr")" in
+      running) n_running=$((n_running + 1)) ;;
+      done)    n_done=$((n_done + 1)) ;;
+      failed)  n_failed=$((n_failed + 1)) ;;
+      queued)  n_queued=$((n_queued + 1)) ;;
+    esac
+  done
+
+  # Header
+  local spin
+  spin="$(spinner_char)"
+  buf="${buf}  ${BOLD}gh fix${RST}  │  "
+  [ "$n_running" -gt 0 ] && buf="${buf}${c_yellow}${spin} ${n_running} running${RST}  "
+  [ "$n_done" -gt 0 ]    && buf="${buf}${c_green}✓ ${n_done} done${RST}  "
+  [ "$n_failed" -gt 0 ]  && buf="${buf}${c_red}✗ ${n_failed} failed${RST}  "
+  [ "$n_queued" -gt 0 ]  && buf="${buf}${c_gray}◌ ${n_queued} queued${RST}  "
+  buf="${buf}${CLR}\n"
+
+  # Separator
+  local sep=""
+  local si=0
+  while [ "$si" -lt "$cols" ]; do sep="${sep}─"; si=$((si + 1)); done
+  buf="${buf}${c_gray}${sep}${RST}\n"
+
+  # PR list
+  local idx=0
+  local title_max=$((cols - 38))
+  [ "$title_max" -lt 10 ] && title_max=10
+  local row_count=2  # header + separator
+
+  for pr in $TUI_READY_LIST; do
+    local status elapsed title tc icon color_code
+    status="$(pr_status "$pr")"
+    elapsed="$(pr_elapsed "$pr")"
+    title="$(kv_get "$pr" title)"
+    tc="$(kv_get "$pr" thread_count)"
+
+    if [ ${#title} -gt "$title_max" ]; then
+      title="${title:0:$((title_max - 1))}…"
+    fi
+
+    case "$status" in
+      running) icon="$spin"; color_code="$c_yellow" ;;
+      done)    icon="✓";     color_code="$c_green" ;;
+      failed)  icon="✗";     color_code="$c_red" ;;
+      queued)  icon="◌";     color_code="$c_gray" ;;
+    esac
+
+    if [ "$idx" -eq "$TUI_SELECTED" ]; then
+      buf="${buf} ${BOLD}▸ ${color_code}${icon}${RST} ${BOLD}#${pr}${RST}"
+    else
+      buf="${buf}   ${color_code}${icon}${RST}  #${pr}"
+    fi
+
+    # Pad PR number
+    local pr_len=${#pr}
+    local pad_needed=$((4 - pr_len))
+    local pi=0
+    while [ "$pi" -lt "$pad_needed" ]; do buf="${buf} "; pi=$((pi + 1)); done
+
+    buf="${buf}  $(printf '%5s' "$elapsed")  $(printf '%2s' "$tc") threads  "
+    buf="${buf}${color_code}${title}${RST}${CLR}\n"
+
+    idx=$((idx + 1))
+    row_count=$((row_count + 1))
+  done
+
+  buf="${buf}\n"
+  row_count=$((row_count + 1))
+
+  # Preview separator
+  local sel_pr
+  sel_pr="$(pr_at_index "$TUI_SELECTED")"
+  local preview_hdr=" ─── #${sel_pr} preview "
+  local hdr_len=${#preview_hdr}
+  local rest=""
+  local ri="$hdr_len"
+  while [ "$ri" -lt "$cols" ]; do rest="${rest}─"; ri=$((ri + 1)); done
+  buf="${buf}${c_gray}${preview_hdr}${rest}${RST}\n"
+  row_count=$((row_count + 1))
+
+  # Preview: last N lines
+  local preview_rows=$((rows - row_count - 2))
+  [ "$preview_rows" -lt 3 ] && preview_rows=3
+  local log_file="$LOG_DIR/pr-${sel_pr}.log"
+
+  if [ -f "$log_file" ]; then
+    local preview_content
+    preview_content="$(tail -"$preview_rows" "$log_file" 2>/dev/null)"
+    local lc=0
+    while IFS= read -r line; do
+      if [ ${#line} -gt "$((cols - 4))" ]; then
+        line="${line:0:$((cols - 5))}…"
+      fi
+      buf="${buf}  ${c_white}${line}${RST}${CLR}\n"
+      lc=$((lc + 1))
+    done <<EOF
+$preview_content
+EOF
+    # Fill remaining preview rows
+    while [ "$lc" -lt "$preview_rows" ]; do
+      buf="${buf}${CLR}\n"
+      lc=$((lc + 1))
+    done
+  else
+    buf="${buf}  ${c_gray}(waiting...)${RST}${CLR}\n"
+    local lc=1
+    while [ "$lc" -lt "$preview_rows" ]; do
+      buf="${buf}${CLR}\n"
+      lc=$((lc + 1))
+    done
+  fi
+
+  # Footer (position at last row)
+  buf="${buf}\033[$((rows));1H"
+  buf="${buf}  ${c_gray}↑↓ navigate  ⏎ full log  q quit${RST}${CLR}"
+
+  # Single write
+  printf '%b' "$buf"
+}
+
+# ── TUI: render detail view (buffered — single write) ────────────────────────
+
+tui_render_detail() {
+  local cols rows
+  cols=$(tput cols 2>/dev/null || echo 80)
+  rows=$(tput lines 2>/dev/null || echo 24)
+
+  local sel_pr
+  sel_pr="$(pr_at_index "$TUI_SELECTED")"
+  local title="$(kv_get "$sel_pr" title)"
+  local status="$(pr_status "$sel_pr")"
+  local elapsed="$(pr_elapsed "$sel_pr")"
+
+  local buf=""
+  buf="${buf}\033[H"  # cursor home
+
+  local status_icon status_color
+  case "$status" in
+    running) status_icon="$(spinner_char)"; status_color="$c_yellow" ;;
+    done)    status_icon="✓"; status_color="$c_green" ;;
+    failed)  status_icon="✗"; status_color="$c_red" ;;
+    queued)  status_icon="◌"; status_color="$c_gray" ;;
+  esac
+
+  # Header
+  buf="${buf}  ${BOLD}PR #${sel_pr}${RST} — ${title}  "
+  buf="${buf}${status_color}[${status_icon} ${status} ${elapsed}]${RST}${CLR}\n"
+
+  # Separator
+  local sep=""
+  local si=0
+  while [ "$si" -lt "$cols" ]; do sep="${sep}─"; si=$((si + 1)); done
+  buf="${buf}${c_gray}${sep}${RST}\n"
+
+  # Log content
+  local content_rows=$((rows - 4))
+  local log_file="$LOG_DIR/pr-${sel_pr}.log"
+  local total_lines=0
+
+  if [ -f "$log_file" ]; then
+    total_lines=$(wc -l < "$log_file" | tr -d ' ')
+  fi
+
+  local max_scroll=$((total_lines - content_rows))
+  [ "$max_scroll" -lt 0 ] && max_scroll=0
+
+  if [ "$TUI_DETAIL_SCROLL" -ge "$((max_scroll - 2))" ] || [ "$TUI_DETAIL_SCROLL" -eq -1 ]; then
+    TUI_DETAIL_SCROLL=$max_scroll
+  fi
+
+  local skip="$TUI_DETAIL_SCROLL"
+  [ "$skip" -lt 0 ] && skip=0
+
+  local displayed=0
+  if [ -f "$log_file" ]; then
+    local line_num=0
+    while IFS= read -r line; do
+      line_num=$((line_num + 1))
+      if [ "$line_num" -le "$skip" ]; then continue; fi
+      if [ "$displayed" -ge "$content_rows" ]; then break; fi
+
+      if [ ${#line} -gt "$((cols - 2))" ]; then
+        line="${line:0:$((cols - 3))}…"
+      fi
+
+      buf="${buf} ${line}${CLR}\n"
+      displayed=$((displayed + 1))
+    done < "$log_file"
+  fi
+
+  while [ "$displayed" -lt "$content_rows" ]; do
+    buf="${buf}${CLR}\n"
+    displayed=$((displayed + 1))
+  done
+
+  # Footer
+  buf="${buf}\033[$((rows));1H"
+  buf="${buf}  ${c_gray}↑↓ scroll  Esc/q back  "
+  if [ "$total_lines" -gt 0 ]; then
+    local pct=$(( (skip + content_rows) * 100 / (total_lines + 1) ))
+    [ "$pct" -gt 100 ] && pct=100
+    buf="${buf}[${skip}/${total_lines} lines  ${pct}%%]"
+  fi
+  buf="${buf}${RST}${CLR}"
+
+  printf '%b' "$buf"
+}
+
+# ── TUI: check if all jobs are done ─────────────────────────────────────────
+
+tui_all_done() {
+  for pr in $TUI_READY_LIST; do
+    local s
+    s="$(pr_status "$pr")"
+    if [ "$s" = "running" ] || [ "$s" = "queued" ]; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+# ── TUI: main loop ──────────────────────────────────────────────────────────
+
+tui_loop() {
+  TUI_READY_LIST="$1"
+  TUI_READY_COUNT=0
+  for _ in $TUI_READY_LIST; do TUI_READY_COUNT=$((TUI_READY_COUNT + 1)); done
+
+  # Init terminal
+  TUI_ACTIVE=true
+  tui_open_tty
+  tput smcup    # alternate screen buffer
+  tput civis    # hide cursor
+  tput clear
+
+  TUI_DETAIL_SCROLL=-1  # -1 = follow tail
+
+  while true; do
+    SPINNER_IDX=$((SPINNER_IDX + 1))
+
+    # Render
+    if [ "$TUI_VIEW" = "dashboard" ]; then
+      tui_render_dashboard
+    else
+      tui_render_detail
+    fi
+
+    # Read input
+    local key
+    key="$(tui_read_key)"
+
+    case "$TUI_VIEW" in
+      dashboard)
+        case "$key" in
+          UP)
+            TUI_SELECTED=$((TUI_SELECTED - 1))
+            [ "$TUI_SELECTED" -lt 0 ] && TUI_SELECTED=$((TUI_READY_COUNT - 1))
+            ;;
+          DOWN)
+            TUI_SELECTED=$((TUI_SELECTED + 1))
+            [ "$TUI_SELECTED" -ge "$TUI_READY_COUNT" ] && TUI_SELECTED=0
+            ;;
+          ENTER)
+            TUI_VIEW="detail"
+            TUI_DETAIL_SCROLL=-1
+            tput clear
+            ;;
+          QUIT)
+            if tui_all_done; then
+              break
+            fi
+            # Show "jobs still running" hint in footer
+            ;;
+        esac
+        ;;
+      detail)
+        case "$key" in
+          UP)
+            TUI_DETAIL_SCROLL=$((TUI_DETAIL_SCROLL - 3))
+            [ "$TUI_DETAIL_SCROLL" -lt 0 ] && TUI_DETAIL_SCROLL=0
+            ;;
+          DOWN)
+            TUI_DETAIL_SCROLL=$((TUI_DETAIL_SCROLL + 3))
+            ;;
+          QUIT|ESC)
+            TUI_VIEW="dashboard"
+            tput clear
+            ;;
+        esac
+        ;;
+    esac
+
+    # Auto-exit when all done (after small delay for final render)
+    if tui_all_done && [ "$TUI_VIEW" = "dashboard" ]; then
+      # One more render to show final state
+      SPINNER_IDX=$((SPINNER_IDX + 1))
+      tui_render_dashboard
+      sleep 1
+      break
+    fi
+  done
+
+  # Cleanup terminal
+  TUI_ACTIVE=false
+  tui_close_tty
+  tput cnorm    # show cursor
+  tput rmcup    # restore screen
+}
+
+# ── setup phase (sequential) ─────────────────────────────────────────────────
+
+setup_all() {
+  local repo_dir="$1"
+  local autofix_hook
+  autofix_hook="$(detect_autofix_hook "$repo_dir")"
+  kv_set global autofix_hook "$autofix_hook"
+
+  for pr_num in $PR_NUMBERS; do
+    echo ""
+    echo "━━━ PR #$pr_num ━━━"
+
+    local pr_json
+    pr_json=$(gh pr view "$pr_num" --repo "$OWNER_REPO" \
+      --json headRefName,title,state,isDraft 2>/dev/null) \
+      || { echo "  ⚠ not found — skipping"; kv_append skipped "$pr_num"; continue; }
+
+    local branch title state is_draft
+    branch=$(echo "$pr_json" | jq -r '.headRefName')
+    title=$(echo "$pr_json" | jq -r '.title')
+    state=$(echo "$pr_json" | jq -r '.state')
+    is_draft=$(echo "$pr_json" | jq -r '.isDraft')
+
+    local state_label="$state"
+    [ "$is_draft" = "true" ] && state_label="DRAFT"
+
+    echo "  Title : $title"
+    echo "  Branch: $branch"
+    echo "  State : $state_label"
+
+    kv_set "$pr_num" title "$title"
+    kv_set "$pr_num" branch "$branch"
+
+    if [ "$state" != "OPEN" ]; then
+      echo "  ⚠ PR is $state — skipping"
+      kv_append skipped "$pr_num"
+      continue
+    fi
+
+    local worktree_path
+    worktree_path="$(setup_worktree "$pr_num" "$repo_dir" "$branch")"
+    kv_set "$pr_num" worktree "$worktree_path"
+
+    local log_file="$LOG_DIR/pr-$pr_num.log"
+    : > "$log_file"
+
+    if [ "$SETUP_ONLY" = true ]; then
+      echo "  → cd $worktree_path"
+      kv_append skipped "$pr_num"
+      continue
+    fi
+
+    # Merge base branch before fixing (resolve conflicts first)
+    merge_base_branch "$pr_num" "$worktree_path" "$log_file" || true
+
+    echo "  Fetching unresolved threads..."
+    local threads_json threads_file triage_file thread_count residual_count
+    threads_json="$(get_unresolved_threads "$OWNER_REPO" "$pr_num")"
+    thread_count="$(echo "$threads_json" | jq 'length')"
+    threads_file="$LOG_DIR/pr-$pr_num-threads.json"
+    triage_file="$LOG_DIR/pr-$pr_num-triage.json"
+
+    echo "$threads_json" > "$threads_file"
+
+    if [ "$thread_count" -eq 0 ]; then
+      echo "  ✓ No unresolved threads"
+      kv_append skipped "$pr_num"
+      continue
+    fi
+
+    triage_threads "$worktree_path" "$threads_file" "$triage_file"
+    residual_count="$(jq '.needs_llm | length' < "$triage_file")"
+
+    kv_set "$pr_num" threads_file "$threads_file"
+    kv_set "$pr_num" triage_file "$triage_file"
+    kv_set "$pr_num" thread_count "$thread_count"
+    kv_set "$pr_num" residual_count "$residual_count"
+
+    echo "  Threads total      : $thread_count"
+    echo "  deterministic skip : $(jq '.skip | length' < "$triage_file")"
+    echo "  auto/mechanical    : $(jq '.auto | length' < "$triage_file")"
+    echo "  already-likely-fix : $(jq '.already_likely_fixed | length' < "$triage_file")"
+    echo "  residual needs llm : $residual_count"
+
+    kv_append ready "$pr_num"
+  done
+}
+
+# ── process_pr (parallel mode — writes to log_file) ─────────────────────────
+
+process_pr() {
+  local pr_num="$1"
+  local title worktree_path threads_file triage_file log_file hook
+  title="$(kv_get "$pr_num" title)"
+  worktree_path="$(kv_get "$pr_num" worktree)"
+  threads_file="$(kv_get "$pr_num" threads_file)"
+  triage_file="$(kv_get "$pr_num" triage_file)"
+  hook="$(kv_get global autofix_hook)"
+  log_file="$LOG_DIR/pr-$pr_num.log"
+
+  # Signal start
+  date +%s > "$LOG_DIR/pr-${pr_num}.started"
+
+  {
+    echo "━━━ PR #$pr_num ━━━ [$title]"
+    echo "worktree: $worktree_path"
+    echo "gate model: $GATE_MODEL"
+    echo "fix model : $FIX_MODEL"
+    echo ""
+
+    # 1. Write deterministic responses
+    local deterministic_responses="$LOG_DIR/pr-$pr_num-deterministic-responses.json"
+    write_deterministic_responses "$triage_file" "$deterministic_responses"
+
+    # 2. Run autofix hook
+    run_autofix_hook "$worktree_path" "$hook" "$log_file"
+
+    # 3. Run gate model
+    local gate_out="$LOG_DIR/pr-$pr_num-gate.json"
+    run_gate_model "$OWNER_REPO" "$pr_num" "$triage_file" "$gate_out" "$log_file"
+
+    local needs_advanced
+    needs_advanced="$(jq -r '.needs_advanced_model' < "$gate_out" 2>/dev/null || echo "true")"
+
+    local selected_file="$LOG_DIR/pr-$pr_num-selected.txt"
+    jq -r '.threads_to_fix[]?' < "$gate_out" > "$selected_file" || true
+
+    # 4. If gate says yes -> run fix model
+    if [ "$needs_advanced" = "true" ]; then
+      if [ ! -s "$selected_file" ]; then
+        jq -r '.needs_llm[]?.thread_id' < "$triage_file" > "$selected_file"
+      fi
+
+      if [ "$DRY_RUN" = true ]; then
+        echo "[dry-run] would run advanced model on:"
+        cat "$selected_file"
+      else
+        run_fix_model "$OWNER_REPO" "$pr_num" "$worktree_path" "$threads_file" "$selected_file" "$log_file"
+      fi
+    else
+      echo "[gate] advanced model not needed"
+    fi
+
+    # 5. Merge deterministic + LLM responses
+    local combined="$LOG_DIR/pr-$pr_num-thread-responses.json"
+    local model_responses="$worktree_path/thread-responses.json"
+
+    if [ -f "$model_responses" ] && jq -e '.' "$model_responses" >/dev/null 2>&1; then
+      jq -s 'add' "$deterministic_responses" "$model_responses" > "$combined"
+    else
+      cp "$deterministic_responses" "$combined"
+    fi
+
+    # 6. Reply and resolve
+    if [ "$NO_RESOLVE" = false ]; then
+      echo "[resolve] replying/resolving"
+      echo "[resolve] $(reply_and_resolve_from_responses "$combined")"
+    else
+      echo "[resolve] skipped by flag"
+    fi
+
+    # 7. Post-fix summary
+    post_fix_summary "$pr_num" "$triage_file" "$combined" "$log_file"
+
+    # 8. Request Copilot re-review
+    if [ "$DRY_RUN" = false ]; then
+      echo "[review] requesting Copilot re-review"
+      request_copilot_review "$pr_num"
+    fi
+
+    # 9. Post-fix review cycle
+    local fixed_count
+    fixed_count="$(jq '[.[] | select(.action == "fixed" or .action == "already_fixed")] | length' < "$combined" 2>/dev/null || echo "0")"
+    post_fix_review_cycle "$pr_num" "$worktree_path" "$fixed_count" "$log_file"
+
+    # 10. Write status
+    echo "[done]"
+    echo "OK" > "$LOG_DIR/pr-$pr_num.status"
+  } >> "$log_file" 2>&1 || {
+    echo "FAIL" > "$LOG_DIR/pr-$pr_num.status"
+    return 0
+  }
+}
+
+# ── process_pr_sequential — same as process_pr but streams to stdout ─────────
+
+process_pr_sequential() {
+  local pr_num="$1"
+  local title worktree_path threads_file triage_file log_file hook
+  title="$(kv_get "$pr_num" title)"
+  worktree_path="$(kv_get "$pr_num" worktree)"
+  threads_file="$(kv_get "$pr_num" threads_file)"
+  triage_file="$(kv_get "$pr_num" triage_file)"
+  hook="$(kv_get global autofix_hook)"
+  log_file="$LOG_DIR/pr-$pr_num.log"
+
+  date +%s > "$LOG_DIR/pr-${pr_num}.started"
+
+  echo ""
+  echo "━━━ PR #$pr_num ━━━  [$title]"
+  echo "  Worktree  : $worktree_path"
+  echo "  Gate model: $GATE_MODEL"
+  echo "  Fix model : $FIX_MODEL"
+  echo ""
+
+  # 1. Write deterministic responses
+  local deterministic_responses="$LOG_DIR/pr-$pr_num-deterministic-responses.json"
+  write_deterministic_responses "$triage_file" "$deterministic_responses"
+  echo "  deterministic responses written"
+
+  # 2. Run autofix hook
+  if [ -n "$hook" ] && [ -x "$hook" ]; then
+    echo "  Running autofix hook: $hook"
+    run_autofix_hook "$worktree_path" "$hook" "$log_file"
+  fi
+
+  # 3. Run gate model
+  echo "  Running gate model ($GATE_MODEL)..."
+  local gate_out="$LOG_DIR/pr-$pr_num-gate.json"
+  run_gate_model "$OWNER_REPO" "$pr_num" "$triage_file" "$gate_out" "$log_file"
+
+  local needs_advanced
+  needs_advanced="$(jq -r '.needs_advanced_model' < "$gate_out" 2>/dev/null || echo "true")"
+
+  local selected_file="$LOG_DIR/pr-$pr_num-selected.txt"
+  jq -r '.threads_to_fix[]?' < "$gate_out" > "$selected_file" || true
+
+  # 4. If gate says yes -> run fix model
+  if [ "$needs_advanced" = "true" ]; then
+    if [ ! -s "$selected_file" ]; then
+      jq -r '.needs_llm[]?.thread_id' < "$triage_file" > "$selected_file"
+    fi
+
+    local sel_count
+    sel_count="$(wc -l < "$selected_file" | tr -d ' ')"
+    echo "  Gate: YES — $sel_count thread(s) need advanced model"
+
+    if [ "$DRY_RUN" = true ]; then
+      echo "  [dry-run] would run advanced model on:"
+      sed 's/^/    /' "$selected_file"
+    else
+      echo "  Launching fix model ($FIX_MODEL)..."
+      run_fix_model "$OWNER_REPO" "$pr_num" "$worktree_path" "$threads_file" "$selected_file" "$log_file"
+    fi
+  else
+    local reason
+    reason="$(jq -r '.reason // "n/a"' < "$gate_out" 2>/dev/null)"
+    echo "  Gate: NO — advanced model not needed ($reason)"
+  fi
+
+  # 5. Merge deterministic + LLM responses
+  local combined="$LOG_DIR/pr-$pr_num-thread-responses.json"
+  local model_responses="$worktree_path/thread-responses.json"
+
+  if [ -f "$model_responses" ] && jq -e '.' "$model_responses" >/dev/null 2>&1; then
+    jq -s 'add' "$deterministic_responses" "$model_responses" > "$combined"
+  else
+    cp "$deterministic_responses" "$combined"
+  fi
+
+  # 6. Reply and resolve
+  if [ "$NO_RESOLVE" = false ]; then
+    echo "  Replying & resolving threads..."
+    local resolve_result
+    resolve_result="$(reply_and_resolve_from_responses "$combined")"
+    echo "  $resolve_result"
+  else
+    echo "  (--no-resolve: skipping thread resolution)"
+  fi
+
+  # 7. Post-fix summary
+  post_fix_summary "$pr_num" "$triage_file" "$combined" "$log_file"
+
+  # 8. Request Copilot re-review
+  if [ "$DRY_RUN" = false ]; then
+    echo "  Requesting Copilot re-review..."
+    request_copilot_review "$pr_num"
+  fi
+
+  # 9. Post-fix review cycle
+  local fixed_count
+  fixed_count="$(jq '[.[] | select(.action == "fixed" or .action == "already_fixed")] | length' < "$combined" 2>/dev/null || echo "0")"
+  post_fix_review_cycle "$pr_num" "$worktree_path" "$fixed_count" "$log_file"
+
+  # 10. Write status
+  echo "  ✓ PR #$pr_num complete"
+  echo "OK" > "$LOG_DIR/pr-$pr_num.status"
+}
+
+# ── print results ────────────────────────────────────────────────────────────
+
+print_results() {
+  local pr_num
+  for pr_num in $(kv_list ready); do
+    local log_file="$LOG_DIR/pr-$pr_num.log"
+    local status title
+    status="$(cat "$LOG_DIR/pr-$pr_num.status" 2>/dev/null || echo "FAIL")"
+    title="$(kv_get "$pr_num" title)"
+    echo ""
+    if [ "$status" = "OK" ]; then
+      echo "━━━ PR #$pr_num ✓ ━━━ [$title]"
+    else
+      echo "━━━ PR #$pr_num ⚠ ━━━ [$title]"
+    fi
+    cat "$log_file" 2>/dev/null || true
+  done
+}
+
+# ── cleanup ──────────────────────────────────────────────────────────────────
+
+TUI_ACTIVE=false
+
+cleanup() {
+  if [ "$TUI_ACTIVE" = true ]; then
+    tui_close_tty 2>/dev/null || true
+    tput cnorm 2>/dev/null || true
+    tput rmcup 2>/dev/null || true
+    TUI_ACTIVE=false
+  fi
+  sem_destroy 2>/dev/null || true
+  if [ -n "$LOG_DIR" ] && [ -d "$LOG_DIR" ]; then
+    rm -rf "$LOG_DIR"
+  fi
+}
+
+cleanup_sigint() {
+  if [ -n "$BG_PIDS" ]; then
+    for pid in $BG_PIDS; do
+      kill "$pid" 2>/dev/null || true
+      kill -9 "$pid" 2>/dev/null || true
+    done
+    wait 2>/dev/null || true
+  fi
+  cleanup
+  echo ""
+  echo "  Interrupted — killed all running jobs."
+  exit 130
+}
+
+trap cleanup EXIT
+trap cleanup_sigint INT TERM
+
+# ── FIFO semaphore ───────────────────────────────────────────────────────────
+
+sem_init() {
+  SEMAPHORE=$(mktemp -u /tmp/gh-fix-sem.XXXXXX)
+  mkfifo "$SEMAPHORE"
+  exec 3<>"$SEMAPHORE"
+  local i=0
+  while [ "$i" -lt "$CONCURRENCY" ]; do printf '\n' >&3; i=$((i + 1)); done
+}
+sem_acquire() { IFS= read -r -u 3; }
+sem_release() { printf '\n' >&3; }
+sem_destroy() { exec 3>&- 2>/dev/null || true; rm -f "$SEMAPHORE" 2>/dev/null || true; }
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+main() {
+  parse_flags "$@"
+
+  LOG_DIR="$(mktemp -d /tmp/gh-fix-XXXXXX)"
+
+  echo "Repo       : $OWNER_REPO"
+  local repo_dir
+  repo_dir="$(find_local_repo "$OWNER_REPO")"
+  echo "Local repo : $repo_dir"
+  echo "Concurrency: $CONCURRENCY"
+  echo "Gate model : $GATE_MODEL"
+  echo "Fix model  : $FIX_MODEL"
+
+  local hook
+  hook="$(detect_autofix_hook "$repo_dir")"
+  if [ -n "$hook" ]; then
+    echo "Autofix    : $hook"
+  else
+    echo "Autofix    : none"
+  fi
+
+  [ "$DRY_RUN" = true ] && echo "Mode       : DRY RUN"
+
+  # Phase 1: sequential setup (worktrees, merge, threads, triage)
+  setup_all "$repo_dir"
+
+  local total=0 ready=0 skipped=0
+  for _ in $PR_NUMBERS; do total=$((total + 1)); done
+
+  local ready_list="$(kv_list ready)"
+  for _ in $ready_list; do ready=$((ready + 1)); done
+  for _ in $(kv_list skipped); do skipped=$((skipped + 1)); done
+
+  if [ "$ready" -eq 0 ]; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  Done — $total PR(s), nothing to process."
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    return 0
+  fi
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  Processing $ready PR(s) with concurrency=$CONCURRENCY"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  # Determine if TUI should be used
+  local use_tui=false
+  if [ "$CONCURRENCY" -gt 1 ] && [ "$NO_TUI" = false ] && [ -t 1 ]; then
+    use_tui=true
+  fi
+
+  # Phase 2: fix PRs
+  if [ "$CONCURRENCY" -eq 1 ]; then
+    # Sequential — stream directly to stdout
+    for pr_num in $ready_list; do
+      process_pr_sequential "$pr_num"
+    done
+  else
+    # Parallel — launch background jobs
+    sem_init
+    local pids=""
+
+    for pr_num in $ready_list; do
+      (
+        sem_acquire
+        process_pr "$pr_num"
+        sem_release
+      ) &
+      pids="${pids:+$pids }$!"
+      BG_PIDS="$pids"
+    done
+
+    if [ "$use_tui" = true ]; then
+      # TUI monitors jobs
+      tui_loop "$ready_list"
+
+      # Wait for any stragglers
+      for pid in $pids; do
+        wait "$pid" 2>/dev/null || true
+      done
+      sem_destroy
+
+      # Print final results after TUI exits
+      print_results
+    else
+      # No TUI — just wait
+      for pid in $pids; do
+        wait "$pid" 2>/dev/null || true
+      done
+      sem_destroy
+      print_results
+    fi
+  fi
+
+  # Summary
+  local ok=0 fail=0
+  for pr_num in $ready_list; do
+    local s
+    s="$(cat "$LOG_DIR/pr-${pr_num}.status" 2>/dev/null || echo "FAIL")"
+    if [ "$s" = "OK" ]; then ok=$((ok + 1)); else fail=$((fail + 1)); fi
+  done
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  Done — $total PR(s): $ok fixed, $skipped skipped, $fail failed"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  # Terminal bell + macOS notification
+  printf '\a'
+  osascript -e "display notification \"$ok fixed, $skipped skipped, $fail failed\" with title \"gh fix done\" sound name \"Glass\"" 2>/dev/null || true
+}
+
+# Allow sourcing without executing (for tests)
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi
