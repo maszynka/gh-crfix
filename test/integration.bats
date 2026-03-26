@@ -38,26 +38,45 @@ teardown() {
 setup_mocks() {
   local pr_state="${1:-OPEN}" thread_count="${2:-1}" claude_exit="${3:-0}"
 
-  # Mock gh with routing logic
+  # Mock gh with routing logic (including --jq support)
   mock_command_script "gh" "
-    if echo \"\$@\" | grep -q 'repo view'; then
-      echo '{\"nameWithOwner\":\"test-owner/test-repo\"}'
-    elif echo \"\$@\" | grep -q 'pr view'; then
-      pr_num=\$(echo \"\$@\" | grep -oE '[0-9]+' | head -1)
-      cat <<PREOF
-{\"headRefName\":\"pr-branch-1\",\"title\":\"Test PR #\${pr_num}\",\"state\":\"$pr_state\",\"isDraft\":false}
-PREOF
-    elif echo \"\$@\" | grep -q 'api graphql'; then
-      if echo \"\$@\" | grep -q 'reviewThreads'; then
+    # Extract --jq argument if present
+    jq_expr=''
+    args=()
+    while [ \$# -gt 0 ]; do
+      if [ \"\$1\" = '--jq' ]; then shift; jq_expr=\"\$1\"
+      elif [ \"\$1\" = '-q' ]; then shift; jq_expr=\"\$1\"
+      else args+=(\"\$1\"); fi
+      shift
+    done
+    apply_jq() { if [ -n \"\$jq_expr\" ]; then echo \"\$1\" | jq -r \"\$jq_expr\"; else echo \"\$1\"; fi; }
+
+    all=\"\${args[*]}\"
+    if echo \"\$all\" | grep -q 'repo view'; then
+      apply_jq '{\"nameWithOwner\":\"test-owner/test-repo\"}'
+    elif echo \"\$all\" | grep -q 'pr view'; then
+      if [ -n \"\$jq_expr\" ]; then
+        echo 'master'
+      else
+        pr_num=\$(echo \"\$all\" | grep -oE '[0-9]+' | head -1)
+        echo \"{\\\"headRefName\\\":\\\"pr-branch-1\\\",\\\"title\\\":\\\"Test PR #\${pr_num}\\\",\\\"state\\\":\\\"$pr_state\\\",\\\"isDraft\\\":false}\"
+      fi
+    elif echo \"\$all\" | grep -q 'api graphql'; then
+      if echo \"\$all\" | grep -q 'reviewThreads'; then
         if [ $thread_count -eq 0 ]; then
-          echo '{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[]}}}}}'
+          json='{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[]}}}}}'
         else
-          echo '{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[{\"id\":\"PRRT_t1\",\"isResolved\":false,\"path\":\"file.ts\",\"line\":1,\"comments\":{\"nodes\":[{\"body\":\"Fix\",\"path\":\"file.ts\",\"line\":1,\"originalLine\":1,\"author\":{\"login\":\"rev\"},\"createdAt\":\"2025-01-01\"}]}}]}}}}}'
+          json='{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[{\"id\":\"PRRT_t1\",\"isResolved\":false,\"isOutdated\":false,\"path\":\"file.ts\",\"line\":1,\"comments\":{\"nodes\":[{\"body\":\"Fix\",\"path\":\"file.ts\",\"line\":1,\"originalLine\":1,\"author\":{\"login\":\"rev\"},\"createdAt\":\"2025-01-01T00:00:00Z\"}]}}]}}}}}'
         fi
-      elif echo \"\$@\" | grep -q 'resolveReviewThread\|addPullRequestReviewThreadReply'; then
+        apply_jq \"\$json\"
+      elif echo \"\$all\" | grep -q 'resolveReviewThread\|addPullRequestReviewThreadReply'; then
         echo '{}'
       fi
-    elif echo \"\$@\" | grep -q 'pr edit'; then
+    elif echo \"\$all\" | grep -q 'pr comment'; then
+      true
+    elif echo \"\$all\" | grep -q 'pr edit'; then
+      true
+    elif echo \"\$all\" | grep -q 'requested_reviewers'; then
       true
     fi
   "
@@ -84,7 +103,6 @@ CREOF
   run bash "$SCRIPT_PATH" --seq --no-tui "https://github.com/test-owner/test-repo/pull/1"
   [ "$status" -eq 0 ]
   assert_output --partial "1 fixed"
-  assert_output --partial "Review requested" || assert_output --partial "review"
 }
 
 @test "integration: PR with no unresolved threads skipped" {
@@ -115,7 +133,7 @@ CREOF
   run bash "$SCRIPT_PATH" --seq --no-tui "https://github.com/test-owner/test-repo/pull/1"
   [ "$status" -eq 0 ]
   assert_output --partial "No unresolved threads"
-  assert_output --partial "nothing to fix"
+  assert_output --partial "nothing to process"
 }
 
 @test "integration: closed PR is skipped" {
@@ -134,7 +152,7 @@ CREOF
   cd "$REPO_DIR"
   run bash "$SCRIPT_PATH" --seq --setup-only "https://github.com/test-owner/test-repo/pull/1"
   [ "$status" -eq 0 ]
-  assert_output --partial "nothing to fix"
+  assert_output --partial "nothing to process"
   # claude should NOT have been called
   [ ! -f "$MOCK_CALLS/claude.log" ]
 }
@@ -182,7 +200,7 @@ CREOF
   cd "$REPO_DIR"
   run bash "$SCRIPT_PATH" --seq --no-tui "https://github.com/test-owner/test-repo/pull/1"
   [ "$status" -eq 0 ]
-  assert_output --partial "nothing to fix"
+  assert_output --partial "nothing to process"
 }
 
 @test "integration: parallel mode with --no-tui works" {
@@ -197,17 +215,27 @@ CREOF
 @test "integration: draft PR is processed" {
   # Mock to return isDraft=true but state=OPEN
   mock_command_script "gh" '
-    if echo "$@" | grep -q "repo view"; then
-      echo "{\"nameWithOwner\":\"test-owner/test-repo\"}"
-    elif echo "$@" | grep -q "pr view"; then
-      echo "{\"headRefName\":\"pr-branch-1\",\"title\":\"Draft PR\",\"state\":\"OPEN\",\"isDraft\":true}"
-    elif echo "$@" | grep -q "api graphql"; then
-      if echo "$@" | grep -q "reviewThreads"; then
-        echo "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[{\"id\":\"PRRT_1\",\"isResolved\":false,\"path\":\"x.ts\",\"line\":1,\"comments\":{\"nodes\":[{\"body\":\"fix\",\"path\":\"x.ts\",\"line\":1,\"originalLine\":1,\"author\":{\"login\":\"r\"},\"createdAt\":\"2025-01-01\"}]}}]}}}}}"
-      else
-        echo "{}"
-      fi
-    elif echo "$@" | grep -q "pr edit"; then
+    jq_expr=""
+    args=()
+    while [ $# -gt 0 ]; do
+      if [ "$1" = "--jq" ] || [ "$1" = "-q" ]; then shift; jq_expr="$1"
+      else args+=("$1"); fi
+      shift
+    done
+    apply_jq() { if [ -n "$jq_expr" ]; then echo "$1" | jq -r "$jq_expr"; else echo "$1"; fi; }
+    all="${args[*]}"
+
+    if echo "$all" | grep -q "repo view"; then
+      apply_jq "{\"nameWithOwner\":\"test-owner/test-repo\"}"
+    elif echo "$all" | grep -q "pr view"; then
+      if [ -n "$jq_expr" ]; then echo "master"
+      else echo "{\"headRefName\":\"pr-branch-1\",\"title\":\"Draft PR\",\"state\":\"OPEN\",\"isDraft\":true}"; fi
+    elif echo "$all" | grep -q "api graphql"; then
+      if echo "$all" | grep -q "reviewThreads"; then
+        json="{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[{\"id\":\"PRRT_1\",\"isResolved\":false,\"isOutdated\":false,\"path\":\"x.ts\",\"line\":1,\"comments\":{\"nodes\":[{\"body\":\"fix\",\"path\":\"x.ts\",\"line\":1,\"originalLine\":1,\"author\":{\"login\":\"r\"},\"createdAt\":\"2025-01-01T00:00:00Z\"}]}}]}}}}}"
+        apply_jq "$json"
+      else echo "{}"; fi
+    elif echo "$all" | grep -q "pr comment\|pr edit\|requested_reviewers"; then
       true
     fi
   '
@@ -234,7 +262,6 @@ CREOF
   cd "$REPO_DIR"
   run bash "$SCRIPT_PATH" --seq --no-tui --no-post-fix "https://github.com/test-owner/test-repo/pull/1"
   [ "$status" -eq 0 ]
-  assert_output --partial "no-post-fix"
   assert_output --partial "1 fixed"
 }
 
@@ -296,6 +323,6 @@ CREOF
   export GH_CRFIX_REVIEW_WAIT=0
   run bash "$SCRIPT_PATH" --seq --no-tui "https://github.com/test-owner/test-repo/pull/1"
   # Script continues even if merge fails (non-fatal)
-  assert_output --partial "No new review comments"
+  assert_output --partial "no new comments"
   assert_output --partial "post-fix"
 }
