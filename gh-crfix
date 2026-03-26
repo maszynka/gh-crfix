@@ -1562,7 +1562,8 @@ process_pr_sequential() {
       sed 's/^/    /' "$selected_file"
     else
       echo "  Launching fix model ($FIX_MODEL)..."
-      run_fix_model "$OWNER_REPO" "$pr_num" "$worktree_path" "$threads_file" "$selected_file" "$log_file"
+      run_fix_model "$OWNER_REPO" "$pr_num" "$worktree_path" "$threads_file" "$selected_file" "$log_file" \
+        || echo "  Fix model failed (continuing)"
     fi
   else
     local reason

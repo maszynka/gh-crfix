@@ -287,7 +287,7 @@ CREOF
         echo "$count" > "'"$call_count_file"'"
         if [ "$count" -eq 1 ]; then
           # First call (setup): 1 unresolved thread
-          json="{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[{\"id\":\"PRRT_1\",\"isResolved\":false,\"path\":\"x.ts\",\"line\":1,\"comments\":{\"nodes\":[{\"body\":\"fix\",\"path\":\"x.ts\",\"line\":1,\"originalLine\":1,\"author\":{\"login\":\"r\"},\"createdAt\":\"2025-01-01\"}]}}]}}}}}"
+          json="{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[{\"id\":\"PRRT_1\",\"isResolved\":false,\"isOutdated\":false,\"path\":\"x.ts\",\"line\":1,\"comments\":{\"nodes\":[{\"body\":\"fix\",\"path\":\"x.ts\",\"line\":1,\"originalLine\":1,\"author\":{\"login\":\"r\"},\"createdAt\":\"2025-01-01T00:00:00Z\"}]}}]}}}}}"
         else
           # Second call (post-fix): 0 unresolved
           json="{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[]}}}}}"
