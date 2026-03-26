@@ -75,7 +75,14 @@ gh fix 123 --dry-run
 - [`gh`](https://cli.github.com/) (authenticated)
 - `jq`
 - [`claude`](https://docs.anthropic.com/en/docs/claude-code) CLI (for gate + fix models)
+- `bash` 4+
 - `bats` (for tests only)
+
+## Security note
+
+When fixing code, `gh fix` runs `claude` with `--dangerously-skip-permissions`, granting the AI model full filesystem and shell access **within the worktree**. It can read, write, commit, and push code autonomously. This is by design — the tool needs to edit files and push fixes without interactive approval.
+
+Use `--dry-run` to preview what would happen without any mutations. Review the generated commits before merging.
 
 ## Repo autofix hook
 

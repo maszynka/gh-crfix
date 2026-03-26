@@ -66,11 +66,6 @@ BG_PIDS=""
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 die() { echo "ERROR: $*" >&2; exit 1; }
-note() { echo "[$(date +%H:%M:%S)] $*" >&2; }
-
-json_escape() {
-  jq -Rs . <<< "${1:-}"
-}
 
 # ── tiny fs kv ───────────────────────────────────────────────────────────────
 
@@ -670,10 +665,10 @@ Selected thread IDs:
 $(cat "$selected_file")
 
 Selected thread details:
-$(jq -r --slurpfile ids "$selected_file" '
-  def selected($idlist): ($idlist[0] | split("\n") | map(select(length > 0)));
+$(jq -r --rawfile ids "$selected_file" '
+  ($ids | split("\n") | map(select(length > 0))) as $idlist |
   .[]
-  | select(.id as $id | (selected($ids) | index($id)))
+  | select(.id as $id | ($idlist | index($id)))
   | "Thread ID: \(.id)\nFile: \(.comments.nodes[0].path // .path // "unknown")\nLine: \(.comments.nodes[0].line // .comments.nodes[0].originalLine // .line // "unknown")\nComments:\n" +
     ([.comments.nodes[] | "  @\(.author.login): \(.body)"] | join("\n")) + "\n---"
 ' < "$threads_file")
@@ -794,7 +789,7 @@ merge_base_branch() {
     while IFS= read -r file; do
       [ -n "$file" ] || continue
       case "$file" in
-        *.lock|*-lock.yaml|*-lock.json|*.tsbuildinfo|.github/.auto-fix-iterations)
+        *.lock|*-lock.yaml|*-lock.json|*.tsbuildinfo)
           git -C "$worktree_path" checkout --theirs "$file" 2>/dev/null
           git -C "$worktree_path" add "$file" 2>/dev/null
           echo "[merge] auto-resolve $file (theirs)" ;;
@@ -869,7 +864,7 @@ post_fix_summary() {
 
 post_fix_review_cycle() {
   local pr_num="$1" worktree_path="$2" fixed_count="$3" log_file="$4"
-  [ "$NO_POST_FIX" = true ] || [ "$DRY_RUN" = true ] && return 0
+  { [ "$NO_POST_FIX" = true ] || [ "$DRY_RUN" = true ]; } && return 0
 
   {
     echo "[post-fix] waiting ${REVIEW_WAIT_SECS}s..."
@@ -896,14 +891,12 @@ post_fix_review_cycle() {
 #  TUI — Terminal dashboard for parallel mode
 # ══════════════════════════════════════════════════════════════════════════════
 
-SPINNER_FRAMES="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 SPINNER_IDX=0
 TUI_SELECTED=0
 TUI_VIEW="dashboard"     # dashboard | detail
 TUI_DETAIL_SCROLL=0       # scroll offset in detail view
 TUI_READY_LIST=""          # cached ready PR list
 TUI_READY_COUNT=0
-TUI_RUNNING=true
 
 # Get status of a PR: queued | running | done | failed
 pr_status() {
@@ -931,20 +924,6 @@ pr_elapsed() {
   mins=$((elapsed / 60))
   secs=$((elapsed % 60))
   printf '%d:%02d' "$mins" "$secs"
-}
-
-# Get last non-empty line from log
-pr_last_line() {
-  local pr_num="$1" max_width="${2:-80}"
-  local log_file="$LOG_DIR/pr-${pr_num}.log"
-  if [ ! -f "$log_file" ]; then echo ""; return; fi
-  local line
-  line="$(tail -20 "$log_file" 2>/dev/null | grep -v '^$' | tail -1)"
-  # Truncate to width
-  if [ ${#line} -gt "$max_width" ]; then
-    line="${line:0:$((max_width - 1))}…"
-  fi
-  echo "$line"
 }
 
 # Get N-th PR number from ready list (0-indexed)
@@ -1812,7 +1791,8 @@ main() {
 
   # Terminal bell + macOS notification
   printf '\a'
-  osascript -e "display notification \"$ok fixed, $skipped skipped, $fail failed\" with title \"gh fix done\" sound name \"Glass\"" 2>/dev/null || true
+  command -v osascript >/dev/null 2>&1 && \
+    osascript -e "display notification \"$ok fixed, $skipped skipped, $fail failed\" with title \"gh fix done\" sound name \"Glass\"" 2>/dev/null || true
 }
 
 # Allow sourcing without executing (for tests)
