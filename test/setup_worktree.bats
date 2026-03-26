@@ -16,7 +16,7 @@ setup() {
   git -C "$REPO_DIR" commit -q -m "test commit"
   git -C "$REPO_DIR" checkout -q master 2>/dev/null || git -C "$REPO_DIR" checkout -q main
 
-  WORKTREE_SUBDIR=".gh-fix/worktrees"
+  WORKTREE_SUBDIR=".gh-crfix/worktrees"
 }
 
 teardown() {

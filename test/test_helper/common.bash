@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Shared test helper for gh-fix tests
+# Shared test helper for gh-crfix tests
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-SCRIPT_PATH="$SCRIPT_DIR/gh-fix"
+SCRIPT_PATH="$SCRIPT_DIR/gh-crfix"
 
 load 'test_helper/bats-support/load'
 load 'test_helper/bats-assert/load'

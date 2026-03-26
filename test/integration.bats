@@ -5,7 +5,7 @@ setup() {
   setup_common
 
   # Skip post-fix cycle in tests (avoids 90s sleep)
-  export GH_FIX_REVIEW_WAIT=0
+  export GH_CRFIX_REVIEW_WAIT=0
 
   # Create test git repo
   REPO_DIR="$TEST_TMPDIR/repo"
@@ -293,7 +293,7 @@ CREOF
   mock_command "osascript" 0
 
   cd "$REPO_DIR"
-  export GH_FIX_REVIEW_WAIT=0
+  export GH_CRFIX_REVIEW_WAIT=0
   run bash "$SCRIPT_PATH" --seq --no-tui "https://github.com/test-owner/test-repo/pull/1"
   # Script continues even if merge fails (non-fatal)
   assert_output --partial "No new review comments"

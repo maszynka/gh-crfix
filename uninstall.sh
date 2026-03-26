@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Remove gh-fix gh extension symlink
+# Remove gh-crfix gh extension symlink
 set -euo pipefail
 
-EXT_DIR="$(gh extension dir 2>/dev/null || echo "$HOME/.local/share/gh/extensions")/gh-fix"
+EXT_DIR="$(gh extension dir 2>/dev/null || echo "$HOME/.local/share/gh/extensions")/gh-crfix"
 
 if [ -L "$EXT_DIR" ]; then
   rm "$EXT_DIR"

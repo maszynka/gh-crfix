@@ -16,41 +16,42 @@ Parse PR → Create worktree → Merge base branch → Fetch review threads
   → Post-fix cycle (wait → check new comments → merge base)
 ```
 
-## Install as gh extension
+## Install
 
 ```bash
-# Clone and symlink
-git clone https://github.com/YOUR_USER/gh-fix ~/.local/share/gh/extensions/gh-fix
-# or use the install script from any local clone:
-bash install.sh
+# Via gh extension install (recommended)
+gh extension install maszynka/gh-crfix
+
+# Or clone and symlink manually
+git clone https://github.com/maszynka/gh-crfix && cd gh-crfix && bash install.sh
 ```
 
 Then run:
 
 ```bash
-gh fix 123
+gh crfix 123
 ```
 
 ## Usage
 
 ```bash
 # Single PR (inside a git repo)
-gh fix 123
+gh crfix 123
 
 # PR range
-gh fix 123-126
+gh crfix 123-126
 
 # PR list
-gh fix [123,125,130]
+gh crfix [123,125,130]
 
 # Full URL (works from anywhere)
-gh fix https://github.com/owner/repo/pull/123
+gh crfix https://github.com/owner/repo/pull/123
 
 # Parallel with TUI dashboard
-gh fix 100-110 -c 5
+gh crfix 100-110 -c 5
 
 # Dry run (no mutations)
-gh fix 123 --dry-run
+gh crfix 123 --dry-run
 ```
 
 ## Flags
@@ -82,17 +83,17 @@ gh fix 123 --dry-run
 
 ## Security note
 
-When fixing code, `gh fix` runs `claude` with `--dangerously-skip-permissions`, granting the AI model full filesystem and shell access **within the worktree**. It can read, write, commit, and push code autonomously. This is by design — the tool needs to edit files and push fixes without interactive approval.
+When fixing code, `gh crfix` runs `claude` with `--dangerously-skip-permissions`, granting the AI model full filesystem and shell access **within the worktree**. It can read, write, commit, and push code autonomously. This is by design — the tool needs to edit files and push fixes without interactive approval.
 
 Use `--dry-run` to preview what would happen without any mutations. Review the generated commits before merging.
 
 ## Repo autofix hook
 
-`gh fix` looks for a deterministic autofix script in the **target repo**:
+`gh crfix` looks for a deterministic autofix script in the **target repo**:
 
 1. `--autofix-hook PATH` flag
-2. `.gh-fix/autofix.sh` (executable)
-3. `scripts/gh-fix-autofix.sh` (executable)
+2. `.gh-crfix/autofix.sh` (executable)
+3. `scripts/gh-crfix-autofix.sh` (executable)
 
 The hook runs in the worktree before the AI gate/fix phase.
 
@@ -100,10 +101,10 @@ The hook runs in the worktree before the AI gate/fix phase.
 
 | Variable | Description |
 |----------|-------------|
-| `GH_FIX_DIR` | Force local repo path (auto-detected otherwise) |
-| `GH_FIX_REVIEW_WAIT` | Seconds to wait for re-review (default: 90) |
-| `GH_FIX_GATE_MODEL` | Gate model override |
-| `GH_FIX_FIX_MODEL` | Fix model override |
+| `GH_CRFIX_DIR` | Force local repo path (auto-detected otherwise) |
+| `GH_CRFIX_REVIEW_WAIT` | Seconds to wait for re-review (default: 90) |
+| `GH_CRFIX_GATE_MODEL` | Gate model override |
+| `GH_CRFIX_FIX_MODEL` | Fix model override |
 
 ## Tests
 
@@ -121,8 +122,8 @@ bats test/v2/
 ## File structure
 
 ```
-gh-fix/
-├── gh-fix                # Main script
+gh-crfix/
+├── gh-crfix              # Main script (gh extension binary)
 ├── install.sh            # Symlink as gh extension
 ├── uninstall.sh          # Remove symlink
 ├── test/

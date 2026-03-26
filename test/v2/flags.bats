@@ -127,7 +127,7 @@ teardown() { teardown_common; }
     --no-autofix \
     --no-resolve \
     --setup-only \
-    --autofix-hook "/repo/.gh-fix/fix.sh" \
+    --autofix-hook "/repo/.gh-crfix/fix.sh" \
     "https://github.com/owner/repo/pull/10"
 
   [ "$GATE_MODEL" = "haiku" ]
@@ -138,7 +138,7 @@ teardown() { teardown_common; }
   [ "$NO_AUTOFIX" = "true" ]
   [ "$NO_RESOLVE" = "true" ]
   [ "$SETUP_ONLY" = "true" ]
-  [ "$AUTO_FIX_HOOK" = "/repo/.gh-fix/fix.sh" ]
+  [ "$AUTO_FIX_HOOK" = "/repo/.gh-crfix/fix.sh" ]
   [ "$PR_NUMBERS" = "10" ]
 }
 

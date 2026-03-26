@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gh fix — hybrid PR review fixer
+# gh crfix — hybrid PR review fixer
 #
 # Strategy:
 #   1) deterministic triage
@@ -10,12 +10,12 @@
 #   6) TUI dashboard for parallel mode
 #
 # Usage:
-#   gh fix 123
-#   gh fix 123-126
-#   gh fix [123,125,130]
-#   gh fix https://github.com/owner/repo/pull/123
-#   gh fix https://github.com/owner/repo/pull/93-95
-#   gh fix https://github.com/owner/repo/pull/[93,94,95]
+#   gh crfix 123
+#   gh crfix 123-126
+#   gh crfix [123,125,130]
+#   gh crfix https://github.com/owner/repo/pull/123
+#   gh crfix https://github.com/owner/repo/pull/93-95
+#   gh crfix https://github.com/owner/repo/pull/[93,94,95]
 #
 # Flags:
 #   -c N, --concurrency N        max parallel PR workers (default: 3)
@@ -35,14 +35,14 @@
 #   -h, --help
 #
 # Env:
-#   GH_FIX_DIR                 override local repo path
-#   GH_FIX_REVIEW_WAIT         seconds to wait for re-review (default: 90)
-#   GH_FIX_GATE_MODEL          gate model override
-#   GH_FIX_FIX_MODEL           fix model override
+#   GH_CRFIX_DIR                 override local repo path
+#   GH_CRFIX_REVIEW_WAIT         seconds to wait for re-review (default: 90)
+#   GH_CRFIX_GATE_MODEL          gate model override
+#   GH_CRFIX_FIX_MODEL           fix model override
 
 set -euo pipefail
 
-WORKTREE_SUBDIR=".gh-fix/worktrees"
+WORKTREE_SUBDIR=".gh-crfix/worktrees"
 OWNER_REPO=""
 PR_NUMBERS=""
 CONCURRENCY=3
@@ -51,14 +51,14 @@ NO_RESOLVE=false
 NO_TUI=false
 NO_POST_FIX=false
 INCLUDE_OUTDATED=false
-GATE_MODEL="${GH_FIX_GATE_MODEL:-haiku}"
-FIX_MODEL="${GH_FIX_FIX_MODEL:-sonnet}"
+GATE_MODEL="${GH_CRFIX_GATE_MODEL:-haiku}"
+FIX_MODEL="${GH_CRFIX_FIX_MODEL:-sonnet}"
 MAX_THREADS=100
 AUTO_FIX_HOOK=""
 NO_AUTOFIX=false
 RESOLVE_SKIPPED=false
 DRY_RUN=false
-REVIEW_WAIT_SECS="${GH_FIX_REVIEW_WAIT:-90}"
+REVIEW_WAIT_SECS="${GH_CRFIX_REVIEW_WAIT:-90}"
 LOG_DIR=""
 SEMAPHORE=""
 BG_PIDS=""
@@ -78,15 +78,15 @@ kv_list()   { cat "$LOG_DIR/kv/list__${1}" 2>/dev/null || true; }
 
 usage() {
   cat <<'EOF'
-gh fix — hybrid PR review fixer (triage + gate + TUI + conflict resolution + post-fix)
+gh crfix — hybrid PR review fixer (triage + gate + TUI + conflict resolution + post-fix)
 
 Usage:
-  gh fix <url>            single PR
-  gh fix <url-range>      range   e.g. .../pull/93-95
-  gh fix <url-list>       list    e.g. .../pull/[93,94,95]
-  gh fix <number>         uses current repo
-  gh fix <n1>-<n2>        uses current repo
-  gh fix <n1>,<n2>,<n3>   uses current repo
+  gh crfix <url>            single PR
+  gh crfix <url-range>      range   e.g. .../pull/93-95
+  gh crfix <url-list>       list    e.g. .../pull/[93,94,95]
+  gh crfix <number>         uses current repo
+  gh crfix <n1>-<n2>        uses current repo
+  gh crfix <n1>,<n2>,<n3>   uses current repo
 
 Flags:
   -c N, --concurrency N        max parallel PR workers (default: 3)
@@ -118,16 +118,16 @@ Flow:
 
 Repo autofix discovery:
   - --autofix-hook PATH
-  - .gh-fix/autofix.sh
-  - scripts/gh-fix-autofix.sh
+  - .gh-crfix/autofix.sh
+  - scripts/gh-crfix-autofix.sh
 
-Worktrees: <repo>/.gh-fix/worktrees/pr-{number}
+Worktrees: <repo>/.gh-crfix/worktrees/pr-{number}
 
 Env vars:
-  GH_FIX_DIR            force the local repo path (auto-detected otherwise)
-  GH_FIX_REVIEW_WAIT    seconds to wait for re-review (default: 90)
-  GH_FIX_GATE_MODEL     gate model override (default: haiku)
-  GH_FIX_FIX_MODEL      fix model override (default: sonnet)
+  GH_CRFIX_DIR            force the local repo path (auto-detected otherwise)
+  GH_CRFIX_REVIEW_WAIT    seconds to wait for re-review (default: 90)
+  GH_CRFIX_GATE_MODEL     gate model override (default: haiku)
+  GH_CRFIX_FIX_MODEL      fix model override (default: sonnet)
 EOF
 }
 
@@ -217,13 +217,13 @@ find_local_repo() {
     fi
   fi
 
-  if [ -n "${GH_FIX_DIR:-}" ]; then
-    echo "$GH_FIX_DIR"
+  if [ -n "${GH_CRFIX_DIR:-}" ]; then
+    echo "$GH_CRFIX_DIR"
     return 0
   fi
 
   local dir
-  for dir in "$HOME/projects" "$HOME/code" "$HOME/dev" "$HOME/work" "$HOME"; do
+  for dir in "$HOME/projects" "$HOME/code" "$HOME/dev" "$HOME/work"; do
     [ -d "$dir" ] || continue
     while IFS= read -r git_dir; do
       local repo_dir remote
@@ -236,7 +236,7 @@ find_local_repo() {
     done < <(find "$dir" -maxdepth 4 -name ".git" -type d 2>/dev/null)
   done
 
-  die "Cannot find local clone of $owner_repo. Set GH_FIX_DIR=/path/to/repo."
+  die "Cannot find local clone of $owner_repo. Set GH_CRFIX_DIR=/path/to/repo."
 }
 
 # ── autofix hook detection ───────────────────────────────────────────────────
@@ -254,13 +254,13 @@ detect_autofix_hook() {
     return 0
   fi
 
-  if [ -x "$repo_dir/.gh-fix/autofix.sh" ]; then
-    echo "$repo_dir/.gh-fix/autofix.sh"
+  if [ -x "$repo_dir/.gh-crfix/autofix.sh" ]; then
+    echo "$repo_dir/.gh-crfix/autofix.sh"
     return 0
   fi
 
-  if [ -x "$repo_dir/scripts/gh-fix-autofix.sh" ]; then
-    echo "$repo_dir/scripts/gh-fix-autofix.sh"
+  if [ -x "$repo_dir/scripts/gh-crfix-autofix.sh" ]; then
+    echo "$repo_dir/scripts/gh-crfix-autofix.sh"
     return 0
   fi
 
@@ -665,7 +665,7 @@ Selected thread IDs:
 $(cat "$selected_file")
 
 Selected thread details:
-$(jq -r --rawfile ids "$selected_file" '
+$(jq -r --arg ids "$(cat "$selected_file")" '
   ($ids | split("\n") | map(select(length > 0))) as $idlist |
   .[]
   | select(.id as $id | ($idlist | index($id)))
@@ -848,7 +848,7 @@ post_fix_summary() {
     [ -f "$responses_file" ] && resolved=$(jq '[.[] | select(.action == "fixed" or .action == "already_fixed")] | length' < "$responses_file" 2>/dev/null || echo "0")
 
     printf -v body '%s\n' \
-      "🤖 **gh fix** — Fix Summary" "" \
+      "🤖 **gh crfix** — Fix Summary" "" \
       "| Stage | Count |" "|-------|-------|" \
       "| Total threads | $total_ct |" \
       "| Skipped (deterministic) | $skip_ct |" \
@@ -876,13 +876,13 @@ post_fix_review_cycle() {
 
     if [ "$new_count" -eq 0 ]; then
       echo "[post-fix] no new comments"
-      pr_comment "$pr_num" "🤖 **gh fix**: All $fixed_count comments addressed. No new issues after re-review."
+      pr_comment "$pr_num" "🤖 **gh crfix**: All $fixed_count comments addressed. No new issues after re-review."
       merge_base_branch "$pr_num" "$worktree_path" "$log_file" || true
       request_copilot_review "$pr_num"
       echo "[post-fix] done"
     else
       echo "[post-fix] $new_count new comment(s)"
-      pr_comment "$pr_num" "🤖 **gh fix**: Fixed $fixed_count comments, but $new_count new issue(s) raised. Run again to address."
+      pr_comment "$pr_num" "🤖 **gh crfix**: Fixed $fixed_count comments, but $new_count new issue(s) raised. Run again to address."
     fi
   } >> "$log_file" 2>&1
 }
@@ -936,18 +936,14 @@ pr_at_index() {
 }
 
 # ── TUI: terminal input ─────────────────────────────────────────────────────
-# Open a dedicated fd for the terminal to avoid stdin conflicts
-TTY_FD=""
+# Open a dedicated fd (4) for the terminal to avoid stdin conflicts
 tui_open_tty() {
   exec 4</dev/tty
-  TTY_FD=4
-  # Set terminal to raw-ish mode on the tty
   stty -echo -icanon min 0 time 0 </dev/tty 2>/dev/null || true
 }
 tui_close_tty() {
   stty echo icanon </dev/tty 2>/dev/null || true
   exec 4<&- 2>/dev/null || true
-  TTY_FD=""
 }
 
 # Read one keypress (non-blocking, ~0.4s timeout via loop)
@@ -1025,7 +1021,7 @@ tui_render_dashboard() {
   # Header
   local spin
   spin="$(spinner_char)"
-  buf="${buf}  ${BOLD}gh fix${RST}  │  "
+  buf="${buf}  ${BOLD}gh crfix${RST}  │  "
   [ "$n_running" -gt 0 ] && buf="${buf}${c_yellow}${spin} ${n_running} running${RST}  "
   [ "$n_done" -gt 0 ]    && buf="${buf}${c_green}✓ ${n_done} done${RST}  "
   [ "$n_failed" -gt 0 ]  && buf="${buf}${c_red}✗ ${n_failed} failed${RST}  "
@@ -1669,7 +1665,7 @@ trap cleanup_sigint INT TERM
 # ── FIFO semaphore ───────────────────────────────────────────────────────────
 
 sem_init() {
-  SEMAPHORE=$(mktemp -u /tmp/gh-fix-sem.XXXXXX)
+  SEMAPHORE=$(mktemp -u /tmp/gh-crfix-sem.XXXXXX)
   mkfifo "$SEMAPHORE"
   exec 3<>"$SEMAPHORE"
   local i=0
@@ -1684,7 +1680,7 @@ sem_destroy() { exec 3>&- 2>/dev/null || true; rm -f "$SEMAPHORE" 2>/dev/null ||
 main() {
   parse_flags "$@"
 
-  LOG_DIR="$(mktemp -d /tmp/gh-fix-XXXXXX)"
+  LOG_DIR="$(mktemp -d /tmp/gh-crfix-XXXXXX)"
 
   echo "Repo       : $OWNER_REPO"
   local repo_dir
@@ -1792,7 +1788,7 @@ main() {
   # Terminal bell + macOS notification
   printf '\a'
   command -v osascript >/dev/null 2>&1 && \
-    osascript -e "display notification \"$ok fixed, $skipped skipped, $fail failed\" with title \"gh fix done\" sound name \"Glass\"" 2>/dev/null || true
+    osascript -e "display notification \"$ok fixed, $skipped skipped, $fail failed\" with title \"gh crfix done\" sound name \"Glass\"" 2>/dev/null || true
 }
 
 # Allow sourcing without executing (for tests)
