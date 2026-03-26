@@ -457,7 +457,11 @@ is_simple_mechanical() {
 
 is_non_actionable() {
   local text="$1"
-  echo "$text" | grep -qiE '(lgtm|looks good|thanks|nice|great catch fixed\?|resolved\?)'
+  # Only skip very short comments that are purely acknowledgements
+  local word_count
+  word_count="$(echo "$text" | wc -w | tr -d ' ')"
+  [ "$word_count" -gt 8 ] && return 1
+  echo "$text" | grep -qiE '(^lgtm$|^looks good|^thanks!?$|^nice!?$|great catch|^resolved\??$)'
 }
 
 classify_one_thread() {
@@ -476,8 +480,8 @@ classify_one_thread() {
     decision="skip"
     reason="outdated thread"
   elif [ -z "$path" ]; then
-    decision="skip"
-    reason="missing file path"
+    decision="needs_llm"
+    reason="PR-level comment (no file path)"
   elif is_non_actionable "$text"; then
     decision="skip"
     reason="non-actionable comment"
@@ -623,7 +627,7 @@ run_gate_model() {
       --model "$GATE_MODEL" \
       --output-format json \
       --json-schema "$(cat "$schema_file")" \
-      "$(cat "$prompt_file")" > "$out_file"; then
+      < "$prompt_file" > "$out_file"; then
       echo "[gate] failed; fallback to needs_advanced_model=true"
       jq -n \
         --arg reason "gate model failed" \
@@ -692,7 +696,7 @@ run_fix_model() {
     cat "$selected_file"
     echo ""
 
-    if ! (cd "$worktree_path" && claude -p --model "$FIX_MODEL" --dangerously-skip-permissions "$(cat "$prompt_file")"); then
+    if ! (cd "$worktree_path" && claude -p --model "$FIX_MODEL" --dangerously-skip-permissions < "$prompt_file"); then
       echo "[fix] FAILED"
       return 1
     fi
