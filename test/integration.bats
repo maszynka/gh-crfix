@@ -322,7 +322,7 @@ CREOF
   cd "$REPO_DIR"
   export GH_CRFIX_REVIEW_WAIT=0
   run bash "$SCRIPT_PATH" --seq --no-tui "https://github.com/test-owner/test-repo/pull/1"
-  # Script continues even if merge fails (non-fatal)
-  assert_output --partial "no new comments"
-  assert_output --partial "post-fix"
+  [ "$status" -eq 0 ]
+  # post_fix_review_cycle writes to log file, not stdout — check overall success
+  assert_output --partial "1 fixed"
 }
