@@ -292,9 +292,14 @@ setup_worktree() {
   mkdir -p "$repo_dir/$WORKTREE_SUBDIR"
 
   if git -C "$repo_dir" worktree list --porcelain | grep -qxF "worktree $worktree_path"; then
-    git -C "$worktree_path" fetch origin "$branch" --quiet 2>/dev/null || true
-    git -C "$worktree_path" checkout "$branch" >/dev/null 2>&1 || true
-    git -C "$worktree_path" pull --rebase origin "$branch" --quiet 2>/dev/null || true
+    # Clean up any leftover state from previous run
+    git -C "$worktree_path" merge --abort 2>/dev/null || true
+    git -C "$worktree_path" rebase --abort 2>/dev/null || true
+    git -C "$worktree_path" checkout -- . 2>/dev/null || true
+    git -C "$worktree_path" clean -fd 2>/dev/null || true
+    git -C "$worktree_path" fetch origin "$branch" --quiet || true
+    git -C "$worktree_path" checkout "$branch" 2>/dev/null || true
+    git -C "$worktree_path" reset --hard "origin/$branch" 2>/dev/null || true
     echo "$worktree_path"
     return 0
   fi
@@ -304,8 +309,12 @@ setup_worktree() {
     | awk -v b="$branch" '/^worktree /{wt=$2} /^branch refs\/heads\//{if($2=="refs/heads/"b) print wt}')
 
   if [ -n "$existing_wt" ]; then
-    git -C "$existing_wt" fetch origin "$branch" --quiet 2>/dev/null || true
-    git -C "$existing_wt" pull --rebase origin "$branch" --quiet 2>/dev/null || true
+    git -C "$existing_wt" merge --abort 2>/dev/null || true
+    git -C "$existing_wt" rebase --abort 2>/dev/null || true
+    git -C "$existing_wt" checkout -- . 2>/dev/null || true
+    git -C "$existing_wt" clean -fd 2>/dev/null || true
+    git -C "$existing_wt" fetch origin "$branch" --quiet || true
+    git -C "$existing_wt" reset --hard "origin/$branch" 2>/dev/null || true
     echo "$existing_wt"
     return 0
   fi
@@ -787,8 +796,11 @@ merge_base_branch() {
   base_branch=$(gh pr view "$pr_num" --repo "$OWNER_REPO" --json baseRefName -q '.baseRefName' 2>/dev/null || echo "master")
 
   {
+    echo "[merge] fetching origin/$base_branch"
+    if ! git -C "$worktree_path" fetch origin "+refs/heads/$base_branch:refs/remotes/origin/$base_branch" --quiet 2>&1; then
+      echo "[merge] WARNING: fetch failed — will use cached origin/$base_branch"
+    fi
     echo "[merge] merging origin/$base_branch"
-    git -C "$worktree_path" fetch origin "$base_branch" --quiet 2>/dev/null || true
     if git -C "$worktree_path" merge "origin/$base_branch" --no-edit -q 2>/dev/null; then
       git -C "$worktree_path" push --quiet 2>/dev/null || true
       echo "[merge] clean"

@@ -1,5 +1,11 @@
 # gh crfix — Changelog
 
+## 1.3.0 — 2026-03-27
+
+### Fixed
+- **Worktree reuse**: existing worktrees from previous runs could have dirty state (pending merge, uncommitted files). `checkout`/`pull --rebase` failed silently (`2>/dev/null || true`), leaving a stale worktree. Now: abort any pending merge/rebase, clean untracked files, `reset --hard origin/$branch` to guarantee a fresh state.
+- **Base branch fetch**: `git fetch origin master` relied on default refspec to update `origin/master`; silenced ALL errors. Now uses explicit refspec (`+refs/heads/$base:refs/remotes/origin/$base`) and logs fetch failures instead of hiding them.
+
 ## 1.2.0 — 2026-03-27
 
 ### Fixed
