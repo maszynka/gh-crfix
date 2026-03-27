@@ -1,5 +1,12 @@
 # gh crfix — Changelog
 
+## 1.2.0 — 2026-03-27
+
+### Fixed
+- **Critical:** `run_gate_model` used `--output-format json` which wraps the response in a `{"type":"result","result":"..."}` envelope; `jq .needs_advanced_model` returned null on the wrapper → always evaluated as gate=NO → advanced model never ran. Fixed by switching to `--output-format text` so the output is directly parseable JSON.
+- Gate prompt bias flipped: was "conservative — don't request advanced model unless necessary" (biases toward false/skip); now "default true unless all threads are clearly non-actionable" — prevents silently skipping real bugs.
+- Default gate model changed from `haiku` to `sonnet` for better reasoning on complex/security threads. Can be overridden with `--gate-model haiku` or `GH_CRFIX_GATE_MODEL=haiku`.
+
 ## 1.1.0 — 2026-03-27
 
 ### Added

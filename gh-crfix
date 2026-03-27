@@ -25,7 +25,7 @@
 #   --setup-only                 only setup worktrees + collect triage
 #   --no-resolve                 do not resolve GitHub threads
 #   --include-outdated           include outdated unresolved threads in triage
-#   --gate-model MODEL           small model for gate (default: haiku)
+#   --gate-model MODEL           small model for gate (default: sonnet)
 #   --fix-model MODEL            advanced model for actual fixing (default: sonnet)
 #   --max-threads N              max threads fetched per PR (default: 100)
 #   --autofix-hook PATH          repo-local deterministic autofix script
@@ -51,7 +51,7 @@ NO_RESOLVE=false
 NO_TUI=false
 NO_POST_FIX=false
 INCLUDE_OUTDATED=false
-GATE_MODEL="${GH_CRFIX_GATE_MODEL:-haiku}"
+GATE_MODEL="${GH_CRFIX_GATE_MODEL:-sonnet}"
 FIX_MODEL="${GH_CRFIX_FIX_MODEL:-sonnet}"
 MAX_THREADS=100
 AUTO_FIX_HOOK=""
@@ -96,7 +96,7 @@ Flags:
   --setup-only                 only setup worktrees + collect triage
   --no-resolve                 do not resolve GitHub threads
   --include-outdated           include outdated unresolved threads
-  --gate-model MODEL           small model for gate (default: haiku)
+  --gate-model MODEL           gate model (default: sonnet)
   --fix-model MODEL            advanced model for fixing (default: sonnet)
   --max-threads N              max threads fetched per PR (default: 100)
   --autofix-hook PATH          deterministic repo-local autofix script
@@ -126,7 +126,7 @@ Worktrees: <repo>/.gh-crfix/worktrees/pr-{number}
 Env vars:
   GH_CRFIX_DIR            force the local repo path (auto-detected otherwise)
   GH_CRFIX_REVIEW_WAIT    seconds to wait for re-review (default: 90)
-  GH_CRFIX_GATE_MODEL     gate model override (default: haiku)
+  GH_CRFIX_GATE_MODEL     gate model override (default: sonnet)
   GH_CRFIX_FIX_MODEL      fix model override (default: sonnet)
 EOF
 }
@@ -575,15 +575,15 @@ build_gate_prompt() {
   llm_ct="$(jq '.needs_llm | length' < "$triage_file")"
 
   cat <<EOF
-You are a tiny gating model for PR review comment automation.
+You are a gating model for PR review comment automation.
 
 Goal:
-Decide whether an advanced coding model is needed at all.
+Decide whether an advanced coding model should run to fix the remaining review threads.
 
 Rules:
-- Be conservative about cost, but do NOT request advanced model unless necessary.
-- If remaining threads are clearly non-actionable, already addressed, or better left unresolved for human discussion, say false.
-- If remaining threads likely require real code changes, semantic understanding, refactoring, or merge/conflict reasoning, say true.
+- Default to true (send to advanced model) unless you are confident the threads need no code changes.
+- Say false ONLY when ALL remaining threads are: clearly already addressed in the PR, pure praise/thanks, or trivially non-actionable (e.g. "LGTM").
+- Say true for anything involving: bugs, security issues, missing tests, logic errors, missing validation, unused imports that need removal, refactoring requests, or any thread where code should change.
 - Output ONLY valid JSON matching the schema.
 
 Context:
@@ -623,15 +623,25 @@ run_gate_model() {
 
   {
     echo "[gate] model=$GATE_MODEL"
+    local raw_out="$LOG_DIR/gate-$pr_num.raw.txt"
     if ! claude -p \
       --model "$GATE_MODEL" \
-      --output-format json \
+      --output-format text \
       --json-schema "$(cat "$schema_file")" \
-      < "$prompt_file" > "$out_file"; then
+      < "$prompt_file" > "$raw_out"; then
       echo "[gate] failed; fallback to needs_advanced_model=true"
       jq -n \
         --arg reason "gate model failed" \
         '{needs_advanced_model: true, reason: $reason, threads_to_fix: []}' > "$out_file"
+    else
+      # Strip any accidental code fences and parse as JSON
+      sed 's/^```json//; s/^```//; s/```$//' < "$raw_out" \
+        | jq '.' > "$out_file" 2>/dev/null \
+        || {
+          echo "[gate] parse failed; fallback to needs_advanced_model=true"
+          jq -n --arg reason "gate output not valid JSON" \
+            '{needs_advanced_model: true, reason: $reason, threads_to_fix: []}' > "$out_file"
+        }
     fi
     echo "[gate] result: $(cat "$out_file")"
   } >> "$log_file" 2>&1
