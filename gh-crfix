@@ -797,7 +797,7 @@ merge_base_branch() {
           git -C "$worktree_path" checkout --theirs "$file" 2>/dev/null
           git -C "$worktree_path" add "$file" 2>/dev/null
           echo "[merge] auto-resolve $file (theirs)" ;;
-        .github/workflows/*|.github/docs/*|CHANGELOG.md)
+        .github/workflows/*|.github/docs/*|.github/.auto-fix-iterations|CHANGELOG.md|thread-responses.json)
           git -C "$worktree_path" checkout --ours "$file" 2>/dev/null
           git -C "$worktree_path" add "$file" 2>/dev/null
           echo "[merge] auto-resolve $file (ours)" ;;
@@ -881,7 +881,9 @@ post_fix_review_cycle() {
     if [ "$new_count" -eq 0 ]; then
       echo "[post-fix] no new comments"
       pr_comment "$pr_num" "🤖 **gh crfix**: All $fixed_count comments addressed. No new issues after re-review."
-      merge_base_branch "$pr_num" "$worktree_path" "$log_file" || true
+      if ! merge_base_branch "$pr_num" "$worktree_path" "$log_file"; then
+        pr_comment "$pr_num" "🤖 **gh crfix**: ⚠️ Could not merge base branch — conflicts require manual resolution."
+      fi
       request_copilot_review "$pr_num"
       echo "[post-fix] done"
     else
@@ -1464,17 +1466,31 @@ process_pr() {
         run_fix_model "$OWNER_REPO" "$pr_num" "$worktree_path" "$threads_file" "$selected_file" "$log_file"
       fi
     else
-      echo "[gate] advanced model not needed"
+      local reason
+      reason="$(jq -r '.reason // "n/a"' < "$gate_out" 2>/dev/null)"
+      echo "[gate] advanced model not needed ($reason)"
+
+      # Generate "skipped by gate" responses so needs_llm threads still get resolved
+      local gate_skipped="$LOG_DIR/pr-$pr_num-gate-skipped.json"
+      jq '[.needs_llm[]? | {
+        thread_id: .thread_id,
+        action: "already_fixed",
+        comment: ("Reviewed by automation — no code change needed: " + .reason + ".")
+      }]' < "$triage_file" > "$gate_skipped"
     fi
 
-    # 5. Merge deterministic + LLM responses
+    # 5. Merge deterministic + LLM + gate-skipped responses
     local combined="$LOG_DIR/pr-$pr_num-thread-responses.json"
     local model_responses="$worktree_path/thread-responses.json"
+    local gate_skipped="$LOG_DIR/pr-$pr_num-gate-skipped.json"
+    local resp_files=("$deterministic_responses")
+    [ -f "$model_responses" ] && jq -e '.' "$model_responses" >/dev/null 2>&1 && resp_files+=("$model_responses")
+    [ -f "$gate_skipped" ] && jq -e '.' "$gate_skipped" >/dev/null 2>&1 && resp_files+=("$gate_skipped")
 
-    if [ -f "$model_responses" ] && jq -e '.' "$model_responses" >/dev/null 2>&1; then
-      jq -s 'add' "$deterministic_responses" "$model_responses" > "$combined"
+    if [ "${#resp_files[@]}" -eq 1 ]; then
+      cp "${resp_files[0]}" "$combined"
     else
-      cp "$deterministic_responses" "$combined"
+      jq -s 'add' "${resp_files[@]}" > "$combined"
     fi
 
     # 6. Reply and resolve
@@ -1485,21 +1501,29 @@ process_pr() {
       echo "[resolve] skipped by flag"
     fi
 
-    # 7. Post-fix summary
+    # 7. Remove thread-responses.json from git (prevents future merge conflicts)
+    if [ -f "$worktree_path/thread-responses.json" ]; then
+      git -C "$worktree_path" rm -f thread-responses.json >/dev/null 2>&1 || rm -f "$worktree_path/thread-responses.json"
+      git -C "$worktree_path" commit -q -m "chore: remove thread-responses.json artifact" 2>/dev/null || true
+      git -C "$worktree_path" push -q 2>/dev/null || true
+      echo "[cleanup] removed thread-responses.json from git"
+    fi
+
+    # 8. Post-fix summary
     post_fix_summary "$pr_num" "$triage_file" "$combined" "$log_file"
 
-    # 8. Request Copilot re-review
+    # 9. Request Copilot re-review
     if [ "$DRY_RUN" = false ]; then
       echo "[review] requesting Copilot re-review"
       request_copilot_review "$pr_num"
     fi
 
-    # 9. Post-fix review cycle
+    # 10. Post-fix review cycle
     local fixed_count
     fixed_count="$(jq '[.[] | select(.action == "fixed" or .action == "already_fixed")] | length' < "$combined" 2>/dev/null || echo "0")"
     post_fix_review_cycle "$pr_num" "$worktree_path" "$fixed_count" "$log_file"
 
-    # 10. Write status
+    # 11. Write status
     echo "[done]"
     echo "OK" > "$LOG_DIR/pr-$pr_num.status"
   } >> "$log_file" 2>&1 || {
@@ -1573,16 +1597,28 @@ process_pr_sequential() {
     local reason
     reason="$(jq -r '.reason // "n/a"' < "$gate_out" 2>/dev/null)"
     echo "  Gate: NO — advanced model not needed ($reason)"
+
+    # Generate "skipped by gate" responses so needs_llm threads still get resolved
+    local gate_skipped="$LOG_DIR/pr-$pr_num-gate-skipped.json"
+    jq '[.needs_llm[]? | {
+      thread_id: .thread_id,
+      action: "already_fixed",
+      comment: ("Reviewed by automation — no code change needed: " + .reason + ".")
+    }]' < "$triage_file" > "$gate_skipped"
   fi
 
-  # 5. Merge deterministic + LLM responses
+  # 5. Merge deterministic + LLM + gate-skipped responses
   local combined="$LOG_DIR/pr-$pr_num-thread-responses.json"
   local model_responses="$worktree_path/thread-responses.json"
+  local gate_skipped="$LOG_DIR/pr-$pr_num-gate-skipped.json"
+  local resp_files=("$deterministic_responses")
+  [ -f "$model_responses" ] && jq -e '.' "$model_responses" >/dev/null 2>&1 && resp_files+=("$model_responses")
+  [ -f "$gate_skipped" ] && jq -e '.' "$gate_skipped" >/dev/null 2>&1 && resp_files+=("$gate_skipped")
 
-  if [ -f "$model_responses" ] && jq -e '.' "$model_responses" >/dev/null 2>&1; then
-    jq -s 'add' "$deterministic_responses" "$model_responses" > "$combined"
+  if [ "${#resp_files[@]}" -eq 1 ]; then
+    cp "${resp_files[0]}" "$combined"
   else
-    cp "$deterministic_responses" "$combined"
+    jq -s 'add' "${resp_files[@]}" > "$combined"
   fi
 
   # 6. Reply and resolve
@@ -1595,21 +1631,29 @@ process_pr_sequential() {
     echo "  (--no-resolve: skipping thread resolution)"
   fi
 
-  # 7. Post-fix summary
+  # 7. Remove thread-responses.json from git (prevents future merge conflicts)
+  if [ -f "$worktree_path/thread-responses.json" ]; then
+    git -C "$worktree_path" rm -f thread-responses.json >/dev/null 2>&1 || rm -f "$worktree_path/thread-responses.json"
+    git -C "$worktree_path" commit -q -m "chore: remove thread-responses.json artifact" 2>/dev/null || true
+    git -C "$worktree_path" push -q 2>/dev/null || true
+    echo "  [cleanup] removed thread-responses.json from git"
+  fi
+
+  # 8. Post-fix summary
   post_fix_summary "$pr_num" "$triage_file" "$combined" "$log_file"
 
-  # 8. Request Copilot re-review
+  # 9. Request Copilot re-review
   if [ "$DRY_RUN" = false ]; then
     echo "  Requesting Copilot re-review..."
     request_copilot_review "$pr_num"
   fi
 
-  # 9. Post-fix review cycle
+  # 10. Post-fix review cycle
   local fixed_count
   fixed_count="$(jq '[.[] | select(.action == "fixed" or .action == "already_fixed")] | length' < "$combined" 2>/dev/null || echo "0")"
   post_fix_review_cycle "$pr_num" "$worktree_path" "$fixed_count" "$log_file"
 
-  # 10. Write status
+  # 11. Write status
   echo "  ✓ PR #$pr_num complete"
   echo "OK" > "$LOG_DIR/pr-$pr_num.status"
 }
