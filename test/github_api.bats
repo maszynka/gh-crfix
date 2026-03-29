@@ -9,18 +9,9 @@ setup() {
 
 teardown() { teardown_common; }
 
-# ── reply_and_resolve_all ────────────────────────────────────────────────────
+# ── reply_and_resolve_from_responses ─────────────────────────────────────────
 
-@test "reply_and_resolve_all: with valid responses file" {
-  # Create threads file
-  cat > "$TEST_TMPDIR/threads.json" <<'EOF'
-[
-  {"id": "PRRT_1", "comments": {"nodes": [{"body": "fix x"}]}},
-  {"id": "PRRT_2", "comments": {"nodes": [{"body": "fix y"}]}}
-]
-EOF
-
-  # Create responses file
+@test "reply_and_resolve_from_responses: with valid responses file" {
   cat > "$TEST_TMPDIR/responses.json" <<'EOF'
 [
   {"thread_id": "PRRT_1", "action": "fixed", "comment": "Fixed X"},
@@ -28,51 +19,52 @@ EOF
 ]
 EOF
 
-  # Mock gh to succeed silently
   mock_command "gh" 0
 
-  run reply_and_resolve_all 42 "$TEST_TMPDIR/threads.json" "$TEST_TMPDIR/responses.json"
+  run reply_and_resolve_from_responses "$TEST_TMPDIR/responses.json"
   [ "$status" -eq 0 ]
-  assert_output --partial "Replied & resolved 2/2"
+  assert_output "replied=2 resolved=1 unresolved_skipped=1"
 }
 
-@test "reply_and_resolve_all: without responses file uses fallback" {
-  cat > "$TEST_TMPDIR/threads.json" <<'EOF'
-[
-  {"id": "PRRT_1", "comments": {"nodes": [{"body": "fix"}]}},
-  {"id": "PRRT_2", "comments": {"nodes": [{"body": "fix"}]}}
-]
-EOF
-
+@test "reply_and_resolve_from_responses: missing file returns empty output" {
   mock_command "gh" 0
 
-  run reply_and_resolve_all 42 "$TEST_TMPDIR/threads.json" "$TEST_TMPDIR/nonexistent.json"
+  run reply_and_resolve_from_responses "$TEST_TMPDIR/nonexistent.json"
   [ "$status" -eq 0 ]
-  assert_output --partial "Replied & resolved 2/2"
+  [ -z "$output" ]
 }
 
-@test "reply_and_resolve_all: malformed responses file uses fallback" {
-  cat > "$TEST_TMPDIR/threads.json" <<'EOF'
-[{"id": "PRRT_1", "comments": {"nodes": [{"body": "fix"}]}}]
-EOF
-
+@test "reply_and_resolve_from_responses: malformed file returns empty output" {
   echo "NOT JSON" > "$TEST_TMPDIR/bad.json"
   mock_command "gh" 0
 
-  run reply_and_resolve_all 42 "$TEST_TMPDIR/threads.json" "$TEST_TMPDIR/bad.json"
+  run reply_and_resolve_from_responses "$TEST_TMPDIR/bad.json"
   [ "$status" -eq 0 ]
-  assert_output --partial "Replied & resolved 1/1"
+  [ -z "$output" ]
 }
 
-@test "reply_and_resolve_all: empty threads" {
-  echo "[]" > "$TEST_TMPDIR/threads.json"
+@test "reply_and_resolve_from_responses: empty array" {
   echo "[]" > "$TEST_TMPDIR/responses.json"
-
   mock_command "gh" 0
 
-  run reply_and_resolve_all 42 "$TEST_TMPDIR/threads.json" "$TEST_TMPDIR/responses.json"
+  run reply_and_resolve_from_responses "$TEST_TMPDIR/responses.json"
   [ "$status" -eq 0 ]
-  assert_output --partial "0/0"
+  assert_output "replied=0 resolved=0 unresolved_skipped=0"
+}
+
+@test "reply_and_resolve_from_responses: RESOLVE_SKIPPED resolves skipped entries" {
+  cat > "$TEST_TMPDIR/responses.json" <<'EOF'
+[
+  {"thread_id": "PRRT_1", "action": "skipped", "comment": "Skipped but resolve"}
+]
+EOF
+
+  RESOLVE_SKIPPED=true
+  mock_command "gh" 0
+
+  run reply_and_resolve_from_responses "$TEST_TMPDIR/responses.json"
+  [ "$status" -eq 0 ]
+  assert_output "replied=1 resolved=1 unresolved_skipped=0"
 }
 
 # ── resolve_thread ───────────────────────────────────────────────────────────
