@@ -188,6 +188,7 @@ EOF
 
   [ "$decision" = "skip" ]
   [ "$reason" = "non-actionable comment" ]
+  [ "$(echo "$result" | jq -r '.resolve_when_skipped')" = "true" ]
 }
 
 @test "classify_one_thread: returns auto for mechanical nit" {

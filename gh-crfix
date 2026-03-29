@@ -522,6 +522,7 @@ classify_one_thread() {
 
   local reason="needs semantic review"
   local decision="needs_llm"
+  local resolve_when_skipped=false
 
   if [ "$(jq -r '.isOutdated' <<< "$thread_json")" = "true" ] && [ "$INCLUDE_OUTDATED" = false ]; then
     decision="skip"
@@ -532,6 +533,7 @@ classify_one_thread() {
   elif is_non_actionable "$text"; then
     decision="skip"
     reason="non-actionable comment"
+    resolve_when_skipped=true
   elif is_question_only "$text"; then
     decision="skip"
     reason="question-only thread"
@@ -555,13 +557,15 @@ classify_one_thread() {
     --arg decision "$decision" \
     --arg reason "$reason" \
     --arg body "$text" \
+    --argjson resolve_when_skipped "$resolve_when_skipped" \
     '{
       thread_id: $id,
       path: $path,
       line: $line,
       decision: $decision,
       reason: $reason,
-      body: $body
+      body: $body,
+      resolve_when_skipped: $resolve_when_skipped
     }'
 }
 
@@ -804,10 +808,11 @@ reply_and_resolve_from_responses() {
   n="$(jq 'length' < "$responses_file")"
   i=0
   while [ "$i" -lt "$n" ]; do
-    local tid action comment
+    local tid action comment resolve_when_skipped
     tid="$(jq -r ".[$i].thread_id // empty" < "$responses_file")"
     action="$(jq -r ".[$i].action // empty" < "$responses_file")"
     comment="$(jq -r ".[$i].comment // empty" < "$responses_file")"
+    resolve_when_skipped="$(jq -r ".[$i].resolve_when_skipped // false" < "$responses_file")"
 
     [ -n "$tid" ] || { i=$((i + 1)); continue; }
 
@@ -820,7 +825,7 @@ reply_and_resolve_from_responses() {
         resolve_thread "$tid" && resolved=$((resolved + 1))
         ;;
       skipped)
-        if [ "$RESOLVE_SKIPPED" = true ]; then
+        if [ "$RESOLVE_SKIPPED" = true ] || [ "$resolve_when_skipped" = true ]; then
           resolve_thread "$tid" && resolved=$((resolved + 1))
         else
           skipped=$((skipped + 1))
@@ -850,7 +855,8 @@ write_deterministic_responses() {
       (.skip[]? | {
         thread_id: .thread_id,
         action: "skipped",
-        comment: ("Skipped automatically: " + .reason + ".")
+        comment: ("Skipped automatically: " + .reason + "."),
+        resolve_when_skipped: (.resolve_when_skipped // false)
       })
     ]
   ' < "$triage_file" > "$out_file"

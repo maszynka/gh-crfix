@@ -67,6 +67,20 @@ EOF
   assert_output "replied=1 resolved=1 unresolved_skipped=0"
 }
 
+@test "reply_and_resolve_from_responses: non-actionable skipped entry resolves by default" {
+  cat > "$TEST_TMPDIR/responses.json" <<'EOF'
+[
+  {"thread_id": "PRRT_1", "action": "skipped", "comment": "LGTM", "resolve_when_skipped": true}
+]
+EOF
+
+  mock_command "gh" 0
+
+  run reply_and_resolve_from_responses "$TEST_TMPDIR/responses.json"
+  [ "$status" -eq 0 ]
+  assert_output "replied=1 resolved=1 unresolved_skipped=0"
+}
+
 # ── write_uncovered_responses ────────────────────────────────────────────────
 
 @test "write_uncovered_responses: adds skipped reply for uncovered auto thread" {
