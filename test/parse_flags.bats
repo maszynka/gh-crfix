@@ -65,9 +65,9 @@ teardown() { teardown_common; }
   [ "$status" -ne 0 ]
 }
 
-@test "parse_flags: default concurrency is 4" {
+@test "parse_flags: default concurrency is 3" {
   parse_flags "https://github.com/o/r/pull/1"
-  [ "$CONCURRENCY" -eq 4 ]
+  [ "$CONCURRENCY" -eq 3 ]
 }
 
 @test "parse_flags: flags after positional still work" {

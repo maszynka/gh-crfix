@@ -673,31 +673,29 @@ run_gate_model() {
     echo "[gate] model=$GATE_MODEL"
     echo "[gate] backend=$AI_BACKEND"
     local raw_out="$LOG_DIR/gate-$pr_num.raw.txt"
+    local cmd_failed=false
     if [ "$AI_BACKEND" = "claude" ]; then
-      if ! claude -p \
+      claude -p \
         --model "$GATE_MODEL" \
         --output-format text \
         --json-schema "$(cat "$schema_file")" \
-        < "$prompt_file" > "$raw_out"; then
-        echo "[gate] failed; fallback to needs_advanced_model=true"
-        jq -n \
-          --arg reason "gate model failed" \
-          '{needs_advanced_model: true, reason: $reason, threads_to_fix: []}' > "$out_file"
-      fi
+        < "$prompt_file" > "$raw_out" || cmd_failed=true
     else
-      if ! codex exec \
+      codex exec \
         --model "$GATE_MODEL" \
         --sandbox read-only \
         --skip-git-repo-check \
         --color never \
         --output-schema "$schema_file" \
         --output-last-message "$raw_out" \
-        - < "$prompt_file" >/dev/null; then
-        echo "[gate] failed; fallback to needs_advanced_model=true"
-        jq -n \
-          --arg reason "gate model failed" \
-          '{needs_advanced_model: true, reason: $reason, threads_to_fix: []}' > "$out_file"
-      fi
+        - < "$prompt_file" >/dev/null || cmd_failed=true
+    fi
+
+    if [ "$cmd_failed" = true ]; then
+      echo "[gate] failed; fallback to needs_advanced_model=true"
+      jq -n \
+        --arg reason "gate model failed" \
+        '{needs_advanced_model: true, reason: $reason, threads_to_fix: []}' > "$out_file"
     fi
 
     if [ ! -f "$out_file" ]; then
@@ -774,21 +772,21 @@ run_fix_model() {
     cat "$selected_file"
     echo ""
 
+    local cmd_failed=false
     if [ "$AI_BACKEND" = "claude" ]; then
-      if ! (cd "$worktree_path" && claude -p --model "$FIX_MODEL" --dangerously-skip-permissions < "$prompt_file"); then
-        echo "[fix] FAILED"
-        return 1
-      fi
+      (cd "$worktree_path" && claude -p --model "$FIX_MODEL" --dangerously-skip-permissions < "$prompt_file") || cmd_failed=true
     else
-      if ! codex exec \
+      codex exec \
         --cd "$worktree_path" \
         --model "$FIX_MODEL" \
         --dangerously-bypass-approvals-and-sandbox \
         --color never \
-        - < "$prompt_file"; then
-        echo "[fix] FAILED"
-        return 1
-      fi
+        - < "$prompt_file" || cmd_failed=true
+    fi
+
+    if [ "$cmd_failed" = true ]; then
+      echo "[fix] FAILED"
+      return 1
     fi
     echo "[fix] done"
   } >> "$log_file" 2>&1
@@ -917,21 +915,21 @@ merge_base_branch() {
 Keep both sides where possible. PR branch (ours/HEAD) takes priority.
 After resolving: git add each file, git commit --no-edit, git push."
 
+    local llm_succeeded=false
     if [ "$AI_BACKEND" = "claude" ]; then
-      if (cd "$worktree_path" && claude --dangerously-skip-permissions -p "$prompt" < /dev/null 2>&1 | tail -10); then
-        remaining=$(git -C "$worktree_path" diff --name-only --diff-filter=U || true)
-        [ -z "$remaining" ] && { echo "[merge] LLM resolved"; return 0; }
-      fi
+      (cd "$worktree_path" && claude --dangerously-skip-permissions -p "$prompt" < /dev/null 2>&1 | tail -10) && llm_succeeded=true
     else
-      if codex exec \
+      codex exec \
         --cd "$worktree_path" \
         --model "$FIX_MODEL" \
         --dangerously-bypass-approvals-and-sandbox \
         --color never \
-        "$prompt" >/dev/null 2>&1; then
-        remaining=$(git -C "$worktree_path" diff --name-only --diff-filter=U || true)
-        [ -z "$remaining" ] && { echo "[merge] LLM resolved"; return 0; }
-      fi
+        "$prompt" >/dev/null 2>&1 && llm_succeeded=true
+    fi
+
+    if [ "$llm_succeeded" = true ]; then
+      remaining=$(git -C "$worktree_path" diff --name-only --diff-filter=U || true)
+      [ -z "$remaining" ] && { echo "[merge] LLM resolved"; return 0; }
     fi
 
     git -C "$worktree_path" merge --abort 2>/dev/null || true
