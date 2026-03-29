@@ -80,6 +80,28 @@ teardown() { teardown_common; }
   [ "$AUTO_FIX_HOOK" = "/path/to/hook.sh" ]
 }
 
+@test "parse_flags: --validate-hook sets VALIDATE_HOOK" {
+  parse_flags --validate-hook "/path/to/validate.sh" "https://github.com/o/r/pull/1"
+  [ "$VALIDATE_HOOK" = "/path/to/validate.sh" ]
+}
+
+@test "parse_flags: --no-validate sets NO_VALIDATE=true" {
+  parse_flags --no-validate "https://github.com/o/r/pull/1"
+  [ "$NO_VALIDATE" = "true" ]
+}
+
+@test "parse_flags: score flags set weights" {
+  parse_flags \
+    --score-needs-llm .2 \
+    --score-pr-comment 0.4 \
+    --score-test-failure 1 \
+    "https://github.com/o/r/pull/1"
+
+  [ "$SCORE_NEEDS_LLM" = ".2" ]
+  [ "$SCORE_PR_COMMENT" = "0.4" ]
+  [ "$SCORE_TEST_FAILURE" = "1" ]
+}
+
 @test "parse_flags: --max-threads sets MAX_THREADS" {
   parse_flags --max-threads 50 "https://github.com/o/r/pull/1"
   [ "$MAX_THREADS" -eq 50 ]
@@ -102,6 +124,10 @@ teardown() { teardown_common; }
     --ai-backend "codex" \
     --gate-model "gpt-5.4-mini" \
     --fix-model "gpt-5.4" \
+    --validate-hook "/repo/.gh-crfix/validate.sh" \
+    --score-needs-llm .2 \
+    --score-pr-comment 0.4 \
+    --score-test-failure 1 \
     --no-tui \
     --no-post-fix \
     --dry-run \
@@ -114,6 +140,10 @@ teardown() { teardown_common; }
   [ "$AI_BACKEND" = "codex" ]
   [ "$GATE_MODEL" = "gpt-5.4-mini" ]
   [ "$FIX_MODEL" = "gpt-5.4" ]
+  [ "$VALIDATE_HOOK" = "/repo/.gh-crfix/validate.sh" ]
+  [ "$SCORE_NEEDS_LLM" = ".2" ]
+  [ "$SCORE_PR_COMMENT" = "0.4" ]
+  [ "$SCORE_TEST_FAILURE" = "1" ]
   [ "$NO_TUI" = "true" ]
   [ "$NO_POST_FIX" = "true" ]
   [ "$DRY_RUN" = "true" ]
@@ -133,6 +163,7 @@ teardown() { teardown_common; }
     --dry-run \
     --seq \
     --no-autofix \
+    --no-validate \
     --no-resolve \
     --setup-only \
     --autofix-hook "/repo/.gh-crfix/fix.sh" \
@@ -145,6 +176,7 @@ teardown() { teardown_common; }
   [ "$DRY_RUN" = "true" ]
   [ "$CONCURRENCY" -eq 1 ]
   [ "$NO_AUTOFIX" = "true" ]
+  [ "$NO_VALIDATE" = "true" ]
   [ "$NO_RESOLVE" = "true" ]
   [ "$SETUP_ONLY" = "true" ]
   [ "$AUTO_FIX_HOOK" = "/repo/.gh-crfix/fix.sh" ]

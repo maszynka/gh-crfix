@@ -4,10 +4,11 @@
 # Strategy:
 #   1) deterministic triage
 #   2) optional repo-local autofix hook
-#   3) gate model decides whether advanced model is needed
-#   4) advanced model only for residual hard cases
-#   5) post-fix review cycle + merge base branch
-#   6) TUI dashboard for parallel mode
+#   3) deterministic validation + score threshold
+#   4) gate model decides whether advanced model is needed
+#   5) advanced model only for residual hard cases
+#   6) post-fix review cycle + merge base branch
+#   7) TUI dashboard for parallel mode
 #
 # Usage:
 #   gh crfix 123
@@ -25,9 +26,14 @@
 #   --no-post-fix                skip post-fix review cycle
 #   --setup-only                 only setup worktrees + collect triage
 #   --no-resolve                 do not resolve GitHub threads
+#   --validate-hook PATH         repo-local deterministic validation script
+#   --no-validate                disable validation hook even if present
 #   --include-outdated           include outdated unresolved threads in triage
 #   --gate-model MODEL           small model for gate (default: sonnet)
 #   --fix-model MODEL            advanced model for actual fixing (default: sonnet)
+#   --score-needs-llm N          contribution (0..1) when residual semantic review remains
+#   --score-pr-comment N         contribution (0..1) when residual PR-level comments remain
+#   --score-test-failure N       contribution (0..1) when deterministic validation reports failures
 #   --max-threads N              max threads fetched per PR (default: 100)
 #   --autofix-hook PATH          repo-local deterministic autofix script
 #   --no-autofix                 skip autofix hook even if present
@@ -41,6 +47,9 @@
 #   GH_CRFIX_REVIEW_WAIT         seconds to wait for re-review (default: 90)
 #   GH_CRFIX_GATE_MODEL          gate model override
 #   GH_CRFIX_FIX_MODEL           fix model override
+#   GH_CRFIX_SCORE_NEEDS_LLM     score contribution (default: 1)
+#   GH_CRFIX_SCORE_PR_COMMENT    score contribution (default: 0.4)
+#   GH_CRFIX_SCORE_TEST_FAILURE  score contribution (default: 1)
 
 set -euo pipefail
 
@@ -58,10 +67,16 @@ GATE_MODEL="${GH_CRFIX_GATE_MODEL:-sonnet}"
 FIX_MODEL="${GH_CRFIX_FIX_MODEL:-sonnet}"
 MAX_THREADS=100
 AUTO_FIX_HOOK=""
+VALIDATE_HOOK=""
 NO_AUTOFIX=false
+NO_VALIDATE=false
 RESOLVE_SKIPPED=false
 DRY_RUN=false
 REVIEW_WAIT_SECS="${GH_CRFIX_REVIEW_WAIT:-90}"
+SCORE_NEEDS_LLM="${GH_CRFIX_SCORE_NEEDS_LLM:-1}"
+SCORE_PR_COMMENT="${GH_CRFIX_SCORE_PR_COMMENT:-0.4}"
+SCORE_TEST_FAILURE="${GH_CRFIX_SCORE_TEST_FAILURE:-1}"
+LAUNCH_FROM_TUI=false
 LOG_DIR=""
 SEMAPHORE=""
 BG_PIDS=""
@@ -69,6 +84,34 @@ BG_PIDS=""
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 die() { echo "ERROR: $*" >&2; exit 1; }
+
+is_number_0_to_1() {
+  local value="${1:-}"
+  echo "$value" | grep -Eq '^(0(\.[0-9]+)?|1(\.0+)?|\.[0-9]+)$'
+}
+
+validate_score_flag() {
+  local name="$1" value="$2"
+  is_number_0_to_1 "$value" || die "$name must be a number between 0 and 1"
+}
+
+score_sum() {
+  awk '
+    BEGIN { total = 0 }
+    {
+      for (i = 1; i <= NF; i++) total += $i + 0
+    }
+    END { printf "%.3f", total }
+  ' <<< "$*"
+}
+
+normalize_score() {
+  awk -v value="$1" 'BEGIN { printf "%.3f", value + 0 }'
+}
+
+score_at_least_one() {
+  awk -v total="$1" 'BEGIN { exit !(total + 0 >= 1) }'
+}
 
 resolve_ai_backend() {
   case "$AI_BACKEND" in
@@ -113,6 +156,7 @@ usage() {
 gh crfix — hybrid PR review fixer (triage + gate + TUI + conflict resolution + post-fix)
 
 Usage:
+  gh crfix                  interactive launcher (TTY only)
   gh crfix <url>            single PR
   gh crfix <url-range>      range   e.g. .../pull/93-95
   gh crfix <url-list>       list    e.g. .../pull/[93,94,95]
@@ -131,6 +175,11 @@ Flags:
   --include-outdated           include outdated unresolved threads
   --gate-model MODEL           gate model (default: sonnet)
   --fix-model MODEL            advanced model for fixing (default: sonnet)
+  --validate-hook PATH         deterministic validation script
+  --no-validate                disable validation hook and built-in test detection
+  --score-needs-llm N          contribution (0..1) for residual semantic review
+  --score-pr-comment N         contribution (0..1) for residual PR-level comments
+  --score-test-failure N       contribution (0..1) for failed deterministic validation
   --max-threads N              max threads fetched per PR (default: 100)
   --autofix-hook PATH          deterministic repo-local autofix script
   --no-autofix                 disable autofix hook
@@ -141,18 +190,25 @@ Flow:
   1. Setup      — fetch PR info, create worktrees, merge base branch,
                   get review threads, deterministic triage (sequential)
   2. Autofix    — run repo-local autofix hook if available
-  3. Gate       — ask a smaller model if advanced fixing is needed
-  4. Fix        — run the advanced model only if gate says yes
+  3. Validate   — run deterministic validation/tests and build a gate score
+  4. Gate       — ask a smaller model if score >= 1
+  5. Fix        — run the advanced model only if gate says yes
                   TUI dashboard shows live progress (parallel mode)
-  5. Resolve    — reply to threads, mark resolved, request Copilot re-review
-  6. Post-fix   — wait for re-review; if no new comments: merge base branch,
+  6. Resolve    — reply to threads, mark resolved, request Copilot re-review
+  7. Post-fix   — wait for re-review; if no new comments: merge base branch,
                   add PR comment, request final re-review
-  7. Report     — print per-PR summary
+  8. Report     — print per-PR summary
 
 Repo autofix discovery:
   - --autofix-hook PATH
   - .gh-crfix/autofix.sh
   - scripts/gh-crfix-autofix.sh
+
+Validation discovery:
+  - --validate-hook PATH
+  - .gh-crfix/validate.sh
+  - scripts/gh-crfix-validate.sh
+  - built-in package.json test detection (npm/pnpm/yarn/bun)
 
 Worktrees: <repo>/.gh-crfix/worktrees/pr-{number}
 
@@ -162,6 +218,9 @@ Env vars:
   GH_CRFIX_REVIEW_WAIT    seconds to wait for re-review (default: 90)
   GH_CRFIX_GATE_MODEL     gate model override (default: sonnet)
   GH_CRFIX_FIX_MODEL      fix model override (default: sonnet)
+  GH_CRFIX_SCORE_NEEDS_LLM     contribution for residual semantic review (default: 1)
+  GH_CRFIX_SCORE_PR_COMMENT    contribution for PR-level comments (default: 0.4)
+  GH_CRFIX_SCORE_TEST_FAILURE  contribution for failed validation/tests (default: 1)
 EOF
 }
 
@@ -188,6 +247,20 @@ parse_flags() {
       --include-outdated) INCLUDE_OUTDATED=true ;;
       --gate-model) shift; GATE_MODEL="${1:?missing value}" ;;
       --fix-model) shift; FIX_MODEL="${1:?missing value}" ;;
+      --validate-hook) shift; VALIDATE_HOOK="${1:?missing value}" ;;
+      --no-validate) NO_VALIDATE=true ;;
+      --score-needs-llm)
+        shift; SCORE_NEEDS_LLM="${1:?missing value}"
+        validate_score_flag "--score-needs-llm" "$SCORE_NEEDS_LLM"
+        ;;
+      --score-pr-comment)
+        shift; SCORE_PR_COMMENT="${1:?missing value}"
+        validate_score_flag "--score-pr-comment" "$SCORE_PR_COMMENT"
+        ;;
+      --score-test-failure)
+        shift; SCORE_TEST_FAILURE="${1:?missing value}"
+        validate_score_flag "--score-test-failure" "$SCORE_TEST_FAILURE"
+        ;;
       --max-threads)
         shift; MAX_THREADS="${1:?missing value}"
         case "$MAX_THREADS" in *[!0-9]*) die "--max-threads requires a number" ;; esac
@@ -202,6 +275,10 @@ parse_flags() {
     esac
     shift
   done
+
+  validate_score_flag "GH_CRFIX_SCORE_NEEDS_LLM/--score-needs-llm" "$SCORE_NEEDS_LLM"
+  validate_score_flag "GH_CRFIX_SCORE_PR_COMMENT/--score-pr-comment" "$SCORE_PR_COMMENT"
+  validate_score_flag "GH_CRFIX_SCORE_TEST_FAILURE/--score-test-failure" "$SCORE_TEST_FAILURE"
 
   [ -n "$args" ] || { usage; exit 0; }
   parse_input "$args"
@@ -319,6 +396,183 @@ run_autofix_hook() {
     echo "[autofix] hook failed (continuing)" >> "$log_file"
     return 0
   }
+}
+
+# ── validation detection + execution ────────────────────────────────────────
+
+detect_package_manager() {
+  local repo_dir="$1"
+  local package_manager=""
+
+  if [ -f "$repo_dir/package.json" ]; then
+    package_manager="$(jq -r '.packageManager // empty' < "$repo_dir/package.json" 2>/dev/null || true)"
+  fi
+
+  case "$package_manager" in
+    pnpm@*) echo "pnpm"; return 0 ;;
+    yarn@*) echo "yarn"; return 0 ;;
+    bun@*)  echo "bun"; return 0 ;;
+    npm@*)  echo "npm"; return 0 ;;
+  esac
+
+  if [ -f "$repo_dir/pnpm-lock.yaml" ]; then
+    echo "pnpm"
+  elif [ -f "$repo_dir/yarn.lock" ]; then
+    echo "yarn"
+  elif [ -f "$repo_dir/bun.lock" ] || [ -f "$repo_dir/bun.lockb" ]; then
+    echo "bun"
+  else
+    echo "npm"
+  fi
+}
+
+detect_builtin_test_command() {
+  local repo_dir="$1"
+  local package_json="$repo_dir/package.json"
+
+  [ -f "$package_json" ] || { echo ""; return 0; }
+  jq -e '.scripts.test? | strings | length > 0' < "$package_json" >/dev/null 2>&1 || {
+    echo ""
+    return 0
+  }
+
+  case "$(detect_package_manager "$repo_dir")" in
+    pnpm) echo "pnpm test" ;;
+    yarn) echo "yarn test" ;;
+    bun)  echo "bun run test" ;;
+    *)    echo "npm test" ;;
+  esac
+}
+
+detect_validate_runner() {
+  local repo_dir="$1"
+
+  if [ "$NO_VALIDATE" = true ]; then
+    echo ""
+    return 0
+  fi
+
+  if [ -n "$VALIDATE_HOOK" ]; then
+    echo "hook::$VALIDATE_HOOK"
+    return 0
+  fi
+
+  if [ -x "$repo_dir/.gh-crfix/validate.sh" ]; then
+    echo "hook::$repo_dir/.gh-crfix/validate.sh"
+    return 0
+  fi
+
+  if [ -x "$repo_dir/scripts/gh-crfix-validate.sh" ]; then
+    echo "hook::$repo_dir/scripts/gh-crfix-validate.sh"
+    return 0
+  fi
+
+  local builtin_cmd
+  builtin_cmd="$(detect_builtin_test_command "$repo_dir")"
+  if [ -n "$builtin_cmd" ]; then
+    echo "builtin::$builtin_cmd"
+    return 0
+  fi
+
+  echo ""
+}
+
+validation_log_summary() {
+  local raw_file="$1" fallback="$2"
+  if [ -f "$raw_file" ]; then
+    tail -20 "$raw_file" 2>/dev/null \
+      | sed '/^[[:space:]]*$/d' \
+      | tail -3 \
+      | tr '\n' ' ' \
+      | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
+  else
+    echo "$fallback"
+  fi
+}
+
+write_validation_result() {
+  local out_file="$1" source_type="$2" source_value="$3" success="$4" tests_failed="$5" summary="$6"
+
+  jq -n \
+    --arg source_type "$source_type" \
+    --arg source_value "$source_value" \
+    --argjson success "$success" \
+    --argjson tests_failed "$tests_failed" \
+    --arg summary "$summary" \
+    '{
+      source_type: $source_type,
+      source: $source_value,
+      available: ($source_type != "none"),
+      ran: ($source_type != "none"),
+      success: $success,
+      tests_failed: $tests_failed,
+      summary: $summary
+    }' > "$out_file"
+}
+
+run_validation() {
+  local worktree_path="$1" runner="$2" out_file="$3" log_file="$4"
+  local runner_type="${runner%%::*}" runner_value="${runner#*::}"
+  local raw_file="$out_file.raw.log"
+  local hook_json="$out_file.hook.json"
+
+  if [ -z "$runner" ]; then
+    write_validation_result "$out_file" "none" "" true false "No deterministic validation configured."
+    return 0
+  fi
+
+  rm -f "$raw_file" "$hook_json"
+
+  local exit_code=0
+  {
+    if [ "$runner_type" = "hook" ]; then
+      echo "[validate] running hook: $runner_value"
+      (
+        cd "$worktree_path" &&
+        CI=1 GH_CRFIX_VALIDATION_OUT="$hook_json" "$runner_value"
+      ) > "$raw_file" 2>&1 || exit_code=$?
+    else
+      echo "[validate] running builtin tests: $runner_value"
+      (
+        cd "$worktree_path" &&
+        CI=1 bash -lc "$runner_value"
+      ) > "$raw_file" 2>&1 || exit_code=$?
+    fi
+
+    [ -f "$raw_file" ] && cat "$raw_file"
+    echo "[validate] exit=$exit_code"
+  } >> "$log_file" 2>&1
+
+  if [ -f "$hook_json" ] && jq -e '.' "$hook_json" >/dev/null 2>&1; then
+    jq -n \
+      --arg source_type "$runner_type" \
+      --arg source_value "$runner_value" \
+      --argjson fallback_success "$( [ "$exit_code" -eq 0 ] && echo true || echo false )" \
+      --argjson fallback_tests_failed "$( [ "$exit_code" -eq 0 ] && echo false || echo true )" \
+      --arg fallback_summary "$(validation_log_summary "$raw_file" "Validation hook completed.")" \
+      --slurpfile hook "$hook_json" '
+      ($hook[0] // {}) as $doc |
+      {
+        source_type: $source_type,
+        source: $source_value,
+        available: true,
+        ran: true,
+        success: ($doc.success // $fallback_success),
+        tests_failed: ($doc.tests_failed // $fallback_tests_failed),
+        summary: ($doc.summary // $fallback_summary)
+      }' > "$out_file"
+    return 0
+  fi
+
+  if [ "$exit_code" -eq 0 ]; then
+    write_validation_result \
+      "$out_file" "$runner_type" "$runner_value" true false \
+      "$(validation_log_summary "$raw_file" "Deterministic validation passed.")"
+  else
+    write_validation_result \
+      "$out_file" "$runner_type" "$runner_value" false true \
+      "$(validation_log_summary "$raw_file" "Deterministic validation failed.")"
+  fi
 }
 
 # ── worktree setup ───────────────────────────────────────────────────────────
@@ -596,7 +850,76 @@ triage_threads() {
   ' "$tmp" > "$out_file"
 }
 
-# ── gate model ───────────────────────────────────────────────────────────────
+# ── gate scoring + gate model ───────────────────────────────────────────────
+
+build_gate_context() {
+  local triage_file="$1" validation_file="$2" out_file="$3"
+  local needs_llm_count pr_comment_count validation_failed
+  local needs_llm_score pr_comment_score test_failure_score total
+  local needs_llm_weight pr_comment_weight test_failure_weight
+
+  needs_llm_count="$(jq '.needs_llm | length' < "$triage_file")"
+  pr_comment_count="$(jq '[.needs_llm[]? | select(.reason == "PR-level comment (no file path)")] | length' < "$triage_file")"
+  validation_failed="$(jq -r '.tests_failed // false' < "$validation_file" 2>/dev/null || echo false)"
+  needs_llm_weight="$(normalize_score "$SCORE_NEEDS_LLM")"
+  pr_comment_weight="$(normalize_score "$SCORE_PR_COMMENT")"
+  test_failure_weight="$(normalize_score "$SCORE_TEST_FAILURE")"
+
+  if [ "$needs_llm_count" -gt 0 ]; then
+    needs_llm_score="$needs_llm_weight"
+  else
+    needs_llm_score="0.000"
+  fi
+
+  if [ "$pr_comment_count" -gt 0 ]; then
+    pr_comment_score="$pr_comment_weight"
+  else
+    pr_comment_score="0.000"
+  fi
+
+  if [ "$validation_failed" = "true" ]; then
+    test_failure_score="$test_failure_weight"
+  else
+    test_failure_score="0.000"
+  fi
+
+  total="$(score_sum "$needs_llm_score" "$pr_comment_score" "$test_failure_score")"
+
+  jq -n \
+    --argjson needs_llm_count "$needs_llm_count" \
+    --argjson pr_comment_count "$pr_comment_count" \
+    --argjson validation_failed "$validation_failed" \
+    --argjson needs_llm_weight "$needs_llm_weight" \
+    --argjson pr_comment_weight "$pr_comment_weight" \
+    --argjson test_failure_weight "$test_failure_weight" \
+    --argjson needs_llm_score "$needs_llm_score" \
+    --argjson pr_comment_score "$pr_comment_score" \
+    --argjson test_failure_score "$test_failure_score" \
+    --argjson total "$total" \
+    --argjson should_run_gate "$(score_at_least_one "$total" && echo true || echo false)" \
+    '{
+      threshold: 1,
+      total_score: $total,
+      should_run_gate: $should_run_gate,
+      components: {
+        needs_llm: {
+          count: $needs_llm_count,
+          weight: $needs_llm_weight,
+          score: $needs_llm_score
+        },
+        pr_comment: {
+          count: $pr_comment_count,
+          weight: $pr_comment_weight,
+          score: $pr_comment_score
+        },
+        test_failure: {
+          failed: $validation_failed,
+          weight: $test_failure_weight,
+          score: $test_failure_score
+        }
+      }
+    }' > "$out_file"
+}
 
 gate_schema() {
   cat <<'JSON'
@@ -617,7 +940,7 @@ JSON
 }
 
 build_gate_prompt() {
-  local owner_repo="$1" pr_num="$2" triage_file="$3"
+  local owner_repo="$1" pr_num="$2" triage_file="$3" validation_file="${4:-}" score_file="${5:-}"
 
   local auto_ct skip_ct fixed_ct llm_ct
   auto_ct="$(jq '.auto | length' < "$triage_file")"
@@ -625,16 +948,38 @@ build_gate_prompt() {
   fixed_ct="$(jq '.already_likely_fixed | length' < "$triage_file")"
   llm_ct="$(jq '.needs_llm | length' < "$triage_file")"
 
+  local validation_summary="No deterministic validation data."
+  local validation_failed="false"
+  local total_score="0"
+  local should_run_gate="false"
+  local needs_llm_score="0"
+  local pr_comment_score="0"
+  local test_failure_score="0"
+
+  if [ -n "$validation_file" ] && [ -f "$validation_file" ]; then
+    validation_summary="$(jq -r '.summary // "No deterministic validation data."' < "$validation_file")"
+    validation_failed="$(jq -r '.tests_failed // false' < "$validation_file")"
+  fi
+
+  if [ -n "$score_file" ] && [ -f "$score_file" ]; then
+    total_score="$(jq -r '.total_score // 0' < "$score_file")"
+    should_run_gate="$(jq -r '.should_run_gate // false' < "$score_file")"
+    needs_llm_score="$(jq -r '.components.needs_llm.score // 0' < "$score_file")"
+    pr_comment_score="$(jq -r '.components.pr_comment.score // 0' < "$score_file")"
+    test_failure_score="$(jq -r '.components.test_failure.score // 0' < "$score_file")"
+  fi
+
   cat <<EOF
 You are a gating model for PR review comment automation.
 
 Goal:
-Decide whether an advanced coding model should run to fix the remaining review threads.
+Decide whether an advanced coding model should run to fix the remaining review threads and/or deterministic validation failures.
 
 Rules:
 - Default to true (send to advanced model) unless you are confident the threads need no code changes.
 - Say false ONLY when ALL remaining threads are: clearly already addressed in the PR, pure praise/thanks, or trivially non-actionable (e.g. "LGTM").
-- Say true for anything involving: bugs, security issues, missing tests, logic errors, missing validation, unused imports that need removal, refactoring requests, or any thread where code should change.
+- If deterministic validation failed, strongly bias toward true unless the failure is clearly irrelevant noise.
+- Say true for anything involving: bugs, security issues, failing tests, missing tests, logic errors, missing validation, unused imports that need removal, refactoring requests, or any thread where code should change.
 - Output ONLY valid JSON matching the schema.
 
 Context:
@@ -646,6 +991,17 @@ Deterministic triage summary:
 - auto/mechanical: $auto_ct
 - already_likely_fixed: $fixed_ct
 - residual needs_llm candidates: $llm_ct
+
+Deterministic validation:
+- tests_failed: $validation_failed
+- summary: $validation_summary
+
+Score before gate:
+- needs_llm contribution: $needs_llm_score
+- pr_comment contribution: $pr_comment_score
+- test_failure contribution: $test_failure_score
+- total: $total_score
+- threshold met: $should_run_gate
 
 Residual candidate threads:
 $(jq -r '
@@ -665,16 +1021,17 @@ EOF
 }
 
 run_gate_model() {
-  local owner_repo="$1" pr_num="$2" triage_file="$3" out_file="$4" log_file="$5"
+  local owner_repo="$1" pr_num="$2" triage_file="$3" validation_file="$4" score_file="$5" out_file="$6" log_file="$7"
   local prompt_file="$LOG_DIR/gate-$pr_num.txt"
   local schema_file="$LOG_DIR/gate-$pr_num.schema.json"
 
-  build_gate_prompt "$owner_repo" "$pr_num" "$triage_file" > "$prompt_file"
+  build_gate_prompt "$owner_repo" "$pr_num" "$triage_file" "$validation_file" "$score_file" > "$prompt_file"
   gate_schema > "$schema_file"
 
   {
     echo "[gate] model=$GATE_MODEL"
     echo "[gate] backend=$AI_BACKEND"
+    [ -f "$score_file" ] && echo "[gate] score: $(cat "$score_file")"
     local raw_out="$LOG_DIR/gate-$pr_num.raw.txt"
     local cmd_failed=false
     if [ "$AI_BACKEND" = "claude" ]; then
@@ -718,17 +1075,24 @@ run_gate_model() {
 # ── advanced fixer ───────────────────────────────────────────────────────────
 
 build_fix_prompt() {
-  local owner_repo="$1" pr_num="$2" threads_file="$3" selected_file="$4"
+  local owner_repo="$1" pr_num="$2" threads_file="$3" selected_file="$4" validation_file="${5:-}"
+
+  local validation_summary="No deterministic validation data."
+  local validation_failed="false"
+  if [ -n "$validation_file" ] && [ -f "$validation_file" ]; then
+    validation_summary="$(jq -r '.summary // "No deterministic validation data."' < "$validation_file")"
+    validation_failed="$(jq -r '.tests_failed // false' < "$validation_file")"
+  fi
 
   cat <<EOF
-You are fixing a SMALL selected subset of unresolved PR review threads.
+You are fixing unresolved PR review threads and deterministic validation failures.
 
 Repo: $owner_repo
 PR: #$pr_num
 
 Rules:
 1. Read AGENTS.md and CLAUDE.md first if present.
-2. Only work on the selected threads below.
+2. Work on the selected threads below. If the selected thread list is empty, focus on deterministic validation failures instead.
 3. Prefer minimal, correct changes.
 4. Skip threads that truly do not require code changes.
 5. If you edit files, stage, commit, and push.
@@ -742,9 +1106,14 @@ Rules:
    ]
 7. Do NOT include threads outside the selected set.
 8. If no code changes are needed, still write thread-responses.json.
+9. If deterministic validation failed, run the relevant tests/checks again after your fix if feasible.
 
 Selected thread IDs:
 $(cat "$selected_file")
+
+Deterministic validation:
+- tests_failed: $validation_failed
+- summary: $validation_summary
 
 Selected thread details:
 $(jq -r --arg ids "$(cat "$selected_file")" '
@@ -763,10 +1132,10 @@ EOF
 }
 
 run_fix_model() {
-  local owner_repo="$1" pr_num="$2" worktree_path="$3" threads_file="$4" selected_file="$5" log_file="$6"
+  local owner_repo="$1" pr_num="$2" worktree_path="$3" threads_file="$4" selected_file="$5" validation_file="$6" log_file="$7"
   local prompt_file="$LOG_DIR/fix-$pr_num.txt"
 
-  build_fix_prompt "$owner_repo" "$pr_num" "$threads_file" "$selected_file" > "$prompt_file"
+  build_fix_prompt "$owner_repo" "$pr_num" "$threads_file" "$selected_file" "$validation_file" > "$prompt_file"
 
   {
     echo "[fix] model=$FIX_MODEL"
@@ -1039,6 +1408,20 @@ post_fix_review_cycle() {
   } >> "$log_file" 2>&1
 }
 
+run_pre_gate_phase() {
+  local pr_num="$1" worktree_path="$2" triage_file="$3" hook="$4" validate_runner="$5" log_file="$6"
+  local validation_file="$LOG_DIR/pr-$pr_num-validation.json"
+  local gate_context="$LOG_DIR/pr-$pr_num-gate-context.json"
+
+  run_autofix_hook "$worktree_path" "$hook" "$log_file"
+  run_validation "$worktree_path" "$validate_runner" "$validation_file" "$log_file"
+  build_gate_context "$triage_file" "$validation_file" "$gate_context"
+
+  {
+    echo "[score] $(cat "$gate_context")"
+  } >> "$log_file" 2>&1
+}
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  TUI — Terminal dashboard for parallel mode
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1049,6 +1432,16 @@ TUI_VIEW="dashboard"     # dashboard | detail
 TUI_DETAIL_SCROLL=0       # scroll offset in detail view
 TUI_READY_LIST=""          # cached ready PR list
 TUI_READY_COUNT=0
+LAUNCH_SELECTED=0
+LAUNCH_ERROR=""
+LAUNCH_TARGET=""
+LAUNCH_BACKEND=""
+LAUNCH_GATE_MODEL=""
+LAUNCH_FIX_MODEL=""
+LAUNCH_CONCURRENCY=""
+LAUNCH_SCORE_NEEDS_LLM=""
+LAUNCH_SCORE_PR_COMMENT=""
+LAUNCH_SCORE_TEST_FAILURE=""
 
 # Get status of a PR: queued | running | done | failed
 pr_status() {
@@ -1101,12 +1494,19 @@ tui_close_tty() {
 # Read one keypress (non-blocking, ~0.4s timeout via loop)
 tui_read_key() {
   local key=""
+  local status=0
   # Use the dedicated tty fd
-  IFS= read -rsn1 -t 1 key <&4 2>/dev/null || true
+  IFS= read -rsn1 -t 1 key <&4 2>/dev/null
+  status=$?
 
-  if [ -z "$key" ]; then
+  if [ "$status" -ne 0 ]; then
     # Timeout — no input
     echo ""
+    return
+  fi
+
+  if [ -z "$key" ]; then
+    echo "ENTER"
     return
   fi
 
@@ -1116,18 +1516,26 @@ tui_read_key() {
 
   if [ "$key" = "$esc_char" ]; then
     # Read rest of escape sequence — arrow keys send ESC [ A/B/C/D
-    local c1="" c2=""
+    local c1="" c2="" c3=""
     IFS= read -rsn1 -t 1 c1 <&4 2>/dev/null || true
     IFS= read -rsn1 -t 1 c2 <&4 2>/dev/null || true
-    case "${c1}${c2}" in
+    if [ "${c1}${c2}" = "[3" ]; then
+      IFS= read -rsn1 -t 1 c3 <&4 2>/dev/null || true
+    fi
+    case "${c1}${c2}${c3}" in
       '[A') echo "UP" ;;
       '[B') echo "DOWN" ;;
+      '[C') echo "RIGHT" ;;
+      '[D') echo "LEFT" ;;
+      '[3~') echo "DELETE" ;;
       *)    echo "ESC" ;;
     esac
+  elif [ "$key" = $'\177' ] || [ "$key" = $'\010' ]; then
+    echo "BACKSPACE"
+  elif [ "$key" = $'\t' ]; then
+    echo "TAB"
   elif [ "$key" = "q" ] || [ "$key" = "Q" ]; then
     echo "QUIT"
-  elif [ "$key" = "" ]; then
-    echo "ENTER"
   else
     echo "$key"
   fi
@@ -1147,6 +1555,216 @@ spinner_char() {
   local simple_frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
   local idx=$((SPINNER_IDX % 10))
   echo "${simple_frames[$idx]}"
+}
+
+launcher_reset() {
+  LAUNCH_SELECTED=0
+  LAUNCH_ERROR=""
+  LAUNCH_TARGET=""
+  LAUNCH_BACKEND="$AI_BACKEND"
+  LAUNCH_GATE_MODEL="$GATE_MODEL"
+  LAUNCH_FIX_MODEL="$FIX_MODEL"
+  LAUNCH_CONCURRENCY="$CONCURRENCY"
+  LAUNCH_SCORE_NEEDS_LLM="$SCORE_NEEDS_LLM"
+  LAUNCH_SCORE_PR_COMMENT="$SCORE_PR_COMMENT"
+  LAUNCH_SCORE_TEST_FAILURE="$SCORE_TEST_FAILURE"
+}
+
+launcher_field_count() { echo 9; }
+
+launcher_field_label() {
+  case "$1" in
+    0) echo "Target" ;;
+    1) echo "AI backend" ;;
+    2) echo "Gate model" ;;
+    3) echo "Fix model" ;;
+    4) echo "Concurrency" ;;
+    5) echo "Score: needs_llm" ;;
+    6) echo "Score: pr_comment" ;;
+    7) echo "Score: test_failure" ;;
+    8) echo "Start" ;;
+  esac
+}
+
+launcher_field_value() {
+  case "$1" in
+    0) echo "$LAUNCH_TARGET" ;;
+    1) echo "$LAUNCH_BACKEND" ;;
+    2) echo "$LAUNCH_GATE_MODEL" ;;
+    3) echo "$LAUNCH_FIX_MODEL" ;;
+    4) echo "$LAUNCH_CONCURRENCY" ;;
+    5) echo "$LAUNCH_SCORE_NEEDS_LLM" ;;
+    6) echo "$LAUNCH_SCORE_PR_COMMENT" ;;
+    7) echo "$LAUNCH_SCORE_TEST_FAILURE" ;;
+    8) echo "Press Enter to launch" ;;
+  esac
+}
+
+launcher_set_value() {
+  local idx="$1" value="$2"
+  case "$idx" in
+    0) LAUNCH_TARGET="$value" ;;
+    1) LAUNCH_BACKEND="$value" ;;
+    2) LAUNCH_GATE_MODEL="$value" ;;
+    3) LAUNCH_FIX_MODEL="$value" ;;
+    4) LAUNCH_CONCURRENCY="$value" ;;
+    5) LAUNCH_SCORE_NEEDS_LLM="$value" ;;
+    6) LAUNCH_SCORE_PR_COMMENT="$value" ;;
+    7) LAUNCH_SCORE_TEST_FAILURE="$value" ;;
+  esac
+}
+
+launcher_append_char() {
+  local idx="$1" char="$2"
+  case "$idx" in
+    0|2|3|4|5|6|7)
+      launcher_set_value "$idx" "$(launcher_field_value "$idx")$char"
+      ;;
+  esac
+}
+
+launcher_backspace() {
+  local idx="$1" current
+  current="$(launcher_field_value "$idx")"
+  [ -n "$current" ] || return 0
+  launcher_set_value "$idx" "${current%?}"
+}
+
+launcher_cycle_backend() {
+  case "$LAUNCH_BACKEND" in
+    auto)   LAUNCH_BACKEND="$([ "$1" = "right" ] && echo claude || echo codex)" ;;
+    claude) LAUNCH_BACKEND="$([ "$1" = "right" ] && echo codex || echo auto)" ;;
+    codex)  LAUNCH_BACKEND="$([ "$1" = "right" ] && echo auto || echo claude)" ;;
+    *)      LAUNCH_BACKEND="auto" ;;
+  esac
+}
+
+launcher_render() {
+  local cols rows
+  cols=$(tput cols 2>/dev/null || echo 80)
+  rows=$(tput lines 2>/dev/null || echo 24)
+
+  local buf=""
+  buf="${buf}\033[H"
+  buf="${buf}  ${BOLD}gh crfix launcher${RST}${CLR}\n"
+  buf="${buf}  ${c_gray}Wpisz numer PR, zakres, listę albo pełny URL. Ustaw modele i scoring; gate odpali się od progu 1.0.${RST}${CLR}\n\n"
+
+  local idx=0 count label value prefix
+  count="$(launcher_field_count)"
+  while [ "$idx" -lt "$count" ]; do
+    label="$(launcher_field_label "$idx")"
+    value="$(launcher_field_value "$idx")"
+    [ -z "$value" ] && value=" "
+    if [ ${#value} -gt "$((cols - 26))" ]; then
+      value="${value:0:$((cols - 27))}…"
+    fi
+    if [ "$idx" -eq "$LAUNCH_SELECTED" ]; then
+      prefix="${BOLD}▸${RST}"
+      buf="${buf} ${prefix} ${BOLD}$(printf '%-20s' "$label")${RST} ${c_white}${value}${RST}${CLR}\n"
+    else
+      buf="${buf}   $(printf '%-20s' "$label") ${c_gray}${value}${RST}${CLR}\n"
+    fi
+    idx=$((idx + 1))
+  done
+
+  buf="${buf}\n"
+  buf="${buf}  ${c_gray}↑↓/Tab navigate  ←→ backend  type to edit  Backspace delete  Enter launch${RST}${CLR}\n"
+  if [ -n "$LAUNCH_ERROR" ]; then
+    buf="${buf}  ${c_red}${LAUNCH_ERROR}${RST}${CLR}\n"
+  fi
+
+  buf="${buf}\033[$((rows));1H"
+  buf="${buf}  ${c_gray}q / Esc cancel${RST}${CLR}"
+  printf '%b' "$buf"
+}
+
+launcher_apply() {
+  local old_owner="$OWNER_REPO" old_prs="$PR_NUMBERS"
+
+  [ -n "$LAUNCH_TARGET" ] || { LAUNCH_ERROR="Target is required."; return 1; }
+  case "$LAUNCH_BACKEND" in auto|claude|codex) ;; *) LAUNCH_ERROR="AI backend must be auto, claude or codex."; return 1 ;; esac
+  case "$LAUNCH_CONCURRENCY" in ''|*[!0-9]*) LAUNCH_ERROR="Concurrency must be an integer."; return 1 ;; esac
+  [ "$LAUNCH_CONCURRENCY" -ge 1 ] || { LAUNCH_ERROR="Concurrency must be >= 1."; return 1; }
+  is_number_0_to_1 "$LAUNCH_SCORE_NEEDS_LLM" || { LAUNCH_ERROR="Score needs_llm must be between 0 and 1."; return 1; }
+  is_number_0_to_1 "$LAUNCH_SCORE_PR_COMMENT" || { LAUNCH_ERROR="Score pr_comment must be between 0 and 1."; return 1; }
+  is_number_0_to_1 "$LAUNCH_SCORE_TEST_FAILURE" || { LAUNCH_ERROR="Score test_failure must be between 0 and 1."; return 1; }
+
+  if ! (parse_input "$LAUNCH_TARGET") >/dev/null 2>&1; then
+    OWNER_REPO="$old_owner"
+    PR_NUMBERS="$old_prs"
+    LAUNCH_ERROR="Target could not be parsed. Use PR number, range, list or GitHub URL."
+    return 1
+  fi
+
+  AI_BACKEND="$LAUNCH_BACKEND"
+  GATE_MODEL="$LAUNCH_GATE_MODEL"
+  FIX_MODEL="$LAUNCH_FIX_MODEL"
+  CONCURRENCY="$LAUNCH_CONCURRENCY"
+  SCORE_NEEDS_LLM="$(normalize_score "$LAUNCH_SCORE_NEEDS_LLM")"
+  SCORE_PR_COMMENT="$(normalize_score "$LAUNCH_SCORE_PR_COMMENT")"
+  SCORE_TEST_FAILURE="$(normalize_score "$LAUNCH_SCORE_TEST_FAILURE")"
+  parse_input "$LAUNCH_TARGET"
+  LAUNCH_FROM_TUI=true
+  return 0
+}
+
+launcher_loop() {
+  launcher_reset
+  TUI_ACTIVE=true
+  tui_open_tty
+  tput smcup
+  tput civis
+  tput clear
+
+  while true; do
+    launcher_render
+    local key
+    key="$(tui_read_key)"
+
+    case "$key" in
+      UP)
+        LAUNCH_SELECTED=$((LAUNCH_SELECTED - 1))
+        [ "$LAUNCH_SELECTED" -lt 0 ] && LAUNCH_SELECTED=8
+        ;;
+      DOWN|TAB|ENTER)
+        if [ "$key" = "ENTER" ] && [ "$LAUNCH_SELECTED" -eq 8 ]; then
+          if launcher_apply; then
+            break
+          fi
+        else
+          LAUNCH_SELECTED=$((LAUNCH_SELECTED + 1))
+          [ "$LAUNCH_SELECTED" -gt 8 ] && LAUNCH_SELECTED=0
+        fi
+        ;;
+      LEFT)
+        [ "$LAUNCH_SELECTED" -eq 1 ] && launcher_cycle_backend "left"
+        ;;
+      RIGHT)
+        [ "$LAUNCH_SELECTED" -eq 1 ] && launcher_cycle_backend "right"
+        ;;
+      BACKSPACE|DELETE)
+        launcher_backspace "$LAUNCH_SELECTED"
+        ;;
+      QUIT|ESC)
+        tui_close_tty
+        tput cnorm
+        tput rmcup
+        TUI_ACTIVE=false
+        return 1
+        ;;
+      "")
+        ;;
+      *)
+        LAUNCH_ERROR=""
+        launcher_append_char "$LAUNCH_SELECTED" "$key"
+        ;;
+    esac
+  done
+
+  tui_close_tty
+  tput cnorm
+  tput rmcup
+  TUI_ACTIVE=false
 }
 
 # ── TUI: render dashboard (buffered — single write) ─────────────────────────
@@ -1477,8 +2095,11 @@ tui_loop() {
 setup_all() {
   local repo_dir="$1"
   local autofix_hook
+  local validate_runner
   autofix_hook="$(detect_autofix_hook "$repo_dir")"
+  validate_runner="$(detect_validate_runner "$repo_dir")"
   kv_set global autofix_hook "$autofix_hook"
+  kv_set global validate_runner "$validate_runner"
 
   for pr_num in $PR_NUMBERS; do
     echo ""
@@ -1564,12 +2185,13 @@ setup_all() {
 
 process_pr() {
   local pr_num="$1"
-  local title worktree_path threads_file triage_file log_file hook
+  local title worktree_path threads_file triage_file log_file hook validate_runner
   title="$(kv_get "$pr_num" title)"
   worktree_path="$(kv_get "$pr_num" worktree)"
   threads_file="$(kv_get "$pr_num" threads_file)"
   triage_file="$(kv_get "$pr_num" triage_file)"
   hook="$(kv_get global autofix_hook)"
+  validate_runner="$(kv_get global validate_runner)"
   log_file="$LOG_DIR/pr-$pr_num.log"
 
   # Signal start
@@ -1586,43 +2208,63 @@ process_pr() {
     local deterministic_responses="$LOG_DIR/pr-$pr_num-deterministic-responses.json"
     write_deterministic_responses "$triage_file" "$deterministic_responses"
 
-    # 2. Run autofix hook
-    run_autofix_hook "$worktree_path" "$hook" "$log_file"
+    # 2. Run deterministic pre-gate phase
+    run_pre_gate_phase "$pr_num" "$worktree_path" "$triage_file" "$hook" "$validate_runner" "$log_file"
+    local validation_file="$LOG_DIR/pr-$pr_num-validation.json"
+    local gate_context="$LOG_DIR/pr-$pr_num-gate-context.json"
 
-    # 3. Run gate model
+    # 3. Run gate model only after score threshold is met
     local gate_out="$LOG_DIR/pr-$pr_num-gate.json"
-    run_gate_model "$OWNER_REPO" "$pr_num" "$triage_file" "$gate_out" "$log_file"
+    local selected_file="$LOG_DIR/pr-$pr_num-selected.txt"
+    local should_run_gate
+    should_run_gate="$(jq -r '.should_run_gate // false' < "$gate_context" 2>/dev/null || echo false)"
+    : > "$selected_file"
+
+    if [ "$should_run_gate" = "true" ]; then
+      run_gate_model "$OWNER_REPO" "$pr_num" "$triage_file" "$validation_file" "$gate_context" "$gate_out" "$log_file"
+      jq -r '.threads_to_fix[]?' < "$gate_out" > "$selected_file" || true
+    else
+      local total_score
+      total_score="$(jq -r '.total_score // 0' < "$gate_context" 2>/dev/null || echo 0)"
+      jq -n \
+        --arg reason "deterministic score below threshold ($total_score < 1)" \
+        '{needs_advanced_model: false, reason: $reason, threads_to_fix: []}' > "$gate_out"
+      echo "[gate] skipped: $(jq -r '.reason' < "$gate_out")"
+    fi
 
     local needs_advanced
     needs_advanced="$(jq -r '.needs_advanced_model' < "$gate_out" 2>/dev/null || echo "true")"
 
-    local selected_file="$LOG_DIR/pr-$pr_num-selected.txt"
-    jq -r '.threads_to_fix[]?' < "$gate_out" > "$selected_file" || true
-
     # 4. If gate says yes -> run fix model
     if [ "$needs_advanced" = "true" ]; then
-      if [ ! -s "$selected_file" ]; then
+      if [ ! -s "$selected_file" ] && [ "$(jq '.needs_llm | length' < "$triage_file")" -gt 0 ]; then
         jq -r '.needs_llm[]?.thread_id' < "$triage_file" > "$selected_file"
       fi
 
       if [ "$DRY_RUN" = true ]; then
         echo "[dry-run] would run advanced model on:"
-        cat "$selected_file"
+        if [ -s "$selected_file" ]; then
+          cat "$selected_file"
+        else
+          echo "(no explicit thread selection; deterministic validation failed)"
+        fi
       else
-        run_fix_model "$OWNER_REPO" "$pr_num" "$worktree_path" "$threads_file" "$selected_file" "$log_file"
+        run_fix_model "$OWNER_REPO" "$pr_num" "$worktree_path" "$threads_file" "$selected_file" "$validation_file" "$log_file"
       fi
     else
       local reason
       reason="$(jq -r '.reason // "n/a"' < "$gate_out" 2>/dev/null)"
       echo "[gate] advanced model not needed ($reason)"
 
-      # Generate "skipped by gate" responses so needs_llm threads still get resolved
-      local gate_skipped="$LOG_DIR/pr-$pr_num-gate-skipped.json"
-      jq '[.needs_llm[]? | {
-        thread_id: .thread_id,
-        action: "already_fixed",
-        comment: ("Reviewed by automation — no code change needed: " + .reason + ".")
-      }]' < "$triage_file" > "$gate_skipped"
+      if [ "$should_run_gate" = "true" ]; then
+        # Generate "skipped by gate" responses so needs_llm threads still get resolved
+        local gate_skipped="$LOG_DIR/pr-$pr_num-gate-skipped.json"
+        jq '[.needs_llm[]? | {
+          thread_id: .thread_id,
+          action: "already_fixed",
+          comment: ("Reviewed by automation — no code change needed: " + .reason + ".")
+        }]' < "$triage_file" > "$gate_skipped"
+      fi
     fi
 
     # 5. Merge deterministic + LLM + gate-skipped responses
@@ -1689,12 +2331,13 @@ process_pr() {
 
 process_pr_sequential() {
   local pr_num="$1"
-  local title worktree_path threads_file triage_file log_file hook
+  local title worktree_path threads_file triage_file log_file hook validate_runner
   title="$(kv_get "$pr_num" title)"
   worktree_path="$(kv_get "$pr_num" worktree)"
   threads_file="$(kv_get "$pr_num" threads_file)"
   triage_file="$(kv_get "$pr_num" triage_file)"
   hook="$(kv_get global autofix_hook)"
+  validate_runner="$(kv_get global validate_runner)"
   log_file="$LOG_DIR/pr-$pr_num.log"
 
   date +%s > "$LOG_DIR/pr-${pr_num}.started"
@@ -1711,39 +2354,57 @@ process_pr_sequential() {
   write_deterministic_responses "$triage_file" "$deterministic_responses"
   echo "  deterministic responses written"
 
-  # 2. Run autofix hook
-  if [ -n "$hook" ] && [ -x "$hook" ]; then
-    echo "  Running autofix hook: $hook"
-    run_autofix_hook "$worktree_path" "$hook" "$log_file"
-  fi
+  # 2. Run deterministic pre-gate phase
+  echo "  Running deterministic validation..."
+  run_pre_gate_phase "$pr_num" "$worktree_path" "$triage_file" "$hook" "$validate_runner" "$log_file"
+  local validation_file="$LOG_DIR/pr-$pr_num-validation.json"
+  local gate_context="$LOG_DIR/pr-$pr_num-gate-context.json"
+  echo "  Validation : $(jq -r '.summary' < "$validation_file")"
+  echo "  Gate score : $(jq -r '.total_score' < "$gate_context")"
 
-  # 3. Run gate model
-  echo "  Running gate model ($GATE_MODEL)..."
+  # 3. Run gate model only after score threshold is met
   local gate_out="$LOG_DIR/pr-$pr_num-gate.json"
-  run_gate_model "$OWNER_REPO" "$pr_num" "$triage_file" "$gate_out" "$log_file"
+  local selected_file="$LOG_DIR/pr-$pr_num-selected.txt"
+  local should_run_gate
+  should_run_gate="$(jq -r '.should_run_gate // false' < "$gate_context" 2>/dev/null || echo false)"
+  : > "$selected_file"
+
+  if [ "$should_run_gate" = "true" ]; then
+    echo "  Running gate model ($GATE_MODEL)..."
+    run_gate_model "$OWNER_REPO" "$pr_num" "$triage_file" "$validation_file" "$gate_context" "$gate_out" "$log_file"
+    jq -r '.threads_to_fix[]?' < "$gate_out" > "$selected_file" || true
+  else
+    local total_score
+    total_score="$(jq -r '.total_score // 0' < "$gate_context" 2>/dev/null || echo 0)"
+    jq -n \
+      --arg reason "deterministic score below threshold ($total_score < 1)" \
+      '{needs_advanced_model: false, reason: $reason, threads_to_fix: []}' > "$gate_out"
+    echo "  Gate: SKIP — $(jq -r '.reason' < "$gate_out")"
+  fi
 
   local needs_advanced
   needs_advanced="$(jq -r '.needs_advanced_model' < "$gate_out" 2>/dev/null || echo "true")"
 
-  local selected_file="$LOG_DIR/pr-$pr_num-selected.txt"
-  jq -r '.threads_to_fix[]?' < "$gate_out" > "$selected_file" || true
-
   # 4. If gate says yes -> run fix model
   if [ "$needs_advanced" = "true" ]; then
-    if [ ! -s "$selected_file" ]; then
+    if [ ! -s "$selected_file" ] && [ "$(jq '.needs_llm | length' < "$triage_file")" -gt 0 ]; then
       jq -r '.needs_llm[]?.thread_id' < "$triage_file" > "$selected_file"
     fi
 
     local sel_count
     sel_count="$(wc -l < "$selected_file" | tr -d ' ')"
-    echo "  Gate: YES — $sel_count thread(s) need advanced model"
+    echo "  Gate: YES — $sel_count thread(s) selected; validation_failed=$(jq -r '.tests_failed' < "$validation_file")"
 
     if [ "$DRY_RUN" = true ]; then
       echo "  [dry-run] would run advanced model on:"
-      sed 's/^/    /' "$selected_file"
+      if [ -s "$selected_file" ]; then
+        sed 's/^/    /' "$selected_file"
+      else
+        echo "    (no explicit thread selection; deterministic validation failed)"
+      fi
     else
       echo "  Launching fix model ($FIX_MODEL)..."
-      run_fix_model "$OWNER_REPO" "$pr_num" "$worktree_path" "$threads_file" "$selected_file" "$log_file" \
+      run_fix_model "$OWNER_REPO" "$pr_num" "$worktree_path" "$threads_file" "$selected_file" "$validation_file" "$log_file" \
         || echo "  Fix model failed (continuing)"
     fi
   else
@@ -1751,13 +2412,15 @@ process_pr_sequential() {
     reason="$(jq -r '.reason // "n/a"' < "$gate_out" 2>/dev/null)"
     echo "  Gate: NO — advanced model not needed ($reason)"
 
-    # Generate "skipped by gate" responses so needs_llm threads still get resolved
-    local gate_skipped="$LOG_DIR/pr-$pr_num-gate-skipped.json"
-    jq '[.needs_llm[]? | {
-      thread_id: .thread_id,
-      action: "already_fixed",
-      comment: ("Reviewed by automation — no code change needed: " + .reason + ".")
-    }]' < "$triage_file" > "$gate_skipped"
+    if [ "$should_run_gate" = "true" ]; then
+      # Generate "skipped by gate" responses so needs_llm threads still get resolved
+      local gate_skipped="$LOG_DIR/pr-$pr_num-gate-skipped.json"
+      jq '[.needs_llm[]? | {
+        thread_id: .thread_id,
+        action: "already_fixed",
+        comment: ("Reviewed by automation — no code change needed: " + .reason + ".")
+      }]' < "$triage_file" > "$gate_skipped"
+    fi
   fi
 
   # 5. Merge deterministic + LLM + gate-skipped responses
@@ -1887,7 +2550,16 @@ sem_destroy() { exec 3>&- 2>/dev/null || true; rm -f "$SEMAPHORE" 2>/dev/null ||
 # ── main ─────────────────────────────────────────────────────────────────────
 
 main() {
-  parse_flags "$@"
+  if [ "$#" -eq 0 ]; then
+    if [ -t 0 ] && [ -t 1 ]; then
+      launcher_loop || return 0
+    else
+      usage
+      return 0
+    fi
+  else
+    parse_flags "$@"
+  fi
 
   LOG_DIR="$(mktemp -d /tmp/gh-crfix-XXXXXX)"
   verify_prereqs
@@ -1906,6 +2578,14 @@ main() {
     echo "Autofix    : $hook"
   else
     echo "Autofix    : none"
+  fi
+
+  local validate_runner
+  validate_runner="$(detect_validate_runner "$repo_dir")"
+  if [ -n "$validate_runner" ]; then
+    echo "Validate   : ${validate_runner#*::}"
+  else
+    echo "Validate   : none"
   fi
 
   [ "$DRY_RUN" = true ] && echo "Mode       : DRY RUN"
