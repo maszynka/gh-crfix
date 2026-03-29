@@ -50,6 +50,7 @@
 #   GH_CRFIX_SCORE_NEEDS_LLM     score contribution (default: 1)
 #   GH_CRFIX_SCORE_PR_COMMENT    score contribution (default: 0.4)
 #   GH_CRFIX_SCORE_TEST_FAILURE  score contribution (default: 1)
+#   Persistent defaults file     ${XDG_CONFIG_HOME:-~/.config}/gh-crfix/defaults
 
 set -euo pipefail
 
@@ -85,6 +86,14 @@ BG_PIDS=""
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
+config_dir() {
+  echo "${XDG_CONFIG_HOME:-$HOME/.config}/gh-crfix"
+}
+
+config_file() {
+  echo "$(config_dir)/defaults"
+}
+
 is_number_0_to_1() {
   local value="${1:-}"
   echo "$value" | grep -Eq '^(0(\.[0-9]+)?|1(\.0+)?|\.[0-9]+)$'
@@ -111,6 +120,75 @@ normalize_score() {
 
 score_at_least_one() {
   awk -v total="$1" 'BEGIN { exit !(total + 0 >= 1) }'
+}
+
+load_persisted_defaults() {
+  local file key value
+  file="$(config_file)"
+  [ -f "$file" ] || return 0
+
+  while IFS='=' read -r key value; do
+    case "$key" in
+      ''|'#'*) continue ;;
+      AI_BACKEND)
+        case "$value" in
+          auto|claude|codex)
+            [ -z "${GH_CRFIX_AI_BACKEND+x}" ] && AI_BACKEND="$value"
+            ;;
+        esac
+        ;;
+      GATE_MODEL)
+        [ -n "$value" ] && [ -z "${GH_CRFIX_GATE_MODEL+x}" ] && GATE_MODEL="$value"
+        ;;
+      FIX_MODEL)
+        [ -n "$value" ] && [ -z "${GH_CRFIX_FIX_MODEL+x}" ] && FIX_MODEL="$value"
+        ;;
+      CONCURRENCY)
+        case "$value" in
+          ''|*[!0-9]*) ;;
+          *)
+            [ "$value" -ge 1 ] && CONCURRENCY="$value"
+            ;;
+        esac
+        ;;
+      SCORE_NEEDS_LLM)
+        if is_number_0_to_1 "$value" && [ -z "${GH_CRFIX_SCORE_NEEDS_LLM+x}" ]; then
+          SCORE_NEEDS_LLM="$value"
+        fi
+        ;;
+      SCORE_PR_COMMENT)
+        if is_number_0_to_1 "$value" && [ -z "${GH_CRFIX_SCORE_PR_COMMENT+x}" ]; then
+          SCORE_PR_COMMENT="$value"
+        fi
+        ;;
+      SCORE_TEST_FAILURE)
+        if is_number_0_to_1 "$value" && [ -z "${GH_CRFIX_SCORE_TEST_FAILURE+x}" ]; then
+          SCORE_TEST_FAILURE="$value"
+        fi
+        ;;
+    esac
+  done < "$file"
+}
+
+save_persisted_defaults() {
+  local dir file tmp
+  dir="$(config_dir)"
+  file="$(config_file)"
+  tmp="$file.tmp.$$"
+
+  mkdir -p "$dir" || return 1
+  {
+    echo "# gh-crfix persisted defaults"
+    echo "AI_BACKEND=$AI_BACKEND"
+    echo "GATE_MODEL=$GATE_MODEL"
+    echo "FIX_MODEL=$FIX_MODEL"
+    echo "CONCURRENCY=$CONCURRENCY"
+    echo "SCORE_NEEDS_LLM=$(normalize_score "$SCORE_NEEDS_LLM")"
+    echo "SCORE_PR_COMMENT=$(normalize_score "$SCORE_PR_COMMENT")"
+    echo "SCORE_TEST_FAILURE=$(normalize_score "$SCORE_TEST_FAILURE")"
+  } > "$tmp" || return 1
+
+  mv "$tmp" "$file"
 }
 
 resolve_ai_backend() {
@@ -1683,6 +1761,8 @@ launcher_apply() {
 
   [ -n "$LAUNCH_TARGET" ] || { LAUNCH_ERROR="Target is required."; return 1; }
   case "$LAUNCH_BACKEND" in auto|claude|codex) ;; *) LAUNCH_ERROR="AI backend must be auto, claude or codex."; return 1 ;; esac
+  [ -n "$LAUNCH_GATE_MODEL" ] || { LAUNCH_ERROR="Gate model is required."; return 1; }
+  [ -n "$LAUNCH_FIX_MODEL" ] || { LAUNCH_ERROR="Fix model is required."; return 1; }
   case "$LAUNCH_CONCURRENCY" in ''|*[!0-9]*) LAUNCH_ERROR="Concurrency must be an integer."; return 1 ;; esac
   [ "$LAUNCH_CONCURRENCY" -ge 1 ] || { LAUNCH_ERROR="Concurrency must be >= 1."; return 1; }
   is_number_0_to_1 "$LAUNCH_SCORE_NEEDS_LLM" || { LAUNCH_ERROR="Score needs_llm must be between 0 and 1."; return 1; }
@@ -1704,6 +1784,7 @@ launcher_apply() {
   SCORE_PR_COMMENT="$(normalize_score "$LAUNCH_SCORE_PR_COMMENT")"
   SCORE_TEST_FAILURE="$(normalize_score "$LAUNCH_SCORE_TEST_FAILURE")"
   parse_input "$LAUNCH_TARGET"
+  save_persisted_defaults || { LAUNCH_ERROR="Could not save defaults to $(config_file)."; return 1; }
   LAUNCH_FROM_TUI=true
   return 0
 }
@@ -2550,6 +2631,8 @@ sem_destroy() { exec 3>&- 2>/dev/null || true; rm -f "$SEMAPHORE" 2>/dev/null ||
 # ── main ─────────────────────────────────────────────────────────────────────
 
 main() {
+  load_persisted_defaults
+
   if [ "$#" -eq 0 ]; then
     if [ -t 0 ] && [ -t 1 ]; then
       launcher_loop || return 0

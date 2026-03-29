@@ -111,6 +111,14 @@ Running plain `gh crfix` in a TTY opens a full-screen launcher where you can:
 - set concurrency
 - tune the gate score inputs
 
+After you launch from this screen, `gh crfix` persists those defaults to:
+
+```bash
+${XDG_CONFIG_HOME:-~/.config}/gh-crfix/defaults
+```
+
+The next launcher run will preload them, and CLI runs without explicit flags will also use them unless overridden by env vars or flags.
+
 The gate score uses three weights:
 
 - `needs_llm`
