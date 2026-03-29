@@ -1520,6 +1520,17 @@ LAUNCH_CONCURRENCY=""
 LAUNCH_SCORE_NEEDS_LLM=""
 LAUNCH_SCORE_PR_COMMENT=""
 LAUNCH_SCORE_TEST_FAILURE=""
+LAUNCH_TMP_DIR=""
+LAUNCH_MODEL_STATUS="static defaults"
+LAUNCH_FETCH_PIDS=""
+LAUNCHER_BACKEND_OPTIONS=(auto claude codex)
+LAUNCHER_CONCURRENCY_OPTIONS=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)
+LAUNCHER_SCORE_OPTIONS=(0 .1 .2 .3 .4 .5 .6 .7 .8 .9 1)
+LAUNCHER_CLAUDE_FALLBACK_OPTIONS=(sonnet opus haiku)
+LAUNCHER_CODEX_FALLBACK_OPTIONS=(gpt-5.4-mini gpt-5.4 gpt-5)
+LAUNCHER_CLAUDE_OPTIONS=(sonnet opus haiku)
+LAUNCHER_CODEX_OPTIONS=(gpt-5.4-mini gpt-5.4 gpt-5)
+LAUNCHER_AUTO_OPTIONS=(sonnet opus haiku gpt-5.4-mini gpt-5.4 gpt-5)
 
 # Get status of a PR: queued | running | done | failed
 pr_status() {
@@ -1643,12 +1654,302 @@ launcher_reset() {
   LAUNCH_GATE_MODEL="$GATE_MODEL"
   LAUNCH_FIX_MODEL="$FIX_MODEL"
   LAUNCH_CONCURRENCY="$CONCURRENCY"
-  LAUNCH_SCORE_NEEDS_LLM="$SCORE_NEEDS_LLM"
-  LAUNCH_SCORE_PR_COMMENT="$SCORE_PR_COMMENT"
-  LAUNCH_SCORE_TEST_FAILURE="$SCORE_TEST_FAILURE"
+  LAUNCH_SCORE_NEEDS_LLM="$(launcher_score_token "$SCORE_NEEDS_LLM")"
+  LAUNCH_SCORE_PR_COMMENT="$(launcher_score_token "$SCORE_PR_COMMENT")"
+  LAUNCH_SCORE_TEST_FAILURE="$(launcher_score_token "$SCORE_TEST_FAILURE")"
+  LAUNCHER_CLAUDE_OPTIONS=("${LAUNCHER_CLAUDE_FALLBACK_OPTIONS[@]}")
+  LAUNCHER_CODEX_OPTIONS=("${LAUNCHER_CODEX_FALLBACK_OPTIONS[@]}")
+  LAUNCH_MODEL_STATUS="loading live model lists..."
+  launcher_seed_current_models
+  launcher_refresh_auto_options
+  launcher_sync_option_fields
+  launcher_start_model_fetch
 }
 
 launcher_field_count() { echo 9; }
+
+launcher_guess_backend_for_model() {
+  case "$1" in
+    "" ) echo "" ;;
+    sonnet|opus|haiku|claude-*) echo "claude" ;;
+    *) echo "codex" ;;
+  esac
+}
+
+launcher_score_token() {
+  case "$(normalize_score "${1:-0}")" in
+    0.000) echo "0" ;;
+    0.100) echo ".1" ;;
+    0.200) echo ".2" ;;
+    0.300) echo ".3" ;;
+    0.400) echo ".4" ;;
+    0.500) echo ".5" ;;
+    0.600) echo ".6" ;;
+    0.700) echo ".7" ;;
+    0.800) echo ".8" ;;
+    0.900) echo ".9" ;;
+    1.000) echo "1" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+launcher_array_contains() {
+  local array_name="$1" target="$2" item
+  while IFS= read -r item; do
+    [ "$item" = "$target" ] && return 0
+  done <<EOF
+$(eval 'printf "%s\n" "${'"$array_name"'[@]-}"')
+EOF
+  return 1
+}
+
+launcher_array_prepend_unique() {
+  local array_name="$1" value="$2"
+  [ -n "$value" ] || return 0
+  launcher_array_contains "$array_name" "$value" && return 0
+  eval "$array_name=(\"\$value\" \"\${${array_name}[@]-}\")"
+}
+
+launcher_refresh_auto_options() {
+  local merged=() item
+  for item in "${LAUNCHER_CLAUDE_OPTIONS[@]-}" "${LAUNCHER_CODEX_OPTIONS[@]-}"; do
+    [ -n "$item" ] || continue
+    local seen=false existing
+    for existing in "${merged[@]-}"; do
+      if [ "$existing" = "$item" ]; then
+        seen=true
+        break
+      fi
+    done
+    [ "$seen" = true ] || merged+=("$item")
+  done
+  LAUNCHER_AUTO_OPTIONS=("${merged[@]-}")
+}
+
+launcher_seed_current_models() {
+  case "$(launcher_guess_backend_for_model "$LAUNCH_GATE_MODEL")" in
+    claude) launcher_array_prepend_unique LAUNCHER_CLAUDE_OPTIONS "$LAUNCH_GATE_MODEL" ;;
+    codex) launcher_array_prepend_unique LAUNCHER_CODEX_OPTIONS "$LAUNCH_GATE_MODEL" ;;
+  esac
+
+  case "$(launcher_guess_backend_for_model "$LAUNCH_FIX_MODEL")" in
+    claude) launcher_array_prepend_unique LAUNCHER_CLAUDE_OPTIONS "$LAUNCH_FIX_MODEL" ;;
+    codex) launcher_array_prepend_unique LAUNCHER_CODEX_OPTIONS "$LAUNCH_FIX_MODEL" ;;
+  esac
+}
+
+launcher_array_name_for_models() {
+  case "$LAUNCH_BACKEND" in
+    claude) echo "LAUNCHER_CLAUDE_OPTIONS" ;;
+    codex) echo "LAUNCHER_CODEX_OPTIONS" ;;
+    *) echo "LAUNCHER_AUTO_OPTIONS" ;;
+  esac
+}
+
+launcher_array_name_for_field() {
+  case "$1" in
+    1) echo "LAUNCHER_BACKEND_OPTIONS" ;;
+    2|3) launcher_array_name_for_models ;;
+    4) echo "LAUNCHER_CONCURRENCY_OPTIONS" ;;
+    5|6|7) echo "LAUNCHER_SCORE_OPTIONS" ;;
+    *) echo "" ;;
+  esac
+}
+
+launcher_first_option() {
+  local array_name="$1"
+  eval '[ "${#'"$array_name"'[@]}" -gt 0 ] && printf "%s\n" "${'"$array_name"'[0]}"'
+}
+
+launcher_sync_field_to_allowed() {
+  local idx="$1" current array_name
+  array_name="$(launcher_array_name_for_field "$idx")"
+  [ -n "$array_name" ] || return 0
+  current="$(launcher_field_value "$idx")"
+  if ! launcher_array_contains "$array_name" "$current"; then
+    launcher_set_value "$idx" "$(launcher_first_option "$array_name")"
+  fi
+}
+
+launcher_sync_option_fields() {
+  launcher_refresh_auto_options
+  launcher_sync_field_to_allowed 1
+  launcher_sync_field_to_allowed 2
+  launcher_sync_field_to_allowed 3
+  launcher_sync_field_to_allowed 4
+  launcher_sync_field_to_allowed 5
+  launcher_sync_field_to_allowed 6
+  launcher_sync_field_to_allowed 7
+}
+
+launcher_cycle_field() {
+  local idx="$1" direction="$2" array_name current step i new_idx
+  array_name="$(launcher_array_name_for_field "$idx")"
+  [ -n "$array_name" ] || return 0
+
+  local array_ref=()
+  eval "array_ref=(\"\${${array_name}[@]-}\")"
+  [ "${#array_ref[@]}" -gt 0 ] || return 0
+
+  current="$(launcher_field_value "$idx")"
+  step=1
+  [ "$direction" = "left" ] && step=-1
+
+  for i in "${!array_ref[@]}"; do
+    if [ "${array_ref[$i]}" = "$current" ]; then
+      new_idx=$((i + step))
+      if [ "$new_idx" -lt 0 ]; then
+        new_idx=$((${#array_ref[@]} - 1))
+      elif [ "$new_idx" -ge "${#array_ref[@]}" ]; then
+        new_idx=0
+      fi
+      launcher_set_value "$idx" "${array_ref[$new_idx]}"
+      [ "$idx" -eq 1 ] && launcher_sync_option_fields
+      return 0
+    fi
+  done
+
+  launcher_set_value "$idx" "${array_ref[0]}"
+  [ "$idx" -eq 1 ] && launcher_sync_option_fields
+}
+
+launcher_model_fetch_supported() {
+  local backend="$1"
+  command -v curl >/dev/null 2>&1 || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  case "$backend" in
+    codex)
+      command -v codex >/dev/null 2>&1 || return 1
+      [ -n "${OPENAI_API_KEY:-}" ] || return 1
+      ;;
+    claude)
+      command -v claude >/dev/null 2>&1 || return 1
+      [ -n "${ANTHROPIC_API_KEY:-}" ] || return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+launcher_fetch_models_backend() {
+  local backend="$1" out_file="$2" status_file="$3"
+  local tmp_file="${out_file}.tmp"
+  : > "$status_file"
+
+  case "$backend" in
+    codex)
+      if launcher_model_fetch_supported codex; then
+        if curl --max-time 5 -fsS https://api.openai.com/v1/models \
+          -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+          | jq -r '.data[].id' \
+          | grep -E '^(gpt-5|gpt-4\.1|o1|o3|o4)' \
+          | sort -u > "$tmp_file"; then
+          mv "$tmp_file" "$out_file"
+          echo "live codex models" > "$status_file"
+          return 0
+        fi
+      fi
+      ;;
+    claude)
+      if launcher_model_fetch_supported claude; then
+        if curl --max-time 5 -fsS https://api.anthropic.com/v1/models \
+          -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+          -H "anthropic-version: 2023-06-01" \
+          | jq -r '.data[].id' \
+          | grep -E '^(claude-|sonnet|opus|haiku)' \
+          | sort -u > "$tmp_file"; then
+          mv "$tmp_file" "$out_file"
+          echo "live claude models" > "$status_file"
+          return 0
+        fi
+      fi
+      ;;
+  esac
+
+  rm -f "$tmp_file"
+  echo "static defaults" > "$status_file"
+}
+
+launcher_start_model_fetch() {
+  LAUNCH_FETCH_PIDS=""
+  [ -n "$LAUNCH_TMP_DIR" ] && rm -rf "$LAUNCH_TMP_DIR" 2>/dev/null || true
+  LAUNCH_TMP_DIR="$(mktemp -d /tmp/gh-crfix-launcher-XXXXXX)"
+
+  launcher_fetch_models_backend "claude" \
+    "$LAUNCH_TMP_DIR/claude-models.txt" \
+    "$LAUNCH_TMP_DIR/claude-status.txt" &
+  LAUNCH_FETCH_PIDS="${LAUNCH_FETCH_PIDS:+$LAUNCH_FETCH_PIDS }$!"
+
+  launcher_fetch_models_backend "codex" \
+    "$LAUNCH_TMP_DIR/codex-models.txt" \
+    "$LAUNCH_TMP_DIR/codex-status.txt" &
+  LAUNCH_FETCH_PIDS="${LAUNCH_FETCH_PIDS:+$LAUNCH_FETCH_PIDS }$!"
+}
+
+launcher_load_models_from_file() {
+  local array_name="$1" file="$2" fallback_name="$3" current_value_a="$4" current_value_b="$5"
+  local array_ref=() fallback_ref=() line
+
+  [ -f "$file" ] || return 1
+  eval "fallback_ref=(\"\${${fallback_name}[@]-}\")"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    array_ref+=("$line")
+  done < "$file"
+
+  [ "${#array_ref[@]}" -gt 0 ] || array_ref=("${fallback_ref[@]-}")
+
+  eval "$array_name=()"
+  for line in "${array_ref[@]-}"; do
+    eval "$array_name+=(\"\$line\")"
+  done
+
+  launcher_array_prepend_unique "$array_name" "$current_value_b"
+  launcher_array_prepend_unique "$array_name" "$current_value_a"
+
+  for line in "${fallback_ref[@]-}"; do
+    if ! launcher_array_contains "$array_name" "$line"; then
+      eval "$array_name+=(\"\$line\")"
+    fi
+  done
+}
+
+launcher_poll_model_fetch() {
+  [ -n "$LAUNCH_TMP_DIR" ] || return 0
+
+  if [ -f "$LAUNCH_TMP_DIR/claude-status.txt" ] && [ ! -f "$LAUNCH_TMP_DIR/claude.applied" ]; then
+    launcher_load_models_from_file \
+      "LAUNCHER_CLAUDE_OPTIONS" \
+      "$LAUNCH_TMP_DIR/claude-models.txt" \
+      "LAUNCHER_CLAUDE_FALLBACK_OPTIONS" \
+      "$LAUNCH_GATE_MODEL" \
+      "$LAUNCH_FIX_MODEL"
+    : > "$LAUNCH_TMP_DIR/claude.applied"
+  fi
+
+  if [ -f "$LAUNCH_TMP_DIR/codex-status.txt" ] && [ ! -f "$LAUNCH_TMP_DIR/codex.applied" ]; then
+    launcher_load_models_from_file \
+      "LAUNCHER_CODEX_OPTIONS" \
+      "$LAUNCH_TMP_DIR/codex-models.txt" \
+      "LAUNCHER_CODEX_FALLBACK_OPTIONS" \
+      "$LAUNCH_GATE_MODEL" \
+      "$LAUNCH_FIX_MODEL"
+    : > "$LAUNCH_TMP_DIR/codex.applied"
+  fi
+
+  if [ -f "$LAUNCH_TMP_DIR/claude.applied" ] && [ -f "$LAUNCH_TMP_DIR/codex.applied" ]; then
+    local claude_status codex_status
+    claude_status="$(cat "$LAUNCH_TMP_DIR/claude-status.txt" 2>/dev/null || echo 'static defaults')"
+    codex_status="$(cat "$LAUNCH_TMP_DIR/codex-status.txt" 2>/dev/null || echo 'static defaults')"
+    if [ "$claude_status" = "live claude models" ] || [ "$codex_status" = "live codex models" ]; then
+      LAUNCH_MODEL_STATUS="live models loaded"
+    else
+      LAUNCH_MODEL_STATUS="static defaults"
+    fi
+    launcher_sync_option_fields
+  fi
+}
 
 launcher_field_label() {
   case "$1" in
@@ -1695,7 +1996,7 @@ launcher_set_value() {
 launcher_append_char() {
   local idx="$1" char="$2"
   case "$idx" in
-    0|2|3|4|5|6|7)
+    0)
       launcher_set_value "$idx" "$(launcher_field_value "$idx")$char"
       ;;
   esac
@@ -1703,18 +2004,10 @@ launcher_append_char() {
 
 launcher_backspace() {
   local idx="$1" current
+  [ "$idx" -eq 0 ] || return 0
   current="$(launcher_field_value "$idx")"
   [ -n "$current" ] || return 0
   launcher_set_value "$idx" "${current%?}"
-}
-
-launcher_cycle_backend() {
-  case "$LAUNCH_BACKEND" in
-    auto)   LAUNCH_BACKEND="$([ "$1" = "right" ] && echo claude || echo codex)" ;;
-    claude) LAUNCH_BACKEND="$([ "$1" = "right" ] && echo codex || echo auto)" ;;
-    codex)  LAUNCH_BACKEND="$([ "$1" = "right" ] && echo auto || echo claude)" ;;
-    *)      LAUNCH_BACKEND="auto" ;;
-  esac
 }
 
 launcher_render() {
@@ -1725,7 +2018,8 @@ launcher_render() {
   local buf=""
   buf="${buf}\033[H"
   buf="${buf}  ${BOLD}gh crfix launcher${RST}${CLR}\n"
-  buf="${buf}  ${c_gray}Wpisz numer PR, zakres, listę albo pełny URL. Ustaw modele i scoring; gate odpali się od progu 1.0.${RST}${CLR}\n\n"
+  buf="${buf}  ${c_gray}Wpisz numer PR, zakres, listę albo pełny URL. Resztę ustaw strzałkami; gate odpali się od progu 1.0.${RST}${CLR}\n"
+  buf="${buf}  ${c_gray}Models: ${LAUNCH_MODEL_STATUS}.${RST}${CLR}\n\n"
 
   local idx=0 count label value prefix
   count="$(launcher_field_count)"
@@ -1735,6 +2029,9 @@ launcher_render() {
     [ -z "$value" ] && value=" "
     if [ ${#value} -gt "$((cols - 26))" ]; then
       value="${value:0:$((cols - 27))}…"
+    fi
+    if [ "$idx" -ge 1 ] && [ "$idx" -le 7 ]; then
+      value="◀ $value ▶"
     fi
     if [ "$idx" -eq "$LAUNCH_SELECTED" ]; then
       prefix="${BOLD}▸${RST}"
@@ -1746,7 +2043,7 @@ launcher_render() {
   done
 
   buf="${buf}\n"
-  buf="${buf}  ${c_gray}↑↓/Tab navigate  ←→ backend  type to edit  Backspace delete  Enter launch${RST}${CLR}\n"
+  buf="${buf}  ${c_gray}↑↓/Tab navigate  ←→ change option  type only in Target  Enter launch${RST}${CLR}\n"
   if [ -n "$LAUNCH_ERROR" ]; then
     buf="${buf}  ${c_red}${LAUNCH_ERROR}${RST}${CLR}\n"
   fi
@@ -1761,6 +2058,7 @@ launcher_apply() {
 
   [ -n "$LAUNCH_TARGET" ] || { LAUNCH_ERROR="Target is required."; return 1; }
   case "$LAUNCH_BACKEND" in auto|claude|codex) ;; *) LAUNCH_ERROR="AI backend must be auto, claude or codex."; return 1 ;; esac
+  launcher_sync_option_fields
   [ -n "$LAUNCH_GATE_MODEL" ] || { LAUNCH_ERROR="Gate model is required."; return 1; }
   [ -n "$LAUNCH_FIX_MODEL" ] || { LAUNCH_ERROR="Fix model is required."; return 1; }
   case "$LAUNCH_CONCURRENCY" in ''|*[!0-9]*) LAUNCH_ERROR="Concurrency must be an integer."; return 1 ;; esac
@@ -1798,6 +2096,7 @@ launcher_loop() {
   tput clear
 
   while true; do
+    launcher_poll_model_fetch
     launcher_render
     local key
     key="$(tui_read_key)"
@@ -1818,15 +2117,18 @@ launcher_loop() {
         fi
         ;;
       LEFT)
-        [ "$LAUNCH_SELECTED" -eq 1 ] && launcher_cycle_backend "left"
+        launcher_cycle_field "$LAUNCH_SELECTED" "left"
         ;;
       RIGHT)
-        [ "$LAUNCH_SELECTED" -eq 1 ] && launcher_cycle_backend "right"
+        launcher_cycle_field "$LAUNCH_SELECTED" "right"
         ;;
       BACKSPACE|DELETE)
         launcher_backspace "$LAUNCH_SELECTED"
         ;;
       QUIT|ESC)
+        [ -n "$LAUNCH_FETCH_PIDS" ] && kill $LAUNCH_FETCH_PIDS 2>/dev/null || true
+        [ -n "$LAUNCH_TMP_DIR" ] && rm -rf "$LAUNCH_TMP_DIR" 2>/dev/null || true
+        LAUNCH_TMP_DIR=""
         tui_close_tty
         tput cnorm
         tput rmcup
@@ -1846,6 +2148,9 @@ launcher_loop() {
   tput cnorm
   tput rmcup
   TUI_ACTIVE=false
+  [ -n "$LAUNCH_FETCH_PIDS" ] && wait $LAUNCH_FETCH_PIDS 2>/dev/null || true
+  [ -n "$LAUNCH_TMP_DIR" ] && rm -rf "$LAUNCH_TMP_DIR" 2>/dev/null || true
+  LAUNCH_TMP_DIR=""
 }
 
 # ── TUI: render dashboard (buffered — single write) ─────────────────────────
@@ -2586,6 +2891,8 @@ print_results() {
 TUI_ACTIVE=false
 
 cleanup() {
+  [ -n "$LAUNCH_FETCH_PIDS" ] && kill $LAUNCH_FETCH_PIDS 2>/dev/null || true
+  [ -n "$LAUNCH_TMP_DIR" ] && rm -rf "$LAUNCH_TMP_DIR" 2>/dev/null || true
   if [ "$TUI_ACTIVE" = true ]; then
     tui_close_tty 2>/dev/null || true
     tput cnorm 2>/dev/null || true

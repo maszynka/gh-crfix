@@ -106,10 +106,10 @@ By default `gh crfix` uses `--ai-backend auto`, which prefers `claude` if instal
 Running plain `gh crfix` in a TTY opens a full-screen launcher where you can:
 
 - enter a PR number, range, list, or full GitHub PR URL
-- choose `auto`, `claude`, or `codex`
-- choose gate and fix models
-- set concurrency
-- tune the gate score inputs
+- choose `auto`, `claude`, or `codex` with arrow keys
+- choose gate and fix models with arrow keys
+- set concurrency with arrow keys
+- tune the gate score inputs with arrow keys
 
 After you launch from this screen, `gh crfix` persists those defaults to:
 
@@ -118,6 +118,8 @@ ${XDG_CONFIG_HOME:-~/.config}/gh-crfix/defaults
 ```
 
 The next launcher run will preload them, and CLI runs without explicit flags will also use them unless overridden by env vars or flags.
+
+The launcher keeps the target field as free text, but the other fields use allowed option lists. It starts with static fallback model names and then tries to refresh live model lists in the background when API credentials are available.
 
 The gate score uses three weights:
 
