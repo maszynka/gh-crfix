@@ -856,6 +856,44 @@ write_deterministic_responses() {
   ' < "$triage_file" > "$out_file"
 }
 
+write_uncovered_responses() {
+  local triage_file="$1" selected_file="$2" existing_file="$3" out_file="$4"
+  local selected_json="$LOG_DIR/selected-ids.json"
+
+  if [ -f "$selected_file" ]; then
+    jq -Rsc 'split("\n") | map(select(length > 0))' < "$selected_file" > "$selected_json"
+  else
+    echo '[]' > "$selected_json"
+  fi
+
+  jq -n \
+    --slurpfile triage "$triage_file" \
+    --slurpfile existing "$existing_file" \
+    --slurpfile selected "$selected_json" '
+    ($triage[0]) as $triage_doc |
+    (($existing[0] // []) | map(.thread_id)) as $covered |
+    ($selected[0] // []) as $selected_ids |
+    [
+      ($triage_doc.auto[]? | select(($covered | index(.thread_id)) | not) | {
+        thread_id: .thread_id,
+        action: "skipped",
+        comment: ("Not auto-fixed: " + .reason + ". Leaving unresolved for manual follow-up.")
+      }),
+      ($triage_doc.needs_llm[]? | select(($covered | index(.thread_id)) | not) | {
+        thread_id: .thread_id,
+        action: "skipped",
+        comment: (
+          if ($selected_ids | index(.thread_id)) then
+            "Automation did not apply a code change for this thread. Leaving unresolved for manual follow-up."
+          else
+            "Automation did not select this thread for automatic code changes. Leaving unresolved for manual follow-up."
+          end
+        )
+      })
+    ]
+  ' > "$out_file"
+}
+
 # ── conflict resolution ──────────────────────────────────────────────────────
 
 merge_base_branch() {
@@ -1595,6 +1633,13 @@ process_pr() {
       jq -s 'add' "${resp_files[@]}" > "$combined"
     fi
 
+    local uncovered="$LOG_DIR/pr-$pr_num-uncovered-responses.json"
+    write_uncovered_responses "$triage_file" "$selected_file" "$combined" "$uncovered"
+    if jq -e 'length > 0' "$uncovered" >/dev/null 2>&1; then
+      jq -s 'add' "$combined" "$uncovered" > "$combined.tmp"
+      mv "$combined.tmp" "$combined"
+    fi
+
     # 6. Reply and resolve
     if [ "$NO_RESOLVE" = false ]; then
       echo "[resolve] replying/resolving"
@@ -1721,6 +1766,13 @@ process_pr_sequential() {
     cp "${resp_files[0]}" "$combined"
   else
     jq -s 'add' "${resp_files[@]}" > "$combined"
+  fi
+
+  local uncovered="$LOG_DIR/pr-$pr_num-uncovered-responses.json"
+  write_uncovered_responses "$triage_file" "$selected_file" "$combined" "$uncovered"
+  if jq -e 'length > 0' "$uncovered" >/dev/null 2>&1; then
+    jq -s 'add' "$combined" "$uncovered" > "$combined.tmp"
+    mv "$combined.tmp" "$combined"
   fi
 
   # 6. Reply and resolve
