@@ -9,8 +9,8 @@ Hybrid GitHub PR review fixer — automatically addresses unresolved review comm
 ```
 Parse PR → Create worktree → Merge base branch → Fetch review threads
   → Deterministic triage (skip / auto / already-fixed / needs-LLM)
-  → Haiku gate (is advanced model needed?)
-  → Sonnet fix (only for residual hard cases)
+  → Small-model gate (is advanced model needed?)
+  → Advanced-model fix (only for residual hard cases)
   → Reply & resolve threads
   → Post fix summary → Request Copilot re-review
   → Post-fix cycle (wait → check new comments → merge base)
@@ -52,6 +52,9 @@ gh crfix 100-110 -c 5
 
 # Dry run (no mutations)
 gh crfix 123 --dry-run
+
+# Force Codex backend
+gh crfix 123 --ai-backend codex --gate-model gpt-5.4-mini --fix-model gpt-5.4
 ```
 
 ## Flags
@@ -59,13 +62,14 @@ gh crfix 123 --dry-run
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-c N, --concurrency N` | 3 | Max parallel PR workers |
+| `--ai-backend BACKEND` | auto | AI backend: `auto`, `claude`, `codex` |
 | `--seq` | | Sequential mode (same as `-c 1`) |
 | `--no-tui` | | Disable TUI dashboard |
 | `--no-post-fix` | | Skip post-fix review cycle |
 | `--setup-only` | | Only setup worktrees + triage |
 | `--no-resolve` | | Do not resolve GitHub threads |
 | `--include-outdated` | | Include outdated unresolved threads |
-| `--gate-model MODEL` | haiku | Small model for gate decision |
+| `--gate-model MODEL` | sonnet | Small model for gate decision |
 | `--fix-model MODEL` | sonnet | Advanced model for fixing |
 | `--max-threads N` | 100 | Max threads fetched per PR |
 | `--autofix-hook PATH` | | Repo-local deterministic autofix script |
@@ -77,13 +81,33 @@ gh crfix 123 --dry-run
 
 - [`gh`](https://cli.github.com/) (authenticated)
 - `jq`
-- [`claude`](https://docs.anthropic.com/en/docs/claude-code) CLI (for gate + fix models)
+- One AI CLI:
+  - [`claude`](https://docs.anthropic.com/en/docs/claude-code)
+  - [`codex`](https://developers.openai.com/codex/cli/)
 - `bash` 4+
 - `bats` (for tests only)
 
+By default `gh crfix` uses `--ai-backend auto`, which prefers `claude` if installed and otherwise falls back to `codex`.
+
+## Codex Usage
+
+```bash
+# Recommended Codex setup
+gh crfix 123 \
+  --ai-backend codex \
+  --gate-model gpt-5.4-mini \
+  --fix-model gpt-5.4
+
+# Works with full URL too
+gh crfix https://github.com/owner/repo/pull/123 \
+  --ai-backend codex \
+  --gate-model gpt-5.4-mini \
+  --fix-model gpt-5.4
+```
+
 ## Security note
 
-When fixing code, `gh crfix` runs `claude` with `--dangerously-skip-permissions`, granting the AI model full filesystem and shell access **within the worktree**. It can read, write, commit, and push code autonomously. This is by design — the tool needs to edit files and push fixes without interactive approval.
+When fixing code, `gh crfix` runs the selected AI CLI with full filesystem and shell access **within the worktree**. For `claude` this uses `--dangerously-skip-permissions`; for `codex` it uses `--dangerously-bypass-approvals-and-sandbox`. The model can read, write, commit, and push code autonomously. This is by design — the tool needs to edit files and push fixes without interactive approval.
 
 Use `--dry-run` to preview what would happen without any mutations. Review the generated commits before merging.
 
@@ -102,6 +126,7 @@ The hook runs in the worktree before the AI gate/fix phase.
 | Variable | Description |
 |----------|-------------|
 | `GH_CRFIX_DIR` | Force local repo path (auto-detected otherwise) |
+| `GH_CRFIX_AI_BACKEND` | AI backend override: `auto`, `claude`, `codex` |
 | `GH_CRFIX_REVIEW_WAIT` | Seconds to wait for re-review (default: 90) |
 | `GH_CRFIX_GATE_MODEL` | Gate model override |
 | `GH_CRFIX_FIX_MODEL` | Fix model override |

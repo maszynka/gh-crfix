@@ -36,7 +36,7 @@ teardown() {
 
 # Helper: create a full mock environment for integration tests
 setup_mocks() {
-  local pr_state="${1:-OPEN}" thread_count="${2:-1}" claude_exit="${3:-0}"
+  local pr_state="${1:-OPEN}" thread_count="${2:-1}" model_exit="${3:-0}" backend="${4:-claude}"
 
   # Mock gh with routing logic (including --jq support)
   mock_command_script "gh" "
@@ -52,7 +52,9 @@ setup_mocks() {
     apply_jq() { if [ -n \"\$jq_expr\" ]; then echo \"\$1\" | jq -r \"\$jq_expr\"; else echo \"\$1\"; fi; }
 
     all=\"\${args[*]}\"
-    if echo \"\$all\" | grep -q 'repo view'; then
+    if echo \"\$all\" | grep -q 'auth status'; then
+      true
+    elif echo \"\$all\" | grep -q 'repo view'; then
       apply_jq '{\"nameWithOwner\":\"test-owner/test-repo\"}'
     elif echo \"\$all\" | grep -q 'pr view'; then
       if [ -n \"\$jq_expr\" ]; then
@@ -81,14 +83,21 @@ setup_mocks() {
     fi
   "
 
-  # Mock claude
-  mock_command_script "claude" "
-    # Create a thread-responses.json in cwd
-    cat > thread-responses.json <<'CREOF'
+  if [ "$backend" = "claude" ]; then
+    mock_command_script "claude" "
+      cat > thread-responses.json <<'CREOF'
 [{\"thread_id\":\"PRRT_t1\",\"action\":\"fixed\",\"comment\":\"Fixed as requested\"}]
 CREOF
-    exit $claude_exit
-  "
+      exit $model_exit
+    "
+  else
+    mock_command_script "codex" "
+      cat > thread-responses.json <<'CREOF'
+[{\"thread_id\":\"PRRT_t1\",\"action\":\"fixed\",\"comment\":\"Fixed as requested\"}]
+CREOF
+      exit $model_exit
+    "
+  fi
 
   # Mock osascript (suppress macOS notification)
   mock_command "osascript" 0
@@ -108,7 +117,9 @@ CREOF
 @test "integration: PR with no unresolved threads skipped" {
   # Mock gh with jq passthrough for graphql calls
   mock_command_script "gh" '
-    if echo "$@" | grep -q "repo view"; then
+    if echo "$@" | grep -q "auth status"; then
+      true
+    elif echo "$@" | grep -q "repo view"; then
       echo "{\"nameWithOwner\":\"test-owner/test-repo\"}"
     elif echo "$@" | grep -q "pr view"; then
       echo "{\"headRefName\":\"pr-branch-1\",\"title\":\"Test PR\",\"state\":\"OPEN\",\"isDraft\":false}"
@@ -175,9 +186,21 @@ CREOF
   assert_output --partial "failed"
 }
 
+@test "integration: codex backend happy path" {
+  setup_mocks "OPEN" 1 0 "codex"
+
+  cd "$REPO_DIR"
+  run bash "$SCRIPT_PATH" --seq --no-tui --ai-backend codex --gate-model gpt-5.4-mini --fix-model gpt-5.4 "https://github.com/test-owner/test-repo/pull/1"
+  [ "$status" -eq 0 ]
+  assert_output --partial "AI backend : codex"
+  assert_output --partial "1 fixed"
+}
+
 @test "integration: summary counts are correct for skipped PR" {
   mock_command_script "gh" '
-    if echo "$@" | grep -q "repo view"; then
+    if echo "$@" | grep -q "auth status"; then
+      true
+    elif echo "$@" | grep -q "repo view"; then
       echo "{\"nameWithOwner\":\"test-owner/test-repo\"}"
     elif echo "$@" | grep -q "pr view"; then
       echo "{\"headRefName\":\"pr-branch-1\",\"title\":\"Test PR\",\"state\":\"OPEN\",\"isDraft\":false}"
@@ -225,7 +248,9 @@ CREOF
     apply_jq() { if [ -n "$jq_expr" ]; then echo "$1" | jq -r "$jq_expr"; else echo "$1"; fi; }
     all="${args[*]}"
 
-    if echo "$all" | grep -q "repo view"; then
+    if echo "$all" | grep -q "auth status"; then
+      true
+    elif echo "$all" | grep -q "repo view"; then
       apply_jq "{\"nameWithOwner\":\"test-owner/test-repo\"}"
     elif echo "$all" | grep -q "pr view"; then
       if [ -n "$jq_expr" ]; then echo "master"
@@ -271,7 +296,9 @@ CREOF
   echo "0" > "$call_count_file"
 
   mock_command_script "gh" '
-    if echo "$@" | grep -q "repo view"; then
+    if echo "$@" | grep -q "auth status"; then
+      true
+    elif echo "$@" | grep -q "repo view"; then
       echo "{\"nameWithOwner\":\"test-owner/test-repo\"}"
     elif echo "$@" | grep -q "pr view"; then
       if echo "$@" | grep -q "baseRefName"; then

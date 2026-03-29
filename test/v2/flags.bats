@@ -30,6 +30,11 @@ teardown() { teardown_common; }
   [ "$DRY_RUN" = "true" ]
 }
 
+@test "parse_flags: --ai-backend sets AI_BACKEND" {
+  parse_flags --ai-backend "codex" "https://github.com/o/r/pull/1"
+  [ "$AI_BACKEND" = "codex" ]
+}
+
 @test "parse_flags: --gate-model sets GATE_MODEL" {
   parse_flags --gate-model "gpt-4o-mini" "https://github.com/o/r/pull/1"
   [ "$GATE_MODEL" = "gpt-4o-mini" ]
@@ -94,6 +99,7 @@ teardown() { teardown_common; }
 
 @test "parse_flags: all gpt-5.4 flags combined" {
   parse_flags \
+    --ai-backend "codex" \
     --gate-model "gpt-5.4-mini" \
     --fix-model "gpt-5.4" \
     --no-tui \
@@ -105,6 +111,7 @@ teardown() { teardown_common; }
     -c 8 \
     "https://github.com/o/r/pull/55"
 
+  [ "$AI_BACKEND" = "codex" ]
   [ "$GATE_MODEL" = "gpt-5.4-mini" ]
   [ "$FIX_MODEL" = "gpt-5.4" ]
   [ "$NO_TUI" = "true" ]
@@ -119,6 +126,7 @@ teardown() { teardown_common; }
 
 @test "parse_flags: Claude flags combined" {
   parse_flags \
+    --ai-backend "claude" \
     --gate-model "haiku" \
     --fix-model "sonnet" \
     --no-tui \
@@ -130,6 +138,7 @@ teardown() { teardown_common; }
     --autofix-hook "/repo/.gh-crfix/fix.sh" \
     "https://github.com/owner/repo/pull/10"
 
+  [ "$AI_BACKEND" = "claude" ]
   [ "$GATE_MODEL" = "haiku" ]
   [ "$FIX_MODEL" = "sonnet" ]
   [ "$NO_TUI" = "true" ]
@@ -144,6 +153,7 @@ teardown() { teardown_common; }
 
 @test "parse_flags: all gpt-5.4 + Claude flags combined" {
   parse_flags \
+    --ai-backend "codex" \
     --gate-model "gpt-5.4-mini" \
     --fix-model "claude-sonnet-4-20250514" \
     --no-tui \
@@ -159,6 +169,7 @@ teardown() { teardown_common; }
     -c 2 \
     "https://github.com/org/monorepo/pull/123"
 
+  [ "$AI_BACKEND" = "codex" ]
   [ "$GATE_MODEL" = "gpt-5.4-mini" ]
   [ "$FIX_MODEL" = "claude-sonnet-4-20250514" ]
   [ "$NO_TUI" = "true" ]

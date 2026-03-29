@@ -28,6 +28,11 @@ teardown() { teardown_common; }
   [ "$CONCURRENCY" -eq 8 ]
 }
 
+@test "parse_flags: --ai-backend codex sets AI_BACKEND=codex" {
+  parse_flags --ai-backend codex "https://github.com/o/r/pull/1"
+  [ "$AI_BACKEND" = "codex" ]
+}
+
 @test "parse_flags: --no-tui sets NO_TUI=true" {
   parse_flags --no-tui "https://github.com/o/r/pull/1"
   [ "$NO_TUI" = true ]

@@ -4,8 +4,8 @@
 # Strategy:
 #   1) deterministic triage
 #   2) optional repo-local autofix hook
-#   3) Haiku gate decides whether advanced model is needed
-#   4) Sonnet/Opus only for residual hard cases
+#   3) gate model decides whether advanced model is needed
+#   4) advanced model only for residual hard cases
 #   5) post-fix review cycle + merge base branch
 #   6) TUI dashboard for parallel mode
 #
@@ -19,6 +19,7 @@
 #
 # Flags:
 #   -c N, --concurrency N        max parallel PR workers (default: 3)
+#   --ai-backend BACKEND         AI backend: auto|claude|codex (default: auto)
 #   --seq                        same as -c 1
 #   --no-tui                     disable TUI dashboard (plain output)
 #   --no-post-fix                skip post-fix review cycle
@@ -31,11 +32,12 @@
 #   --autofix-hook PATH          repo-local deterministic autofix script
 #   --no-autofix                 skip autofix hook even if present
 #   --resolve-skipped            also resolve skipped threads
-#   --dry-run                    no writes to GitHub, no Claude fix run
+#   --dry-run                    no writes to GitHub, no AI fix run
 #   -h, --help
 #
 # Env:
 #   GH_CRFIX_DIR                 override local repo path
+#   GH_CRFIX_AI_BACKEND          AI backend override: auto|claude|codex
 #   GH_CRFIX_REVIEW_WAIT         seconds to wait for re-review (default: 90)
 #   GH_CRFIX_GATE_MODEL          gate model override
 #   GH_CRFIX_FIX_MODEL           fix model override
@@ -46,6 +48,7 @@ WORKTREE_SUBDIR=".gh-crfix/worktrees"
 OWNER_REPO=""
 PR_NUMBERS=""
 CONCURRENCY=3
+AI_BACKEND="${GH_CRFIX_AI_BACKEND:-auto}"
 SETUP_ONLY=false
 NO_RESOLVE=false
 NO_TUI=false
@@ -66,6 +69,36 @@ BG_PIDS=""
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 die() { echo "ERROR: $*" >&2; exit 1; }
+
+resolve_ai_backend() {
+  case "$AI_BACKEND" in
+    auto)
+      if command -v claude >/dev/null 2>&1; then
+        AI_BACKEND="claude"
+      elif command -v codex >/dev/null 2>&1; then
+        AI_BACKEND="codex"
+      else
+        die "Neither 'claude' nor 'codex' CLI is installed. Install one or set --ai-backend."
+      fi
+      ;;
+    claude)
+      command -v claude >/dev/null 2>&1 || die "'claude' CLI not found"
+      ;;
+    codex)
+      command -v codex >/dev/null 2>&1 || die "'codex' CLI not found"
+      ;;
+    *)
+      die "Unsupported AI backend: $AI_BACKEND"
+      ;;
+  esac
+}
+
+verify_prereqs() {
+  command -v gh >/dev/null 2>&1 || die "'gh' CLI not found"
+  command -v jq >/dev/null 2>&1 || die "'jq' not found"
+  gh auth status >/dev/null 2>&1 || die "'gh' is not authenticated. Run: gh auth login"
+  resolve_ai_backend
+}
 
 # ── tiny fs kv ───────────────────────────────────────────────────────────────
 
@@ -90,6 +123,7 @@ Usage:
 
 Flags:
   -c N, --concurrency N        max parallel PR workers (default: 3)
+  --ai-backend BACKEND         AI backend: auto|claude|codex (default: auto)
   --seq                        sequential mode (same as -c 1)
   --no-tui                     disable TUI dashboard (plain output)
   --no-post-fix                skip post-fix review cycle (wait + merge master)
@@ -108,8 +142,8 @@ Flow:
   1. Setup      — fetch PR info, create worktrees, merge base branch,
                   get review threads, deterministic triage (sequential)
   2. Autofix    — run repo-local autofix hook if available
-  3. Gate       — ask Haiku gate if advanced model is needed
-  4. Fix        — run Sonnet only if gate says yes
+  3. Gate       — ask a smaller model if advanced fixing is needed
+  4. Fix        — run the advanced model only if gate says yes
                   TUI dashboard shows live progress (parallel mode)
   5. Resolve    — reply to threads, mark resolved, request Copilot re-review
   6. Post-fix   — wait for re-review; if no new comments: merge base branch,
@@ -125,6 +159,7 @@ Worktrees: <repo>/.gh-crfix/worktrees/pr-{number}
 
 Env vars:
   GH_CRFIX_DIR            force the local repo path (auto-detected otherwise)
+  GH_CRFIX_AI_BACKEND     AI backend override: auto|claude|codex
   GH_CRFIX_REVIEW_WAIT    seconds to wait for re-review (default: 90)
   GH_CRFIX_GATE_MODEL     gate model override (default: sonnet)
   GH_CRFIX_FIX_MODEL      fix model override (default: sonnet)
@@ -141,6 +176,10 @@ parse_flags() {
         shift; CONCURRENCY="${1:?missing value for -c}"
         case "$CONCURRENCY" in *[!0-9]*) die "-c requires a number" ;; esac
         [ "$CONCURRENCY" -ge 1 ] || die "-c must be >= 1"
+        ;;
+      --ai-backend)
+        shift; AI_BACKEND="${1:?missing value}"
+        case "$AI_BACKEND" in auto|claude|codex) ;; *) die "--ai-backend must be one of: auto, claude, codex" ;; esac
         ;;
       --seq) CONCURRENCY=1 ;;
       --no-tui) NO_TUI=true ;;
@@ -554,7 +593,7 @@ triage_threads() {
   ' "$tmp" > "$out_file"
 }
 
-# ── Haiku gate ───────────────────────────────────────────────────────────────
+# ── gate model ───────────────────────────────────────────────────────────────
 
 gate_schema() {
   cat <<'JSON'
@@ -632,17 +671,36 @@ run_gate_model() {
 
   {
     echo "[gate] model=$GATE_MODEL"
+    echo "[gate] backend=$AI_BACKEND"
     local raw_out="$LOG_DIR/gate-$pr_num.raw.txt"
-    if ! claude -p \
-      --model "$GATE_MODEL" \
-      --output-format text \
-      --json-schema "$(cat "$schema_file")" \
-      < "$prompt_file" > "$raw_out"; then
-      echo "[gate] failed; fallback to needs_advanced_model=true"
-      jq -n \
-        --arg reason "gate model failed" \
-        '{needs_advanced_model: true, reason: $reason, threads_to_fix: []}' > "$out_file"
+    if [ "$AI_BACKEND" = "claude" ]; then
+      if ! claude -p \
+        --model "$GATE_MODEL" \
+        --output-format text \
+        --json-schema "$(cat "$schema_file")" \
+        < "$prompt_file" > "$raw_out"; then
+        echo "[gate] failed; fallback to needs_advanced_model=true"
+        jq -n \
+          --arg reason "gate model failed" \
+          '{needs_advanced_model: true, reason: $reason, threads_to_fix: []}' > "$out_file"
+      fi
     else
+      if ! codex exec \
+        --model "$GATE_MODEL" \
+        --sandbox read-only \
+        --skip-git-repo-check \
+        --color never \
+        --output-schema "$schema_file" \
+        --output-last-message "$raw_out" \
+        - < "$prompt_file" >/dev/null; then
+        echo "[gate] failed; fallback to needs_advanced_model=true"
+        jq -n \
+          --arg reason "gate model failed" \
+          '{needs_advanced_model: true, reason: $reason, threads_to_fix: []}' > "$out_file"
+      fi
+    fi
+
+    if [ ! -f "$out_file" ]; then
       # Strip any accidental code fences and parse as JSON
       sed 's/^```json//; s/^```//; s/```$//' < "$raw_out" \
         | jq '.' > "$out_file" 2>/dev/null \
@@ -668,7 +726,7 @@ Repo: $owner_repo
 PR: #$pr_num
 
 Rules:
-1. Read CLAUDE.md first if present.
+1. Read AGENTS.md and CLAUDE.md first if present.
 2. Only work on the selected threads below.
 3. Prefer minimal, correct changes.
 4. Skip threads that truly do not require code changes.
@@ -711,13 +769,26 @@ run_fix_model() {
 
   {
     echo "[fix] model=$FIX_MODEL"
+    echo "[fix] backend=$AI_BACKEND"
     echo "[fix] selected threads:"
     cat "$selected_file"
     echo ""
 
-    if ! (cd "$worktree_path" && claude -p --model "$FIX_MODEL" --dangerously-skip-permissions < "$prompt_file"); then
-      echo "[fix] FAILED"
-      return 1
+    if [ "$AI_BACKEND" = "claude" ]; then
+      if ! (cd "$worktree_path" && claude -p --model "$FIX_MODEL" --dangerously-skip-permissions < "$prompt_file"); then
+        echo "[fix] FAILED"
+        return 1
+      fi
+    else
+      if ! codex exec \
+        --cd "$worktree_path" \
+        --model "$FIX_MODEL" \
+        --dangerously-bypass-approvals-and-sandbox \
+        --color never \
+        - < "$prompt_file"; then
+        echo "[fix] FAILED"
+        return 1
+      fi
     fi
     echo "[fix] done"
   } >> "$log_file" 2>&1
@@ -841,14 +912,26 @@ merge_base_branch() {
       return 1
     fi
 
-    echo "[merge] $remaining — using Claude..."
+    echo "[merge] $remaining — using $AI_BACKEND..."
     local prompt="Resolve merge conflicts in: $remaining
 Keep both sides where possible. PR branch (ours/HEAD) takes priority.
 After resolving: git add each file, git commit --no-edit, git push."
 
-    if (cd "$worktree_path" && claude --dangerously-skip-permissions -p "$prompt" < /dev/null 2>&1 | tail -10); then
-      remaining=$(git -C "$worktree_path" diff --name-only --diff-filter=U || true)
-      [ -z "$remaining" ] && { echo "[merge] LLM resolved"; return 0; }
+    if [ "$AI_BACKEND" = "claude" ]; then
+      if (cd "$worktree_path" && claude --dangerously-skip-permissions -p "$prompt" < /dev/null 2>&1 | tail -10); then
+        remaining=$(git -C "$worktree_path" diff --name-only --diff-filter=U || true)
+        [ -z "$remaining" ] && { echo "[merge] LLM resolved"; return 0; }
+      fi
+    else
+      if codex exec \
+        --cd "$worktree_path" \
+        --model "$FIX_MODEL" \
+        --dangerously-bypass-approvals-and-sandbox \
+        --color never \
+        "$prompt" >/dev/null 2>&1; then
+        remaining=$(git -C "$worktree_path" diff --name-only --diff-filter=U || true)
+        [ -z "$remaining" ] && { echo "[merge] LLM resolved"; return 0; }
+      fi
     fi
 
     git -C "$worktree_path" merge --abort 2>/dev/null || true
@@ -1752,12 +1835,14 @@ main() {
   parse_flags "$@"
 
   LOG_DIR="$(mktemp -d /tmp/gh-crfix-XXXXXX)"
+  verify_prereqs
 
   echo "Repo       : $OWNER_REPO"
   local repo_dir
   repo_dir="$(find_local_repo "$OWNER_REPO")"
   echo "Local repo : $repo_dir"
   echo "Concurrency: $CONCURRENCY"
+  echo "AI backend : $AI_BACKEND"
   echo "Gate model : $GATE_MODEL"
   echo "Fix model  : $FIX_MODEL"
 
