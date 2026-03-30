@@ -1529,12 +1529,12 @@ merge_base_branch() {
     if [ -z "$remaining" ]; then
       if ! git -C "$worktree_path" commit --no-edit >/dev/null 2>&1; then
         echo "[merge] auto-resolve commit failed"
-        progress_set "$pr_num" resolve_conflicts failed "auto-resolved files but commit failed"
+        progress_set "$pr_num" resolve_conflicts failed "auto-resolved $auto_resolved file(s), but the merge commit failed"
         return 1
       fi
       if ! git -C "$worktree_path" push --quiet 2>/dev/null; then
         echo "[merge] WARNING: push failed after auto-resolve"
-        progress_set "$pr_num" resolve_conflicts failed "auto-resolved conflicts but push failed"
+        progress_set "$pr_num" resolve_conflicts failed "auto-resolved $auto_resolved file(s), but push failed"
         return 1
       fi
       echo "[merge] auto-resolved"
@@ -1814,6 +1814,14 @@ progress_file() {
 
 trim_note() {
   printf '%s' "${1:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+display_path() {
+  local path="${1:-}"
+  case "$path" in
+    "$HOME"/*) printf '~%s' "${path#$HOME}" ;;
+    *) printf '%s' "$path" ;;
+  esac
 }
 
 progress_set() {
@@ -2606,9 +2614,15 @@ tui_render_dashboard() {
   [ "$preview_rows" -lt 3 ] && preview_rows=3
   local log_file="$LOG_DIR/pr-${sel_pr}.log"
   local checklist_lines checklist_capacity checklist_shown log_rows lc
-  checklist_capacity=$((preview_rows - 2))
+  local worktree_path
+  worktree_path="$(display_path "$(kv_get "$sel_pr" worktree)")"
+  if [ ${#worktree_path} -gt "$((cols - 14))" ]; then
+    worktree_path="${worktree_path:0:$((cols - 15))}…"
+  fi
+  checklist_capacity=$((preview_rows - 3))
   [ "$checklist_capacity" -lt 0 ] && checklist_capacity=0
 
+  buf="${buf}  ${c_gray}Worktree:${RST} ${c_white}${worktree_path}${RST}${CLR}\n"
   buf="${buf}  ${c_gray}Checklist:${RST}${CLR}\n"
   checklist_lines="$(progress_snapshot "$sel_pr")"
   checklist_shown=0
@@ -2633,7 +2647,7 @@ EOF
     checklist_shown=$((checklist_shown + 1))
   done
 
-  log_rows=$((preview_rows - checklist_capacity - 2))
+  log_rows=$((preview_rows - checklist_capacity - 3))
   [ "$log_rows" -lt 0 ] && log_rows=0
   buf="${buf}  ${c_gray}Recent log:${RST}${CLR}\n"
 
@@ -2714,12 +2728,17 @@ tui_render_detail() {
   local log_file="$LOG_DIR/pr-${sel_pr}.log"
   local total_lines=0
   local checklist_lines checklist_rows max_checklist_rows displayed
+  local worktree_path
+  worktree_path="$(display_path "$(kv_get "$sel_pr" worktree)")"
+  if [ ${#worktree_path} -gt "$((cols - 14))" ]; then
+    worktree_path="${worktree_path:0:$((cols - 15))}…"
+  fi
 
   if [ -f "$log_file" ]; then
     total_lines=$(wc -l < "$log_file" | tr -d ' ')
   fi
 
-  max_checklist_rows=$((content_rows - 4))
+  max_checklist_rows=$((content_rows - 5))
   [ "$max_checklist_rows" -lt 0 ] && max_checklist_rows=0
   checklist_rows=0
   checklist_lines="$(progress_snapshot "$sel_pr")"
@@ -2733,7 +2752,7 @@ EOF
     [ "$checklist_rows" -gt "$max_checklist_rows" ] && checklist_rows="$max_checklist_rows"
   fi
 
-  local log_rows=$((content_rows - checklist_rows))
+  local log_rows=$((content_rows - checklist_rows - 1))
   [ "$log_rows" -lt 0 ] && log_rows=0
   local max_scroll=$((total_lines - log_rows))
   [ "$max_scroll" -lt 0 ] && max_scroll=0
@@ -2746,6 +2765,8 @@ EOF
   [ "$skip" -lt 0 ] && skip=0
 
   displayed=0
+  buf="${buf}  ${c_gray}Worktree:${RST} ${c_white}${worktree_path}${RST}${CLR}\n"
+  displayed=$((displayed + 1))
   if [ "$checklist_rows" -gt 0 ]; then
     buf="${buf}  ${c_gray}Checklist:${RST}${CLR}\n"
     displayed=$((displayed + 1))
@@ -2992,7 +3013,7 @@ setup_all() {
     kv_set "$pr_num" thread_count "$thread_count"
     kv_set "$pr_num" residual_count "$residual_count"
     progress_set "$pr_num" filter_threads done \
-      "$(jq -r '"skip=\(.skip | length), auto=\(.auto | length), already_fixed=\(.already_likely_fixed | length), needs_review=\(.needs_llm | length)"' < "$triage_file")"
+      "$(jq -r '"\(.skip | length) skipped, \(.auto | length) auto, \(.already_likely_fixed | length) already fixed, \(.needs_llm | length) need review"' < "$triage_file")"
 
     echo "  Threads total      : $thread_count"
     echo "  deterministic skip : $(jq '.skip | length' < "$triage_file")"
@@ -3065,7 +3086,7 @@ process_pr() {
           })
         ]' > "$gate_skipped"
       echo "[gate] skipped: $(jq -r '.reason' < "$gate_out")"
-      progress_set "$pr_num" gate skipped "score $total_score < 1"
+      progress_set "$pr_num" gate skipped "score $(normalize_score "${total_score:-0}") < 1"
     fi
 
     local needs_advanced
@@ -3257,7 +3278,7 @@ process_pr_sequential() {
         })
       ]' > "$gate_skipped"
     echo "  Gate: SKIP — $(jq -r '.reason' < "$gate_out")"
-    progress_set "$pr_num" gate skipped "score $total_score < 1"
+    progress_set "$pr_num" gate skipped "score $(normalize_score "${total_score:-0}") < 1"
   fi
 
   local needs_advanced
