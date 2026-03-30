@@ -62,3 +62,18 @@ teardown() { teardown_common; }
   [ "$LAUNCH_CONCURRENCY" = "11" ]
   [ "$LAUNCH_SCORE_NEEDS_LLM" = ".1" ]
 }
+
+@test "launcher_apply: rejects mixed model families in auto mode" {
+  LAUNCH_TARGET="https://github.com/owner/repo/pull/123"
+  LAUNCH_BACKEND="auto"
+  LAUNCH_GATE_MODEL="sonnet"
+  LAUNCH_FIX_MODEL="gpt-5.4"
+  LAUNCH_CONCURRENCY="5"
+  LAUNCH_SCORE_NEEDS_LLM=".2"
+  LAUNCH_SCORE_PR_COMMENT=".4"
+  LAUNCH_SCORE_TEST_FAILURE="1"
+
+  run launcher_apply
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Auto backend cannot mix"* ]] || [ "$LAUNCH_ERROR" = "Auto backend cannot mix Claude and Codex model families." ]
+}

@@ -22,6 +22,21 @@ EOF
   [ "$result" = "pnpm test" ]
 }
 
+@test "detect_builtin_test_command: returns empty when selected package manager is missing" {
+  PATH="$MOCK_BIN:/usr/bin:/bin"
+  cat > "$TEST_TMPDIR/package.json" <<'EOF'
+{
+  "packageManager": "pnpm@10.0.0",
+  "scripts": {
+    "test": "vitest run"
+  }
+}
+EOF
+
+  result="$(detect_builtin_test_command "$TEST_TMPDIR")"
+  [ -z "$result" ]
+}
+
 @test "detect_validate_runner: prefers repo validate hook over builtin command" {
   mkdir -p "$TEST_TMPDIR/.gh-crfix"
   cat > "$TEST_TMPDIR/.gh-crfix/validate.sh" <<'EOF'

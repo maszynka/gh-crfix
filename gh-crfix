@@ -77,7 +77,6 @@ REVIEW_WAIT_SECS="${GH_CRFIX_REVIEW_WAIT:-90}"
 SCORE_NEEDS_LLM="${GH_CRFIX_SCORE_NEEDS_LLM:-1}"
 SCORE_PR_COMMENT="${GH_CRFIX_SCORE_PR_COMMENT:-0.4}"
 SCORE_TEST_FAILURE="${GH_CRFIX_SCORE_TEST_FAILURE:-1}"
-LAUNCH_FROM_TUI=false
 LOG_DIR=""
 SEMAPHORE=""
 BG_PIDS=""
@@ -116,6 +115,11 @@ score_sum() {
 
 normalize_score() {
   awk -v value="$1" 'BEGIN { printf "%.3f", value + 0 }'
+}
+
+is_safe_choice_token() {
+  local value="${1:-}"
+  echo "$value" | grep -Eq '^[A-Za-z0-9._-]+$'
 }
 
 score_at_least_one() {
@@ -191,15 +195,55 @@ save_persisted_defaults() {
   mv "$tmp" "$file"
 }
 
+model_family() {
+  case "${1:-}" in
+    "" ) echo "" ;;
+    sonnet|opus|haiku|claude-*) echo "claude" ;;
+    *) echo "codex" ;;
+  esac
+}
+
+infer_backend_from_models() {
+  local gate_family fix_family
+  gate_family="$(model_family "$GATE_MODEL")"
+  fix_family="$(model_family "$FIX_MODEL")"
+
+  if [ -n "$gate_family" ] && [ -n "$fix_family" ] && [ "$gate_family" != "$fix_family" ]; then
+    echo "mixed"
+  elif [ -n "$gate_family" ]; then
+    echo "$gate_family"
+  else
+    echo "$fix_family"
+  fi
+}
+
 resolve_ai_backend() {
   case "$AI_BACKEND" in
     auto)
+      local inferred_backend
+      inferred_backend="$(infer_backend_from_models)"
+      case "$inferred_backend" in
+        claude)
+          command -v claude >/dev/null 2>&1 || die "'claude' CLI not found for the selected Claude models"
+        AI_BACKEND="claude"
+          return 0
+          ;;
+        codex)
+          command -v codex >/dev/null 2>&1 || die "'codex' CLI not found for the selected Codex models"
+        AI_BACKEND="codex"
+          return 0
+          ;;
+        mixed)
+          die "Auto backend cannot mix Claude and Codex model selections. Pick models from one family or set --ai-backend explicitly."
+          ;;
+      esac
+
       if command -v claude >/dev/null 2>&1; then
         AI_BACKEND="claude"
       elif command -v codex >/dev/null 2>&1; then
         AI_BACKEND="codex"
       else
-        die "Neither 'claude' nor 'codex' CLI is installed. Install one or set --ai-backend."
+        die "Neither 'claude' nor 'codex' CLI is installed. Install the 'claude' or 'codex' CLI, or run again with --ai-backend claude|codex."
       fi
       ;;
     claude)
@@ -217,6 +261,11 @@ resolve_ai_backend() {
 verify_prereqs() {
   command -v gh >/dev/null 2>&1 || die "'gh' CLI not found"
   command -v jq >/dev/null 2>&1 || die "'jq' not found"
+  gh auth status >/dev/null 2>&1 || die "'gh' is not authenticated. Run: gh auth login"
+}
+
+verify_parse_input_prereqs() {
+  command -v gh >/dev/null 2>&1 || die "'gh' CLI not found"
   gh auth status >/dev/null 2>&1 || die "'gh' is not authenticated. Run: gh auth login"
 }
 
@@ -359,6 +408,9 @@ parse_flags() {
   validate_score_flag "GH_CRFIX_SCORE_TEST_FAILURE/--score-test-failure" "$SCORE_TEST_FAILURE"
 
   [ -n "$args" ] || { usage; exit 0; }
+  if ! echo "$args" | grep -qE 'github\.com/'; then
+    verify_parse_input_prereqs
+  fi
   parse_input "$args"
 }
 
@@ -507,6 +559,7 @@ detect_package_manager() {
 detect_builtin_test_command() {
   local repo_dir="$1"
   local package_json="$repo_dir/package.json"
+  local package_manager
 
   [ -f "$package_json" ] || { echo ""; return 0; }
   jq -e '.scripts.test? | strings | length > 0' < "$package_json" >/dev/null 2>&1 || {
@@ -514,11 +567,20 @@ detect_builtin_test_command() {
     return 0
   }
 
-  case "$(detect_package_manager "$repo_dir")" in
-    pnpm) echo "pnpm test" ;;
-    yarn) echo "yarn test" ;;
-    bun)  echo "bun run test" ;;
-    *)    echo "npm test" ;;
+  package_manager="$(detect_package_manager "$repo_dir")"
+  case "$package_manager" in
+    pnpm)
+      command -v pnpm >/dev/null 2>&1 && echo "pnpm test"
+      ;;
+    yarn)
+      command -v yarn >/dev/null 2>&1 && echo "yarn test"
+      ;;
+    bun)
+      command -v bun >/dev/null 2>&1 && echo "bun run test"
+      ;;
+    *)
+      command -v npm >/dev/null 2>&1 && echo "npm test"
+      ;;
   esac
 }
 
@@ -613,7 +675,7 @@ run_validation() {
       echo "[validate] running builtin tests: $runner_value"
       (
         cd "$worktree_path" &&
-        CI=1 bash -lc "$runner_value"
+        CI=1 bash -c "$runner_value"
       ) > "$raw_file" 2>&1 || exit_code=$?
     fi
 
@@ -1400,6 +1462,8 @@ merge_base_branch() {
       return 1
     fi
 
+    [ "$AI_BACKEND" = "auto" ] && resolve_ai_backend
+
     echo "[merge] $remaining — using $AI_BACKEND..."
     local prompt="Resolve merge conflicts in: $remaining
 Keep both sides where possible. PR branch (ours/HEAD) takes priority.
@@ -1706,6 +1770,7 @@ EOF
 launcher_array_prepend_unique() {
   local array_name="$1" value="$2"
   [ -n "$value" ] || return 0
+  is_safe_choice_token "$value" || return 0
   launcher_array_contains "$array_name" "$value" && return 0
   eval "$array_name=(\"\$value\" \"\${${array_name}[@]-}\")"
 }
@@ -1895,6 +1960,7 @@ launcher_load_models_from_file() {
   eval "fallback_ref=(\"\${${fallback_name}[@]-}\")"
   while IFS= read -r line; do
     [ -n "$line" ] || continue
+    is_safe_choice_token "$line" || continue
     array_ref+=("$line")
   done < "$file"
 
@@ -2018,7 +2084,7 @@ launcher_render() {
   local buf=""
   buf="${buf}\033[H"
   buf="${buf}  ${BOLD}gh crfix launcher${RST}${CLR}\n"
-  buf="${buf}  ${c_gray}Wpisz numer PR, zakres, listę albo pełny URL. Resztę ustaw strzałkami; gate odpali się od progu 1.0.${RST}${CLR}\n"
+  buf="${buf}  ${c_gray}Enter a PR number, range, list, or full GitHub URL. Use arrows for the rest; the gate runs at score 1.0.${RST}${CLR}\n"
   buf="${buf}  ${c_gray}Models: ${LAUNCH_MODEL_STATUS}.${RST}${CLR}\n\n"
 
   local idx=0 count label value prefix
@@ -2055,17 +2121,26 @@ launcher_render() {
 
 launcher_apply() {
   local old_owner="$OWNER_REPO" old_prs="$PR_NUMBERS"
+  local gate_family fix_family
 
   [ -n "$LAUNCH_TARGET" ] || { LAUNCH_ERROR="Target is required."; return 1; }
   case "$LAUNCH_BACKEND" in auto|claude|codex) ;; *) LAUNCH_ERROR="AI backend must be auto, claude or codex."; return 1 ;; esac
   launcher_sync_option_fields
   [ -n "$LAUNCH_GATE_MODEL" ] || { LAUNCH_ERROR="Gate model is required."; return 1; }
   [ -n "$LAUNCH_FIX_MODEL" ] || { LAUNCH_ERROR="Fix model is required."; return 1; }
+  is_safe_choice_token "$LAUNCH_GATE_MODEL" || { LAUNCH_ERROR="Gate model contains unsupported characters."; return 1; }
+  is_safe_choice_token "$LAUNCH_FIX_MODEL" || { LAUNCH_ERROR="Fix model contains unsupported characters."; return 1; }
   case "$LAUNCH_CONCURRENCY" in ''|*[!0-9]*) LAUNCH_ERROR="Concurrency must be an integer."; return 1 ;; esac
   [ "$LAUNCH_CONCURRENCY" -ge 1 ] || { LAUNCH_ERROR="Concurrency must be >= 1."; return 1; }
   is_number_0_to_1 "$LAUNCH_SCORE_NEEDS_LLM" || { LAUNCH_ERROR="Score needs_llm must be between 0 and 1."; return 1; }
   is_number_0_to_1 "$LAUNCH_SCORE_PR_COMMENT" || { LAUNCH_ERROR="Score pr_comment must be between 0 and 1."; return 1; }
   is_number_0_to_1 "$LAUNCH_SCORE_TEST_FAILURE" || { LAUNCH_ERROR="Score test_failure must be between 0 and 1."; return 1; }
+  gate_family="$(model_family "$LAUNCH_GATE_MODEL")"
+  fix_family="$(model_family "$LAUNCH_FIX_MODEL")"
+  if [ "$LAUNCH_BACKEND" = "auto" ] && [ -n "$gate_family" ] && [ -n "$fix_family" ] && [ "$gate_family" != "$fix_family" ]; then
+    LAUNCH_ERROR="Auto backend cannot mix Claude and Codex model families."
+    return 1
+  fi
 
   if ! (parse_input "$LAUNCH_TARGET") >/dev/null 2>&1; then
     OWNER_REPO="$old_owner"
@@ -2083,7 +2158,6 @@ launcher_apply() {
   SCORE_TEST_FAILURE="$(normalize_score "$LAUNCH_SCORE_TEST_FAILURE")"
   parse_input "$LAUNCH_TARGET"
   save_persisted_defaults || { LAUNCH_ERROR="Could not save defaults to $(config_file)."; return 1; }
-  LAUNCH_FROM_TUI=true
   return 0
 }
 
@@ -2611,10 +2685,21 @@ process_pr() {
       jq -r '.threads_to_fix[]?' < "$gate_out" > "$selected_file" || true
     else
       local total_score
+      local gate_skipped="$LOG_DIR/pr-$pr_num-gate-skipped.json"
       total_score="$(jq -r '.total_score // 0' < "$gate_context" 2>/dev/null || echo 0)"
       jq -n \
         --arg reason "deterministic score below threshold ($total_score < 1)" \
         '{needs_advanced_model: false, reason: $reason, threads_to_fix: []}' > "$gate_out"
+      jq -n \
+        --slurpfile triage "$triage_file" \
+        --arg score "$total_score" '
+        [
+          ($triage[0].needs_llm[]? | {
+            thread_id: .thread_id,
+            action: "skipped",
+            comment: ("Skipped automatically: score below threshold (" + $score + " < 1), so no AI review was triggered.")
+          })
+        ]' > "$gate_skipped"
       echo "[gate] skipped: $(jq -r '.reason' < "$gate_out")"
     fi
 
@@ -2761,10 +2846,21 @@ process_pr_sequential() {
     jq -r '.threads_to_fix[]?' < "$gate_out" > "$selected_file" || true
   else
     local total_score
+    local gate_skipped="$LOG_DIR/pr-$pr_num-gate-skipped.json"
     total_score="$(jq -r '.total_score // 0' < "$gate_context" 2>/dev/null || echo 0)"
     jq -n \
       --arg reason "deterministic score below threshold ($total_score < 1)" \
       '{needs_advanced_model: false, reason: $reason, threads_to_fix: []}' > "$gate_out"
+    jq -n \
+      --slurpfile triage "$triage_file" \
+      --arg score "$total_score" '
+      [
+        ($triage[0].needs_llm[]? | {
+          thread_id: .thread_id,
+          action: "skipped",
+          comment: ("Skipped automatically: score below threshold (" + $score + " < 1), so no AI review was triggered.")
+        })
+      ]' > "$gate_skipped"
     echo "  Gate: SKIP — $(jq -r '.reason' < "$gate_out")"
   fi
 
