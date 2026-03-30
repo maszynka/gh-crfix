@@ -1470,7 +1470,7 @@ write_uncovered_responses() {
 
 merge_base_branch() {
   local pr_num="$1" worktree_path="$2" log_file="$3"
-  local base_branch
+  local base_branch merge_not_needed=false
   base_branch=$(gh pr view "$pr_num" --repo "$OWNER_REPO" --json baseRefName -q '.baseRefName' 2>/dev/null || echo "master")
   progress_set "$pr_num" merge_base running "origin/$base_branch"
   progress_set "$pr_num" resolve_conflicts pending ""
@@ -1480,12 +1480,17 @@ merge_base_branch() {
     if ! git -C "$worktree_path" fetch origin "+refs/heads/$base_branch:refs/remotes/origin/$base_branch" --quiet 2>&1; then
       echo "[merge] WARNING: fetch failed — will use cached origin/$base_branch"
     fi
+    git -C "$worktree_path" merge-base --is-ancestor "origin/$base_branch" HEAD >/dev/null 2>&1 && merge_not_needed=true
     echo "[merge] merging origin/$base_branch"
     if git -C "$worktree_path" merge "origin/$base_branch" --no-edit -q 2>/dev/null; then
       if git -C "$worktree_path" push --quiet 2>/dev/null; then
         echo "[merge] clean"
         echo "[merge] pushed"
-        progress_set "$pr_num" merge_base done "merged origin/$base_branch and pushed"
+        if [ "$merge_not_needed" = true ]; then
+          progress_set "$pr_num" merge_base done "merge not needed - branch up to date"
+        else
+          progress_set "$pr_num" merge_base done "merged origin/$base_branch and pushed"
+        fi
         progress_set "$pr_num" resolve_conflicts skipped "not needed"
         return 0
       fi
@@ -1499,7 +1504,7 @@ merge_base_branch() {
     echo "[merge] conflicts — auto-resolving..."
     progress_set "$pr_num" merge_base done "conflicts detected"
     progress_set "$pr_num" resolve_conflicts running "auto-resolving"
-    local conflicted
+    local conflicted auto_resolved=0
     conflicted=$(git -C "$worktree_path" diff --name-only --diff-filter=U || true)
 
     local file
@@ -1509,10 +1514,12 @@ merge_base_branch() {
         *.lock|*-lock.yaml|*-lock.json|*.tsbuildinfo)
           git -C "$worktree_path" checkout --theirs "$file" 2>/dev/null
           git -C "$worktree_path" add "$file" 2>/dev/null
+          auto_resolved=$((auto_resolved + 1))
           echo "[merge] auto-resolve $file (theirs)" ;;
         .github/workflows/*|.github/docs/*|.github/.auto-fix-iterations|CHANGELOG.md|thread-responses.json)
           git -C "$worktree_path" checkout --ours "$file" 2>/dev/null
           git -C "$worktree_path" add "$file" 2>/dev/null
+          auto_resolved=$((auto_resolved + 1))
           echo "[merge] auto-resolve $file (ours)" ;;
       esac
     done <<< "$conflicted"
@@ -1532,7 +1539,7 @@ merge_base_branch() {
       fi
       echo "[merge] auto-resolved"
       echo "[merge] pushed"
-      progress_set "$pr_num" resolve_conflicts done "auto-resolved and pushed"
+      progress_set "$pr_num" resolve_conflicts done "auto-resolved $auto_resolved file(s) and pushed"
       return 0
     fi
 
@@ -1546,7 +1553,9 @@ merge_base_branch() {
     [ "$AI_BACKEND" = "auto" ] && resolve_ai_backend
 
     echo "[merge] $remaining — using $AI_BACKEND..."
-    progress_set "$pr_num" resolve_conflicts running "using $AI_BACKEND"
+    local llm_targets
+    llm_targets="$(printf '%s\n' "$remaining" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
+    progress_set "$pr_num" resolve_conflicts running "using $AI_BACKEND for $llm_targets file(s)"
     local prompt="Resolve merge conflicts in: $remaining
 Keep both sides where possible. PR branch (ours/HEAD) takes priority.
 After resolving: git add each file, git commit --no-edit, git push."
@@ -1577,7 +1586,11 @@ After resolving: git add each file, git commit --no-edit, git push."
         if git -C "$worktree_path" push --quiet 2>/dev/null; then
           echo "[merge] LLM resolved"
           echo "[merge] pushed"
-          progress_set "$pr_num" resolve_conflicts done "resolved with $AI_BACKEND and pushed"
+          if [ "$auto_resolved" -gt 0 ]; then
+            progress_set "$pr_num" resolve_conflicts done "auto-resolved $auto_resolved file(s), finished remaining conflicts with $AI_BACKEND, and pushed"
+          else
+            progress_set "$pr_num" resolve_conflicts done "resolved with $AI_BACKEND and pushed"
+          fi
           return 0
         fi
 
@@ -1799,9 +1812,14 @@ progress_file() {
   echo "$LOG_DIR/pr-${pr_num}.step.${step}"
 }
 
+trim_note() {
+  printf '%s' "${1:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
 progress_set() {
   local pr_num="$1" step="$2" status="$3" note="${4:-}"
   [ -n "$LOG_DIR" ] || return 0
+  note="$(trim_note "$note")"
   printf '%s\t%s\n' "$status" "$note" > "$(progress_file "$pr_num" "$step")"
 }
 
@@ -1869,10 +1887,24 @@ progress_color() {
   esac
 }
 
+progress_should_render() {
+  local pr_num="$1" step="$2"
+  local status note
+  status="$(progress_get_status "$pr_num" "$step")"
+  note="$(progress_get_note "$pr_num" "$step")"
+
+  case "$step:$status:$note" in
+    resolve_conflicts:skipped:not\ needed) return 1 ;;
+  esac
+
+  return 0
+}
+
 progress_snapshot() {
   local pr_num="$1" step status note
   while IFS= read -r step; do
     [ -n "$step" ] || continue
+    progress_should_render "$pr_num" "$step" || continue
     status="$(progress_get_status "$pr_num" "$step")"
     note="$(progress_get_note "$pr_num" "$step")"
     printf '%s\t%s\t%s\n' "$status" "$(progress_label "$step")" "$note"
@@ -2959,7 +2991,8 @@ setup_all() {
     kv_set "$pr_num" triage_file "$triage_file"
     kv_set "$pr_num" thread_count "$thread_count"
     kv_set "$pr_num" residual_count "$residual_count"
-    progress_set "$pr_num" filter_threads done "$residual_count residual thread(s)"
+    progress_set "$pr_num" filter_threads done \
+      "$(jq -r '"skip=\(.skip | length), auto=\(.auto | length), already_fixed=\(.already_likely_fixed | length), needs_review=\(.needs_llm | length)"' < "$triage_file")"
 
     echo "  Threads total      : $thread_count"
     echo "  deterministic skip : $(jq '.skip | length' < "$triage_file")"
