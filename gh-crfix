@@ -203,6 +203,46 @@ model_family() {
   esac
 }
 
+default_gate_model_for_backend() {
+  case "$1" in
+    claude) echo "sonnet" ;;
+    codex) echo "gpt-5.4-mini" ;;
+    *) echo "" ;;
+  esac
+}
+
+default_fix_model_for_backend() {
+  case "$1" in
+    claude) echo "sonnet" ;;
+    codex) echo "gpt-5.4" ;;
+    *) echo "" ;;
+  esac
+}
+
+using_backend_default_models() {
+  local backend="$1"
+  [ "$GATE_MODEL" = "$(default_gate_model_for_backend "$backend")" ] \
+    && [ "$FIX_MODEL" = "$(default_fix_model_for_backend "$backend")" ]
+}
+
+adopt_backend_default_models() {
+  local backend="$1"
+  GATE_MODEL="$(default_gate_model_for_backend "$backend")"
+  FIX_MODEL="$(default_fix_model_for_backend "$backend")"
+}
+
+validate_models_for_backend() {
+  local backend="$1"
+  local gate_family fix_family
+  gate_family="$(model_family "$GATE_MODEL")"
+  fix_family="$(model_family "$FIX_MODEL")"
+
+  [ -z "$gate_family" ] || [ "$gate_family" = "$backend" ] \
+    || die "Gate model '$GATE_MODEL' is not compatible with --ai-backend $backend"
+  [ -z "$fix_family" ] || [ "$fix_family" = "$backend" ] \
+    || die "Fix model '$FIX_MODEL' is not compatible with --ai-backend $backend"
+}
+
 infer_backend_from_models() {
   local gate_family fix_family
   gate_family="$(model_family "$GATE_MODEL")"
@@ -224,13 +264,28 @@ resolve_ai_backend() {
       inferred_backend="$(infer_backend_from_models)"
       case "$inferred_backend" in
         claude)
-          command -v claude >/dev/null 2>&1 || die "'claude' CLI not found for the selected Claude models"
-        AI_BACKEND="claude"
-          return 0
+          if command -v claude >/dev/null 2>&1; then
+            AI_BACKEND="claude"
+            return 0
+          fi
+          if command -v codex >/dev/null 2>&1 && using_backend_default_models "claude"; then
+            adopt_backend_default_models "codex"
+            AI_BACKEND="codex"
+            return 0
+          fi
+          die "'claude' CLI not found for the selected Claude models"
           ;;
         codex)
-          command -v codex >/dev/null 2>&1 || die "'codex' CLI not found for the selected Codex models"
-        AI_BACKEND="codex"
+          if command -v codex >/dev/null 2>&1; then
+            AI_BACKEND="codex"
+            return 0
+          fi
+          if command -v claude >/dev/null 2>&1 && using_backend_default_models "codex"; then
+            adopt_backend_default_models "claude"
+            AI_BACKEND="claude"
+            return 0
+          fi
+          die "'codex' CLI not found for the selected Codex models"
           return 0
           ;;
         mixed)
@@ -248,9 +303,11 @@ resolve_ai_backend() {
       ;;
     claude)
       command -v claude >/dev/null 2>&1 || die "'claude' CLI not found"
+      validate_models_for_backend "claude"
       ;;
     codex)
       command -v codex >/dev/null 2>&1 || die "'codex' CLI not found"
+      validate_models_for_backend "codex"
       ;;
     *)
       die "Unsupported AI backend: $AI_BACKEND"
