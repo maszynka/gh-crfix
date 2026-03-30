@@ -130,6 +130,37 @@ EOF
   jq -e '.[0].action == "skipped"' "$TEST_TMPDIR/out.json" >/dev/null
 }
 
+@test "write_uncovered_responses: ignores already covered auto and selected needs_llm threads" {
+  cat > "$TEST_TMPDIR/triage.json" <<'EOF'
+{
+  "all": [],
+  "skip": [],
+  "auto": [
+    {"thread_id": "PRRT_auto_done", "reason": "mechanical/simple comment"},
+    {"thread_id": "PRRT_auto_open", "reason": "mechanical/simple comment"}
+  ],
+  "already_likely_fixed": [],
+  "needs_llm": [
+    {"thread_id": "PRRT_selected"},
+    {"thread_id": "PRRT_left_open"}
+  ]
+}
+EOF
+  cat > "$TEST_TMPDIR/combined.json" <<'EOF'
+[
+  {"thread_id": "PRRT_auto_done", "action": "skipped", "comment": "Handled"},
+  {"thread_id": "PRRT_selected", "action": "fixed", "comment": "Done"}
+]
+EOF
+  printf 'PRRT_selected\n' > "$TEST_TMPDIR/selected.txt"
+
+  run write_uncovered_responses "$TEST_TMPDIR/triage.json" "$TEST_TMPDIR/selected.txt" "$TEST_TMPDIR/combined.json" "$TEST_TMPDIR/out.json"
+  [ "$status" -eq 0 ]
+  jq -e 'length == 2' "$TEST_TMPDIR/out.json" >/dev/null
+  jq -e 'map(.thread_id) | index("PRRT_auto_open")' "$TEST_TMPDIR/out.json" >/dev/null
+  jq -e 'map(.thread_id) | index("PRRT_left_open")' "$TEST_TMPDIR/out.json" >/dev/null
+}
+
 # ── resolve_thread ───────────────────────────────────────────────────────────
 
 @test "resolve_thread: calls gh api graphql" {

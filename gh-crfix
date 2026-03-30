@@ -524,7 +524,7 @@ run_autofix_hook() {
     echo "[autofix] done"
   } >> "$log_file" 2>&1 || {
     echo "[autofix] hook failed (continuing)" >> "$log_file"
-    return 0
+    return 1
   }
 }
 
@@ -725,13 +725,13 @@ setup_worktree() {
 
   if git -C "$repo_dir" worktree list --porcelain | grep -qxF "worktree $worktree_path"; then
     # Clean up any leftover state from previous run
-    git -C "$worktree_path" merge --abort 2>/dev/null || true
-    git -C "$worktree_path" rebase --abort 2>/dev/null || true
-    git -C "$worktree_path" checkout -- . 2>/dev/null || true
-    git -C "$worktree_path" clean -fd 2>/dev/null || true
-    git -C "$worktree_path" fetch origin "$branch" --quiet || true
-    git -C "$worktree_path" checkout "$branch" 2>/dev/null || true
-    git -C "$worktree_path" reset --hard "origin/$branch" 2>/dev/null || true
+    git -C "$worktree_path" merge --abort >/dev/null 2>&1 || true
+    git -C "$worktree_path" rebase --abort >/dev/null 2>&1 || true
+    git -C "$worktree_path" checkout -- . >/dev/null 2>&1 || true
+    git -C "$worktree_path" clean -fd >/dev/null 2>&1 || true
+    git -C "$worktree_path" fetch origin "$branch" --quiet >/dev/null 2>&1 || true
+    git -C "$worktree_path" checkout "$branch" >/dev/null 2>&1 || true
+    git -C "$worktree_path" reset --hard "origin/$branch" >/dev/null 2>&1 || true
     echo "$worktree_path"
     return 0
   fi
@@ -741,12 +741,12 @@ setup_worktree() {
     | awk -v b="$branch" '/^worktree /{wt=$2} /^branch refs\/heads\//{if($2=="refs/heads/"b) print wt}')
 
   if [ -n "$existing_wt" ]; then
-    git -C "$existing_wt" merge --abort 2>/dev/null || true
-    git -C "$existing_wt" rebase --abort 2>/dev/null || true
-    git -C "$existing_wt" checkout -- . 2>/dev/null || true
-    git -C "$existing_wt" clean -fd 2>/dev/null || true
-    git -C "$existing_wt" fetch origin "$branch" --quiet || true
-    git -C "$existing_wt" reset --hard "origin/$branch" 2>/dev/null || true
+    git -C "$existing_wt" merge --abort >/dev/null 2>&1 || true
+    git -C "$existing_wt" rebase --abort >/dev/null 2>&1 || true
+    git -C "$existing_wt" checkout -- . >/dev/null 2>&1 || true
+    git -C "$existing_wt" clean -fd >/dev/null 2>&1 || true
+    git -C "$existing_wt" fetch origin "$branch" --quiet >/dev/null 2>&1 || true
+    git -C "$existing_wt" reset --hard "origin/$branch" >/dev/null 2>&1 || true
     echo "$existing_wt"
     return 0
   fi
@@ -1389,16 +1389,16 @@ write_uncovered_responses() {
     (($existing[0] // []) | map(.thread_id)) as $covered |
     ($selected[0] // []) as $selected_ids |
     [
-      ($triage_doc.auto[]? | select(($covered | index(.thread_id)) | not) | {
-        thread_id: .thread_id,
+      ($triage_doc.auto[]? | .thread_id as $thread_id | select(($covered | index($thread_id)) | not) | {
+        thread_id: $thread_id,
         action: "skipped",
         comment: ("Not auto-fixed: " + .reason + ". Leaving unresolved for manual follow-up.")
       }),
-      ($triage_doc.needs_llm[]? | select(($covered | index(.thread_id)) | not) | {
-        thread_id: .thread_id,
+      ($triage_doc.needs_llm[]? | .thread_id as $thread_id | select(($covered | index($thread_id)) | not) | {
+        thread_id: $thread_id,
         action: "skipped",
         comment: (
-          if ($selected_ids | index(.thread_id)) then
+          if ($selected_ids | index($thread_id)) then
             "Automation did not apply a code change for this thread. Leaving unresolved for manual follow-up."
           else
             "Automation did not select this thread for automatic code changes. Leaving unresolved for manual follow-up."
@@ -1415,6 +1415,8 @@ merge_base_branch() {
   local pr_num="$1" worktree_path="$2" log_file="$3"
   local base_branch
   base_branch=$(gh pr view "$pr_num" --repo "$OWNER_REPO" --json baseRefName -q '.baseRefName' 2>/dev/null || echo "master")
+  progress_set "$pr_num" merge_base running "origin/$base_branch"
+  progress_set "$pr_num" resolve_conflicts pending ""
 
   {
     echo "[merge] fetching origin/$base_branch"
@@ -1423,12 +1425,23 @@ merge_base_branch() {
     fi
     echo "[merge] merging origin/$base_branch"
     if git -C "$worktree_path" merge "origin/$base_branch" --no-edit -q 2>/dev/null; then
-      git -C "$worktree_path" push --quiet 2>/dev/null || true
-      echo "[merge] clean"
-      return 0
+      if git -C "$worktree_path" push --quiet 2>/dev/null; then
+        echo "[merge] clean"
+        echo "[merge] pushed"
+        progress_set "$pr_num" merge_base done "merged origin/$base_branch and pushed"
+        progress_set "$pr_num" resolve_conflicts skipped "not needed"
+        return 0
+      fi
+
+      echo "[merge] WARNING: push failed after clean merge"
+      progress_set "$pr_num" merge_base failed "merged origin/$base_branch but push failed"
+      progress_set "$pr_num" resolve_conflicts skipped "not needed"
+      return 1
     fi
 
     echo "[merge] conflicts — auto-resolving..."
+    progress_set "$pr_num" merge_base done "conflicts detected"
+    progress_set "$pr_num" resolve_conflicts running "auto-resolving"
     local conflicted
     conflicted=$(git -C "$worktree_path" diff --name-only --diff-filter=U || true)
 
@@ -1450,21 +1463,33 @@ merge_base_branch() {
     local remaining
     remaining=$(git -C "$worktree_path" diff --name-only --diff-filter=U || true)
     if [ -z "$remaining" ]; then
-      git -C "$worktree_path" commit --no-edit >/dev/null 2>&1
-      git -C "$worktree_path" push --quiet 2>/dev/null || true
+      if ! git -C "$worktree_path" commit --no-edit >/dev/null 2>&1; then
+        echo "[merge] auto-resolve commit failed"
+        progress_set "$pr_num" resolve_conflicts failed "auto-resolved files but commit failed"
+        return 1
+      fi
+      if ! git -C "$worktree_path" push --quiet 2>/dev/null; then
+        echo "[merge] WARNING: push failed after auto-resolve"
+        progress_set "$pr_num" resolve_conflicts failed "auto-resolved conflicts but push failed"
+        return 1
+      fi
       echo "[merge] auto-resolved"
+      echo "[merge] pushed"
+      progress_set "$pr_num" resolve_conflicts done "auto-resolved and pushed"
       return 0
     fi
 
     if [ "$DRY_RUN" = true ]; then
       git -C "$worktree_path" merge --abort 2>/dev/null || true
       echo "[merge] dry-run: skipping LLM resolution"
+      progress_set "$pr_num" resolve_conflicts skipped "dry-run"
       return 1
     fi
 
     [ "$AI_BACKEND" = "auto" ] && resolve_ai_backend
 
     echo "[merge] $remaining — using $AI_BACKEND..."
+    progress_set "$pr_num" resolve_conflicts running "using $AI_BACKEND"
     local prompt="Resolve merge conflicts in: $remaining
 Keep both sides where possible. PR branch (ours/HEAD) takes priority.
 After resolving: git add each file, git commit --no-edit, git push."
@@ -1483,11 +1508,31 @@ After resolving: git add each file, git commit --no-edit, git push."
 
     if [ "$llm_succeeded" = true ]; then
       remaining=$(git -C "$worktree_path" diff --name-only --diff-filter=U || true)
-      [ -z "$remaining" ] && { echo "[merge] LLM resolved"; return 0; }
+      if [ -z "$remaining" ]; then
+        if git -C "$worktree_path" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+          if ! git -C "$worktree_path" commit --no-edit >/dev/null 2>&1; then
+            echo "[merge] merge commit failed after LLM resolution"
+            progress_set "$pr_num" resolve_conflicts failed "resolved with $AI_BACKEND but merge commit failed"
+            return 1
+          fi
+        fi
+
+        if git -C "$worktree_path" push --quiet 2>/dev/null; then
+          echo "[merge] LLM resolved"
+          echo "[merge] pushed"
+          progress_set "$pr_num" resolve_conflicts done "resolved with $AI_BACKEND and pushed"
+          return 0
+        fi
+
+        echo "[merge] WARNING: push failed after LLM resolution"
+        progress_set "$pr_num" resolve_conflicts failed "resolved with $AI_BACKEND but push failed"
+        return 1
+      fi
     fi
 
     git -C "$worktree_path" merge --abort 2>/dev/null || true
     echo "[merge] could not resolve — aborted"
+    progress_set "$pr_num" resolve_conflicts failed "manual resolution required"
     return 1
   } >> "$log_file" 2>&1
 }
@@ -1555,8 +1600,32 @@ run_pre_gate_phase() {
   local validation_file="$LOG_DIR/pr-$pr_num-validation.json"
   local gate_context="$LOG_DIR/pr-$pr_num-gate-context.json"
 
-  run_autofix_hook "$worktree_path" "$hook" "$log_file"
+  if [ "$NO_AUTOFIX" = true ]; then
+    progress_set "$pr_num" autofix skipped "disabled by flag"
+  elif [ -z "$hook" ]; then
+    progress_set "$pr_num" autofix skipped "no hook configured"
+  else
+    progress_set "$pr_num" autofix running "${hook##*/}"
+    if run_autofix_hook "$worktree_path" "$hook" "$log_file"; then
+      progress_set "$pr_num" autofix done "${hook##*/}"
+    else
+      progress_set "$pr_num" autofix failed "${hook##*/} failed"
+    fi
+  fi
+
+  if [ -z "$validate_runner" ]; then
+    progress_set "$pr_num" validate skipped "no validation configured"
+  else
+    progress_set "$pr_num" validate running "${validate_runner#*::}"
+  fi
   run_validation "$worktree_path" "$validate_runner" "$validation_file" "$log_file"
+  if [ -f "$validation_file" ]; then
+    if [ "$(jq -r '.tests_failed // false' < "$validation_file")" = "true" ]; then
+      progress_set "$pr_num" validate failed "$(jq -r '.summary // "validation failed"' < "$validation_file")"
+    else
+      progress_set "$pr_num" validate done "$(jq -r '.summary // "validation passed"' < "$validation_file")"
+    fi
+  fi
   build_gate_context "$triage_file" "$validation_file" "$gate_context"
 
   {
@@ -1631,6 +1700,128 @@ pr_at_index() {
     if [ "$i" -eq "$idx" ]; then echo "$pr"; return; fi
     i=$((i + 1))
   done
+}
+
+progress_steps() {
+  cat <<'EOF'
+merge_base
+resolve_conflicts
+fetch_threads
+filter_threads
+autofix
+validate
+gate
+fix
+reply
+cleanup
+rereview
+postfix
+EOF
+}
+
+progress_label() {
+  case "$1" in
+    merge_base) echo "fetching new base branch and merging base branch" ;;
+    resolve_conflicts) echo "optionally resolving conflicts and pushing" ;;
+    fetch_threads) echo "fetching review comments from GitHub" ;;
+    filter_threads) echo "filtering unresolved comments" ;;
+    autofix) echo "running deterministic autofix hook" ;;
+    validate) echo "running deterministic validation/tests" ;;
+    gate) echo "using gate model to decide if a larger model is needed" ;;
+    fix) echo "using fix model to apply changes" ;;
+    reply) echo "replying to and resolving review threads" ;;
+    cleanup) echo "cleaning up thread-responses artifact" ;;
+    rereview) echo "requesting Copilot re-review" ;;
+    postfix) echo "waiting for re-review and re-merging base branch" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+progress_file() {
+  local pr_num="$1" step="$2"
+  echo "$LOG_DIR/pr-${pr_num}.step.${step}"
+}
+
+progress_set() {
+  local pr_num="$1" step="$2" status="$3" note="${4:-}"
+  [ -n "$LOG_DIR" ] || return 0
+  printf '%s\t%s\n' "$status" "$note" > "$(progress_file "$pr_num" "$step")"
+}
+
+progress_get_status() {
+  local pr_num="$1" step="$2" file
+  file="$(progress_file "$pr_num" "$step")"
+  if [ -f "$file" ]; then
+    awk -F '\t' 'NR==1 { print $1 }' "$file"
+  else
+    echo "pending"
+  fi
+}
+
+progress_get_note() {
+  local pr_num="$1" step="$2" file
+  file="$(progress_file "$pr_num" "$step")"
+  if [ -f "$file" ]; then
+    awk -F '\t' 'NR==1 { $1=""; sub(/^\t/, ""); print }' "$file"
+  else
+    echo ""
+  fi
+}
+
+progress_init() {
+  local pr_num="$1" step
+  while IFS= read -r step; do
+    [ -n "$step" ] || continue
+    progress_set "$pr_num" "$step" "pending" ""
+  done <<EOF
+$(progress_steps)
+EOF
+}
+
+progress_mark_remaining() {
+  local pr_num="$1" target_status="$2" reason="$3" step current
+  while IFS= read -r step; do
+    [ -n "$step" ] || continue
+    current="$(progress_get_status "$pr_num" "$step")"
+    case "$current" in
+      pending|running)
+        progress_set "$pr_num" "$step" "$target_status" "$reason"
+        ;;
+    esac
+  done <<EOF
+$(progress_steps)
+EOF
+}
+
+progress_marker() {
+  case "$1" in
+    done) echo "[x]" ;;
+    running) echo "[>]" ;;
+    skipped) echo "[-]" ;;
+    failed) echo "[!]" ;;
+    *) echo "[ ]" ;;
+  esac
+}
+
+progress_color() {
+  case "$1" in
+    done) echo "$c_green" ;;
+    running) echo "$c_yellow" ;;
+    failed) echo "$c_red" ;;
+    *) echo "$c_gray" ;;
+  esac
+}
+
+progress_snapshot() {
+  local pr_num="$1" step status note
+  while IFS= read -r step; do
+    [ -n "$step" ] || continue
+    status="$(progress_get_status "$pr_num" "$step")"
+    note="$(progress_get_note "$pr_num" "$step")"
+    printf '%s\t%s\t%s\n' "$status" "$(progress_label "$step")" "$note"
+  done <<EOF
+$(progress_steps)
+EOF
 }
 
 # ── TUI: terminal input ─────────────────────────────────────────────────────
@@ -2325,11 +2516,42 @@ tui_render_dashboard() {
   local preview_rows=$((rows - row_count - 2))
   [ "$preview_rows" -lt 3 ] && preview_rows=3
   local log_file="$LOG_DIR/pr-${sel_pr}.log"
+  local checklist_lines checklist_capacity checklist_shown log_rows lc
+  checklist_capacity=$((preview_rows - 2))
+  [ "$checklist_capacity" -lt 0 ] && checklist_capacity=0
 
-  if [ -f "$log_file" ]; then
+  buf="${buf}  ${c_gray}Checklist:${RST}${CLR}\n"
+  checklist_lines="$(progress_snapshot "$sel_pr")"
+  checklist_shown=0
+  while IFS=$'\t' read -r step_status step_label step_note; do
+    [ -n "$step_status" ] || continue
+    [ "$checklist_shown" -ge "$checklist_capacity" ] && break
+    local marker color_code line_text
+    marker="$(progress_marker "$step_status")"
+    color_code="$(progress_color "$step_status")"
+    line_text="${marker} ${step_label}"
+    [ -n "$step_note" ] && line_text="${line_text} (${step_note})"
+    if [ ${#line_text} -gt "$((cols - 4))" ]; then
+      line_text="${line_text:0:$((cols - 5))}…"
+    fi
+    buf="${buf}  ${color_code}${line_text}${RST}${CLR}\n"
+    checklist_shown=$((checklist_shown + 1))
+  done <<EOF
+$checklist_lines
+EOF
+  while [ "$checklist_shown" -lt "$checklist_capacity" ]; do
+    buf="${buf}${CLR}\n"
+    checklist_shown=$((checklist_shown + 1))
+  done
+
+  log_rows=$((preview_rows - checklist_capacity - 2))
+  [ "$log_rows" -lt 0 ] && log_rows=0
+  buf="${buf}  ${c_gray}Recent log:${RST}${CLR}\n"
+
+  if [ "$log_rows" -gt 0 ] && [ -f "$log_file" ]; then
     local preview_content
-    preview_content="$(tail -"$preview_rows" "$log_file" 2>/dev/null)"
-    local lc=0
+    preview_content="$(tail -"$log_rows" "$log_file" 2>/dev/null)"
+    lc=0
     while IFS= read -r line; do
       if [ ${#line} -gt "$((cols - 4))" ]; then
         line="${line:0:$((cols - 5))}…"
@@ -2339,15 +2561,18 @@ tui_render_dashboard() {
     done <<EOF
 $preview_content
 EOF
-    # Fill remaining preview rows
-    while [ "$lc" -lt "$preview_rows" ]; do
+    while [ "$lc" -lt "$log_rows" ]; do
       buf="${buf}${CLR}\n"
       lc=$((lc + 1))
     done
   else
-    buf="${buf}  ${c_gray}(waiting...)${RST}${CLR}\n"
-    local lc=1
-    while [ "$lc" -lt "$preview_rows" ]; do
+    if [ "$log_rows" -gt 0 ]; then
+      buf="${buf}  ${c_gray}(waiting...)${RST}${CLR}\n"
+      lc=1
+    else
+      lc=0
+    fi
+    while [ "$lc" -lt "$log_rows" ]; do
       buf="${buf}${CLR}\n"
       lc=$((lc + 1))
     done
@@ -2395,16 +2620,33 @@ tui_render_detail() {
   while [ "$si" -lt "$cols" ]; do sep="${sep}─"; si=$((si + 1)); done
   buf="${buf}${c_gray}${sep}${RST}\n"
 
-  # Log content
+  # Checklist + log content
   local content_rows=$((rows - 4))
   local log_file="$LOG_DIR/pr-${sel_pr}.log"
   local total_lines=0
+  local checklist_lines checklist_rows max_checklist_rows displayed
 
   if [ -f "$log_file" ]; then
     total_lines=$(wc -l < "$log_file" | tr -d ' ')
   fi
 
-  local max_scroll=$((total_lines - content_rows))
+  max_checklist_rows=$((content_rows - 4))
+  [ "$max_checklist_rows" -lt 0 ] && max_checklist_rows=0
+  checklist_rows=0
+  checklist_lines="$(progress_snapshot "$sel_pr")"
+  if [ "$max_checklist_rows" -gt 0 ]; then
+    checklist_rows=1
+    while IFS= read -r _; do
+      checklist_rows=$((checklist_rows + 1))
+    done <<EOF
+$checklist_lines
+EOF
+    [ "$checklist_rows" -gt "$max_checklist_rows" ] && checklist_rows="$max_checklist_rows"
+  fi
+
+  local log_rows=$((content_rows - checklist_rows))
+  [ "$log_rows" -lt 0 ] && log_rows=0
+  local max_scroll=$((total_lines - log_rows))
   [ "$max_scroll" -lt 0 ] && max_scroll=0
 
   if [ "$TUI_DETAIL_SCROLL" -ge "$((max_scroll - 2))" ] || [ "$TUI_DETAIL_SCROLL" -eq -1 ]; then
@@ -2414,7 +2656,30 @@ tui_render_detail() {
   local skip="$TUI_DETAIL_SCROLL"
   [ "$skip" -lt 0 ] && skip=0
 
-  local displayed=0
+  displayed=0
+  if [ "$checklist_rows" -gt 0 ]; then
+    buf="${buf}  ${c_gray}Checklist:${RST}${CLR}\n"
+    displayed=$((displayed + 1))
+    local checklist_drawn=1
+    while IFS=$'\t' read -r step_status step_label step_note; do
+      [ -n "$step_status" ] || continue
+      [ "$checklist_drawn" -ge "$checklist_rows" ] && break
+      local marker color_code line_text
+      marker="$(progress_marker "$step_status")"
+      color_code="$(progress_color "$step_status")"
+      line_text="${marker} ${step_label}"
+      [ -n "$step_note" ] && line_text="${line_text} (${step_note})"
+      if [ ${#line_text} -gt "$((cols - 2))" ]; then
+        line_text="${line_text:0:$((cols - 3))}…"
+      fi
+      buf="${buf} ${color_code}${line_text}${RST}${CLR}\n"
+      displayed=$((displayed + 1))
+      checklist_drawn=$((checklist_drawn + 1))
+    done <<EOF
+$checklist_lines
+EOF
+  fi
+
   if [ -f "$log_file" ]; then
     local line_num=0
     while IFS= read -r line; do
@@ -2440,7 +2705,7 @@ tui_render_detail() {
   buf="${buf}\033[$((rows));1H"
   buf="${buf}  ${c_gray}↑↓ scroll  Esc/q back  "
   if [ "$total_lines" -gt 0 ]; then
-    local pct=$(( (skip + content_rows) * 100 / (total_lines + 1) ))
+    local pct=$(( (skip + log_rows) * 100 / (total_lines + 1) ))
     [ "$pct" -gt 100 ] && pct=100
     buf="${buf}[${skip}/${total_lines} lines  ${pct}%%]"
   fi
@@ -2598,9 +2863,11 @@ setup_all() {
 
     local log_file="$LOG_DIR/pr-$pr_num.log"
     : > "$log_file"
+    progress_init "$pr_num"
 
     if [ "$SETUP_ONLY" = true ]; then
       echo "  → cd $worktree_path"
+      progress_mark_remaining "$pr_num" skipped "setup-only"
       kv_append skipped "$pr_num"
       continue
     fi
@@ -2610,19 +2877,24 @@ setup_all() {
 
     echo "  Fetching unresolved threads..."
     local threads_json threads_file triage_file thread_count residual_count
+    progress_set "$pr_num" fetch_threads running "review threads"
     threads_json="$(get_unresolved_threads "$OWNER_REPO" "$pr_num")"
     thread_count="$(echo "$threads_json" | jq 'length')"
     threads_file="$LOG_DIR/pr-$pr_num-threads.json"
     triage_file="$LOG_DIR/pr-$pr_num-triage.json"
 
     echo "$threads_json" > "$threads_file"
+    progress_set "$pr_num" fetch_threads done "$thread_count unresolved thread(s)"
 
     if [ "$thread_count" -eq 0 ]; then
       echo "  ✓ No unresolved threads"
+      progress_set "$pr_num" filter_threads skipped "no unresolved threads"
+      progress_mark_remaining "$pr_num" skipped "no unresolved threads"
       kv_append skipped "$pr_num"
       continue
     fi
 
+    progress_set "$pr_num" filter_threads running "deterministic triage"
     triage_threads "$worktree_path" "$threads_file" "$triage_file"
     residual_count="$(jq '.needs_llm | length' < "$triage_file")"
 
@@ -2630,6 +2902,7 @@ setup_all() {
     kv_set "$pr_num" triage_file "$triage_file"
     kv_set "$pr_num" thread_count "$thread_count"
     kv_set "$pr_num" residual_count "$residual_count"
+    progress_set "$pr_num" filter_threads done "$residual_count residual thread(s)"
 
     echo "  Threads total      : $thread_count"
     echo "  deterministic skip : $(jq '.skip | length' < "$triage_file")"
@@ -2681,6 +2954,7 @@ process_pr() {
     : > "$selected_file"
 
     if [ "$should_run_gate" = "true" ]; then
+      progress_set "$pr_num" gate running "$GATE_MODEL"
       run_gate_model "$OWNER_REPO" "$pr_num" "$triage_file" "$validation_file" "$gate_context" "$gate_out" "$log_file"
       jq -r '.threads_to_fix[]?' < "$gate_out" > "$selected_file" || true
     else
@@ -2701,6 +2975,7 @@ process_pr() {
           })
         ]' > "$gate_skipped"
       echo "[gate] skipped: $(jq -r '.reason' < "$gate_out")"
+      progress_set "$pr_num" gate skipped "score $total_score < 1"
     fi
 
     local needs_advanced
@@ -2711,6 +2986,7 @@ process_pr() {
       if [ ! -s "$selected_file" ] && [ "$(jq '.needs_llm | length' < "$triage_file")" -gt 0 ]; then
         jq -r '.needs_llm[]?.thread_id' < "$triage_file" > "$selected_file"
       fi
+      progress_set "$pr_num" gate done "$(wc -l < "$selected_file" | tr -d ' ') thread(s) selected"
 
       if [ "$DRY_RUN" = true ]; then
         echo "[dry-run] would run advanced model on:"
@@ -2719,13 +2995,21 @@ process_pr() {
         else
           echo "(no explicit thread selection; deterministic validation failed)"
         fi
+        progress_set "$pr_num" fix skipped "dry-run"
       else
-        run_fix_model "$OWNER_REPO" "$pr_num" "$worktree_path" "$threads_file" "$selected_file" "$validation_file" "$log_file"
+        progress_set "$pr_num" fix running "$FIX_MODEL"
+        if ! run_fix_model "$OWNER_REPO" "$pr_num" "$worktree_path" "$threads_file" "$selected_file" "$validation_file" "$log_file"; then
+          progress_set "$pr_num" fix failed "$FIX_MODEL failed"
+          return 1
+        fi
+        progress_set "$pr_num" fix done "$FIX_MODEL finished"
       fi
     else
       local reason
       reason="$(jq -r '.reason // "n/a"' < "$gate_out" 2>/dev/null)"
       echo "[gate] advanced model not needed ($reason)"
+      [ "$should_run_gate" = "true" ] && progress_set "$pr_num" gate done "$reason"
+      progress_set "$pr_num" fix skipped "not needed"
 
       if [ "$should_run_gate" = "true" ]; then
         # Generate "skipped by gate" responses so needs_llm threads still get resolved
@@ -2761,18 +3045,25 @@ process_pr() {
 
     # 6. Reply and resolve
     if [ "$NO_RESOLVE" = false ]; then
+      progress_set "$pr_num" reply running "posting replies"
       echo "[resolve] replying/resolving"
       echo "[resolve] $(reply_and_resolve_from_responses "$combined")"
+      progress_set "$pr_num" reply done "replies posted"
     else
       echo "[resolve] skipped by flag"
+      progress_set "$pr_num" reply skipped "disabled by flag"
     fi
 
     # 7. Remove thread-responses.json from git (prevents future merge conflicts)
     if [ -f "$worktree_path/thread-responses.json" ]; then
+      progress_set "$pr_num" cleanup running "removing tracked artifact"
       git -C "$worktree_path" rm -f thread-responses.json >/dev/null 2>&1 || rm -f "$worktree_path/thread-responses.json"
       git -C "$worktree_path" commit -q -m "chore: remove thread-responses.json artifact" 2>/dev/null || true
       git -C "$worktree_path" push -q 2>/dev/null || true
       echo "[cleanup] removed thread-responses.json from git"
+      progress_set "$pr_num" cleanup done "artifact removed"
+    else
+      progress_set "$pr_num" cleanup skipped "nothing to clean"
     fi
 
     # 8. Post-fix summary
@@ -2780,19 +3071,32 @@ process_pr() {
 
     # 9. Request Copilot re-review
     if [ "$DRY_RUN" = false ]; then
+      progress_set "$pr_num" rereview running "requesting review"
       echo "[review] requesting Copilot re-review"
       request_copilot_review "$pr_num"
+      progress_set "$pr_num" rereview done "requested"
+    else
+      progress_set "$pr_num" rereview skipped "dry-run"
     fi
 
     # 10. Post-fix review cycle
     local fixed_count
     fixed_count="$(jq '[.[] | select(.action == "fixed" or .action == "already_fixed")] | length' < "$combined" 2>/dev/null || echo "0")"
+    if [ "$NO_POST_FIX" = true ] || [ "$DRY_RUN" = true ]; then
+      progress_set "$pr_num" postfix skipped "disabled"
+    else
+      progress_set "$pr_num" postfix running "waiting ${REVIEW_WAIT_SECS}s"
+    fi
     post_fix_review_cycle "$pr_num" "$worktree_path" "$fixed_count" "$log_file"
+    if [ "$NO_POST_FIX" = false ] && [ "$DRY_RUN" = false ]; then
+      progress_set "$pr_num" postfix done "review cycle finished"
+    fi
 
     # 11. Write status
     echo "[done]"
     echo "OK" > "$LOG_DIR/pr-$pr_num.status"
   } >> "$log_file" 2>&1 || {
+    progress_mark_remaining "$pr_num" failed "stopped after error"
     echo "FAIL" > "$LOG_DIR/pr-$pr_num.status"
     return 0
   }
@@ -2841,6 +3145,7 @@ process_pr_sequential() {
   : > "$selected_file"
 
   if [ "$should_run_gate" = "true" ]; then
+    progress_set "$pr_num" gate running "$GATE_MODEL"
     echo "  Running gate model ($GATE_MODEL)..."
     run_gate_model "$OWNER_REPO" "$pr_num" "$triage_file" "$validation_file" "$gate_context" "$gate_out" "$log_file"
     jq -r '.threads_to_fix[]?' < "$gate_out" > "$selected_file" || true
@@ -2862,6 +3167,7 @@ process_pr_sequential() {
         })
       ]' > "$gate_skipped"
     echo "  Gate: SKIP — $(jq -r '.reason' < "$gate_out")"
+    progress_set "$pr_num" gate skipped "score $total_score < 1"
   fi
 
   local needs_advanced
@@ -2876,6 +3182,7 @@ process_pr_sequential() {
     local sel_count
     sel_count="$(wc -l < "$selected_file" | tr -d ' ')"
     echo "  Gate: YES — $sel_count thread(s) selected; validation_failed=$(jq -r '.tests_failed' < "$validation_file")"
+    progress_set "$pr_num" gate done "$sel_count thread(s) selected"
 
     if [ "$DRY_RUN" = true ]; then
       echo "  [dry-run] would run advanced model on:"
@@ -2884,15 +3191,23 @@ process_pr_sequential() {
       else
         echo "    (no explicit thread selection; deterministic validation failed)"
       fi
+      progress_set "$pr_num" fix skipped "dry-run"
     else
       echo "  Launching fix model ($FIX_MODEL)..."
-      run_fix_model "$OWNER_REPO" "$pr_num" "$worktree_path" "$threads_file" "$selected_file" "$validation_file" "$log_file" \
-        || echo "  Fix model failed (continuing)"
+      progress_set "$pr_num" fix running "$FIX_MODEL"
+      if ! run_fix_model "$OWNER_REPO" "$pr_num" "$worktree_path" "$threads_file" "$selected_file" "$validation_file" "$log_file"; then
+        progress_set "$pr_num" fix failed "$FIX_MODEL failed"
+        echo "  Fix model failed (continuing)"
+      else
+        progress_set "$pr_num" fix done "$FIX_MODEL finished"
+      fi
     fi
   else
     local reason
     reason="$(jq -r '.reason // "n/a"' < "$gate_out" 2>/dev/null)"
     echo "  Gate: NO — advanced model not needed ($reason)"
+    [ "$should_run_gate" = "true" ] && progress_set "$pr_num" gate done "$reason"
+    progress_set "$pr_num" fix skipped "not needed"
 
     if [ "$should_run_gate" = "true" ]; then
       # Generate "skipped by gate" responses so needs_llm threads still get resolved
@@ -2928,20 +3243,27 @@ process_pr_sequential() {
 
   # 6. Reply and resolve
   if [ "$NO_RESOLVE" = false ]; then
+    progress_set "$pr_num" reply running "posting replies"
     echo "  Replying & resolving threads..."
     local resolve_result
     resolve_result="$(reply_and_resolve_from_responses "$combined")"
     echo "  $resolve_result"
+    progress_set "$pr_num" reply done "replies posted"
   else
     echo "  (--no-resolve: skipping thread resolution)"
+    progress_set "$pr_num" reply skipped "disabled by flag"
   fi
 
   # 7. Remove thread-responses.json from git (prevents future merge conflicts)
   if [ -f "$worktree_path/thread-responses.json" ]; then
+    progress_set "$pr_num" cleanup running "removing tracked artifact"
     git -C "$worktree_path" rm -f thread-responses.json >/dev/null 2>&1 || rm -f "$worktree_path/thread-responses.json"
     git -C "$worktree_path" commit -q -m "chore: remove thread-responses.json artifact" 2>/dev/null || true
     git -C "$worktree_path" push -q 2>/dev/null || true
     echo "  [cleanup] removed thread-responses.json from git"
+    progress_set "$pr_num" cleanup done "artifact removed"
+  else
+    progress_set "$pr_num" cleanup skipped "nothing to clean"
   fi
 
   # 8. Post-fix summary
@@ -2949,14 +3271,26 @@ process_pr_sequential() {
 
   # 9. Request Copilot re-review
   if [ "$DRY_RUN" = false ]; then
+    progress_set "$pr_num" rereview running "requesting review"
     echo "  Requesting Copilot re-review..."
     request_copilot_review "$pr_num"
+    progress_set "$pr_num" rereview done "requested"
+  else
+    progress_set "$pr_num" rereview skipped "dry-run"
   fi
 
   # 10. Post-fix review cycle
   local fixed_count
   fixed_count="$(jq '[.[] | select(.action == "fixed" or .action == "already_fixed")] | length' < "$combined" 2>/dev/null || echo "0")"
+  if [ "$NO_POST_FIX" = true ] || [ "$DRY_RUN" = true ]; then
+    progress_set "$pr_num" postfix skipped "disabled"
+  else
+    progress_set "$pr_num" postfix running "waiting ${REVIEW_WAIT_SECS}s"
+  fi
   post_fix_review_cycle "$pr_num" "$worktree_path" "$fixed_count" "$log_file"
+  if [ "$NO_POST_FIX" = false ] && [ "$DRY_RUN" = false ]; then
+    progress_set "$pr_num" postfix done "review cycle finished"
+  fi
 
   # 11. Write status
   echo "  ✓ PR #$pr_num complete"
