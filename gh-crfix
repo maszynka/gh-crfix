@@ -780,42 +780,42 @@ setup_worktree() {
 
   mkdir -p "$repo_dir/$WORKTREE_SUBDIR"
 
-  if git -C "$repo_dir" worktree list --porcelain | grep -qxF "worktree $worktree_path"; then
-    # Clean up any leftover state from previous run
-    git -C "$worktree_path" merge --abort >/dev/null 2>&1 || true
-    git -C "$worktree_path" rebase --abort >/dev/null 2>&1 || true
-    git -C "$worktree_path" checkout -- . >/dev/null 2>&1 || true
-    git -C "$worktree_path" clean -fd >/dev/null 2>&1 || true
-    git -C "$worktree_path" fetch origin "$branch" --quiet >/dev/null 2>&1 || true
-    git -C "$worktree_path" checkout "$branch" >/dev/null 2>&1 || true
-    git -C "$worktree_path" reset --hard "origin/$branch" >/dev/null 2>&1 || true
-    echo "$worktree_path"
-    return 0
+  if ! git -C "$repo_dir" worktree list --porcelain | grep -qxF "worktree $worktree_path"; then
+    git -C "$repo_dir" fetch origin "$branch" --quiet 2>/dev/null || true
+    if git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$branch"; then
+      git -C "$repo_dir" worktree add --force "$worktree_path" "$branch" >/dev/null 2>&1
+    else
+      git -C "$repo_dir" worktree add --force "$worktree_path" \
+        --track -b "$branch" "origin/$branch" >/dev/null 2>&1
+    fi
   fi
 
-  local existing_wt
-  existing_wt=$(git -C "$repo_dir" worktree list --porcelain \
-    | awk -v b="$branch" '/^worktree /{wt=$2} /^branch refs\/heads\//{if($2=="refs/heads/"b) print wt}')
+  git -C "$worktree_path" merge --abort >/dev/null 2>&1 || true
+  git -C "$worktree_path" rebase --abort >/dev/null 2>&1 || true
+  git -C "$worktree_path" checkout -- . >/dev/null 2>&1 || true
+  git -C "$worktree_path" clean -fd >/dev/null 2>&1 || true
+  git -C "$worktree_path" fetch origin "$branch" --quiet >/dev/null 2>&1 || true
+  git -C "$worktree_path" checkout "$branch" >/dev/null 2>&1 || true
+  git -C "$worktree_path" reset --hard "origin/$branch" >/dev/null 2>&1 \
+    || git -C "$worktree_path" reset --hard "$branch" >/dev/null 2>&1 \
+    || true
 
-  if [ -n "$existing_wt" ]; then
-    git -C "$existing_wt" merge --abort >/dev/null 2>&1 || true
-    git -C "$existing_wt" rebase --abort >/dev/null 2>&1 || true
-    git -C "$existing_wt" checkout -- . >/dev/null 2>&1 || true
-    git -C "$existing_wt" clean -fd >/dev/null 2>&1 || true
-    git -C "$existing_wt" fetch origin "$branch" --quiet >/dev/null 2>&1 || true
-    git -C "$existing_wt" reset --hard "origin/$branch" >/dev/null 2>&1 || true
-    echo "$existing_wt"
-    return 0
-  fi
-
-  git -C "$repo_dir" fetch origin "$branch" --quiet 2>/dev/null || true
-  if git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$branch"; then
-    git -C "$repo_dir" worktree add "$worktree_path" "$branch" >/dev/null 2>&1
-  else
-    git -C "$repo_dir" worktree add "$worktree_path" \
-      --track -b "$branch" "origin/$branch" >/dev/null 2>&1
-  fi
   echo "$worktree_path"
+}
+
+detect_case_collisions() {
+  local worktree_path="$1"
+  git -C "$worktree_path" ls-tree -r --name-only HEAD 2>/dev/null \
+    | awk '
+        {
+          lc = tolower($0)
+          if (lc in seen) {
+            print seen[lc] " | " $0
+          } else {
+            seen[lc] = $0
+          }
+        }
+      '
 }
 
 # ── GitHub API helpers ───────────────────────────────────────────────────────
@@ -1545,6 +1545,8 @@ merge_base_branch() {
 
     if [ "$DRY_RUN" = true ]; then
       git -C "$worktree_path" merge --abort 2>/dev/null || true
+      git -C "$worktree_path" reset --hard HEAD >/dev/null 2>&1 || true
+      git -C "$worktree_path" clean -fd >/dev/null 2>&1 || true
       echo "[merge] dry-run: skipping LLM resolution"
       progress_set "$pr_num" resolve_conflicts skipped "dry-run"
       return 1
@@ -1601,6 +1603,8 @@ After resolving: git add each file, git commit --no-edit, git push."
     fi
 
     git -C "$worktree_path" merge --abort 2>/dev/null || true
+    git -C "$worktree_path" reset --hard HEAD >/dev/null 2>&1 || true
+    git -C "$worktree_path" clean -fd >/dev/null 2>&1 || true
     echo "[merge] could not resolve — aborted"
     progress_set "$pr_num" resolve_conflicts failed "manual resolution required"
     return 1
@@ -2975,6 +2979,24 @@ setup_all() {
     : > "$log_file"
     progress_init "$pr_num"
 
+    local dirty_status
+    dirty_status="$(git -C "$worktree_path" status --short 2>/dev/null || true)"
+    if [ -n "$dirty_status" ]; then
+      local case_conflicts dirty_preview
+      case_conflicts="$(detect_case_collisions "$worktree_path" | sed -n '1,2p' | paste -sd '; ' -)"
+      if [ -n "$case_conflicts" ]; then
+        echo "  ⚠ Worktree is dirty before processing — case-colliding paths detected on this filesystem: $case_conflicts"
+        progress_mark_remaining "$pr_num" failed "worktree not clean (case-colliding paths)"
+      else
+        dirty_preview="$(printf '%s\n' "$dirty_status" | sed -n '1,3p' | paste -sd '; ' -)"
+        echo "  ⚠ Worktree is dirty before processing — $dirty_preview"
+        progress_mark_remaining "$pr_num" failed "worktree not clean"
+      fi
+      echo "FAIL" > "$LOG_DIR/pr-$pr_num.status"
+      kv_append skipped "$pr_num"
+      continue
+    fi
+
     if [ "$SETUP_ONLY" = true ]; then
       echo "  → cd $worktree_path"
       progress_mark_remaining "$pr_num" skipped "setup-only"
@@ -2983,7 +3005,13 @@ setup_all() {
     fi
 
     # Merge base branch before fixing (resolve conflicts first)
-    merge_base_branch "$pr_num" "$worktree_path" "$log_file" || true
+    if ! merge_base_branch "$pr_num" "$worktree_path" "$log_file"; then
+      echo "  ⚠ Could not merge base branch — skipping PR"
+      progress_mark_remaining "$pr_num" failed "merge base failed"
+      echo "FAIL" > "$LOG_DIR/pr-$pr_num.status"
+      kv_append skipped "$pr_num"
+      continue
+    fi
 
     echo "  Fetching unresolved threads..."
     local threads_json threads_file triage_file thread_count residual_count

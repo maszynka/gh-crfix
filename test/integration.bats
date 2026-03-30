@@ -10,6 +10,11 @@ setup() {
   # Create test git repo
   REPO_DIR="$TEST_TMPDIR/repo"
   create_test_repo "$REPO_DIR" "https://github.com/test-owner/test-repo.git"
+  REMOTE_DIR="$TEST_TMPDIR/remote.git"
+  git init --bare -q "$REMOTE_DIR"
+  git -C "$REPO_DIR" remote remove origin
+  git -C "$REPO_DIR" remote add origin "$REMOTE_DIR"
+  export GH_CRFIX_DIR="$REPO_DIR"
   cd "$REPO_DIR"
 
   # Create PR branches
@@ -19,6 +24,11 @@ setup() {
     git add .
     git commit -q -m "commit on $branch"
     git checkout -q master 2>/dev/null || git checkout -q main
+  done
+
+  DEFAULT_BRANCH="$(git -C "$REPO_DIR" symbolic-ref --short HEAD)"
+  for branch in "$DEFAULT_BRANCH" pr-branch-1 pr-branch-2 pr-branch-3; do
+    git -C "$REPO_DIR" push -q -u origin "$branch"
   done
 
   # Thread fixture
@@ -58,7 +68,7 @@ setup_mocks() {
       apply_jq '{\"nameWithOwner\":\"test-owner/test-repo\"}'
     elif echo \"\$all\" | grep -q 'pr view'; then
       if [ -n \"\$jq_expr\" ]; then
-        echo 'master'
+        echo '$DEFAULT_BRANCH'
       else
         pr_num=\$(echo \"\$all\" | grep -oE '[0-9]+' | head -1)
         echo \"{\\\"headRefName\\\":\\\"pr-branch-1\\\",\\\"title\\\":\\\"Test PR #\${pr_num}\\\",\\\"state\\\":\\\"$pr_state\\\",\\\"isDraft\\\":false}\"
@@ -117,20 +127,27 @@ CREOF
 @test "integration: PR with no unresolved threads skipped" {
   # Mock gh with jq passthrough for graphql calls
   mock_command_script "gh" '
-    if echo "$@" | grep -q "auth status"; then
+    jq_expr=""
+    args=()
+    while [ $# -gt 0 ]; do
+      if [ "$1" = "--jq" ] || [ "$1" = "-q" ]; then shift; jq_expr="$1"
+      else args+=("$1"); fi
+      shift
+    done
+    all="${args[*]}"
+    if echo "$all" | grep -q "auth status"; then
       true
-    elif echo "$@" | grep -q "repo view"; then
+    elif echo "$all" | grep -q "repo view"; then
       echo "{\"nameWithOwner\":\"test-owner/test-repo\"}"
-    elif echo "$@" | grep -q "pr view"; then
-      echo "{\"headRefName\":\"pr-branch-1\",\"title\":\"Test PR\",\"state\":\"OPEN\",\"isDraft\":false}"
-    elif echo "$@" | grep -q "api graphql"; then
+    elif echo "$all" | grep -q "pr view"; then
+      if [ -n "$jq_expr" ]; then
+        echo "'"$DEFAULT_BRANCH"'"
+      else
+        echo "{\"headRefName\":\"pr-branch-1\",\"title\":\"Test PR\",\"state\":\"OPEN\",\"isDraft\":false}"
+      fi
+    elif echo "$all" | grep -q "api graphql"; then
       json="{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[]}}}}}"
       # Check if --jq was passed and apply it
-      jq_expr=""
-      while [ $# -gt 0 ]; do
-        if [ "$1" = "--jq" ]; then shift; jq_expr="$1"; fi
-        shift
-      done
       if [ -n "$jq_expr" ]; then
         echo "$json" | jq -r "$jq_expr"
       else
@@ -198,19 +215,26 @@ CREOF
 
 @test "integration: summary counts are correct for skipped PR" {
   mock_command_script "gh" '
-    if echo "$@" | grep -q "auth status"; then
+    jq_expr=""
+    args=()
+    while [ $# -gt 0 ]; do
+      if [ "$1" = "--jq" ] || [ "$1" = "-q" ]; then shift; jq_expr="$1"
+      else args+=("$1"); fi
+      shift
+    done
+    all="${args[*]}"
+    if echo "$all" | grep -q "auth status"; then
       true
-    elif echo "$@" | grep -q "repo view"; then
+    elif echo "$all" | grep -q "repo view"; then
       echo "{\"nameWithOwner\":\"test-owner/test-repo\"}"
-    elif echo "$@" | grep -q "pr view"; then
-      echo "{\"headRefName\":\"pr-branch-1\",\"title\":\"Test PR\",\"state\":\"OPEN\",\"isDraft\":false}"
-    elif echo "$@" | grep -q "api graphql"; then
+    elif echo "$all" | grep -q "pr view"; then
+      if [ -n "$jq_expr" ]; then
+        echo "'"$DEFAULT_BRANCH"'"
+      else
+        echo "{\"headRefName\":\"pr-branch-1\",\"title\":\"Test PR\",\"state\":\"OPEN\",\"isDraft\":false}"
+      fi
+    elif echo "$all" | grep -q "api graphql"; then
       json="{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[]}}}}}"
-      jq_expr=""
-      while [ $# -gt 0 ]; do
-        if [ "$1" = "--jq" ]; then shift; jq_expr="$1"; fi
-        shift
-      done
       if [ -n "$jq_expr" ]; then
         echo "$json" | jq -r "$jq_expr"
       else
@@ -253,7 +277,7 @@ CREOF
     elif echo "$all" | grep -q "repo view"; then
       apply_jq "{\"nameWithOwner\":\"test-owner/test-repo\"}"
     elif echo "$all" | grep -q "pr view"; then
-      if [ -n "$jq_expr" ]; then echo "master"
+      if [ -n "$jq_expr" ]; then echo "'"$DEFAULT_BRANCH"'"
       else echo "{\"headRefName\":\"pr-branch-1\",\"title\":\"Draft PR\",\"state\":\"OPEN\",\"isDraft\":true}"; fi
     elif echo "$all" | grep -q "api graphql"; then
       if echo "$all" | grep -q "reviewThreads"; then
@@ -290,7 +314,7 @@ CREOF
   assert_output --partial "1 fixed"
 }
 
-@test "integration: post-fix merges master when no new comments" {
+@test "integration: post-fix merges base branch when no new comments" {
   # Mock that returns 0 unresolved threads on the second check (post-fix)
   local call_count_file="$TEST_TMPDIR/graphql_calls"
   echo "0" > "$call_count_file"
@@ -303,7 +327,7 @@ CREOF
     elif echo "$@" | grep -q "pr view"; then
       if echo "$@" | grep -q "baseRefName"; then
         # gh pr view with -q extracts the value
-        echo "master"
+        echo "'"$DEFAULT_BRANCH"'"
       else
         echo "{\"headRefName\":\"pr-branch-1\",\"title\":\"Test PR\",\"state\":\"OPEN\",\"isDraft\":false}"
       fi
@@ -352,4 +376,65 @@ CREOF
   [ "$status" -eq 0 ]
   # post_fix_review_cycle writes to log file, not stdout — check overall success
   assert_output --partial "1 fixed"
+}
+
+@test "integration: merge conflict in setup stops processing early" {
+  local base_branch
+  base_branch="$(git -C "$REPO_DIR" symbolic-ref --short HEAD)"
+
+  cat > "$REPO_DIR/conflict.txt" <<'EOF'
+base
+EOF
+  git -C "$REPO_DIR" add conflict.txt
+  git -C "$REPO_DIR" commit -q -m "add conflict base"
+
+  git -C "$REPO_DIR" checkout -q pr-branch-1
+  cat > "$REPO_DIR/conflict.txt" <<'EOF'
+pr branch change
+EOF
+  git -C "$REPO_DIR" add conflict.txt
+  git -C "$REPO_DIR" commit -q -m "change on pr branch"
+  git -C "$REPO_DIR" push -q origin pr-branch-1
+
+  git -C "$REPO_DIR" checkout -q "$base_branch"
+  cat > "$REPO_DIR/conflict.txt" <<'EOF'
+base branch change
+EOF
+  git -C "$REPO_DIR" add conflict.txt
+  git -C "$REPO_DIR" commit -q -m "change on base branch"
+  git -C "$REPO_DIR" push -q origin "$base_branch"
+
+  mock_command_script "gh" "
+    jq_expr=''
+    args=()
+    while [ \$# -gt 0 ]; do
+      if [ \"\$1\" = '--jq' ] || [ \"\$1\" = '-q' ]; then shift; jq_expr=\"\$1\"
+      else args+=(\"\$1\"); fi
+      shift
+    done
+    apply_jq() { if [ -n \"\$jq_expr\" ]; then echo \"\$1\" | jq -r \"\$jq_expr\"; else echo \"\$1\"; fi; }
+    all=\"\${args[*]}\"
+
+    if echo \"\$all\" | grep -q 'auth status'; then
+      true
+    elif echo \"\$all\" | grep -q 'repo view'; then
+      apply_jq '{\"nameWithOwner\":\"test-owner/test-repo\"}'
+    elif echo \"\$all\" | grep -q 'pr view'; then
+      if [ -n \"\$jq_expr\" ]; then
+        echo '$base_branch'
+      else
+        echo '{\"headRefName\":\"pr-branch-1\",\"title\":\"Conflict PR\",\"state\":\"OPEN\",\"isDraft\":false}'
+      fi
+    fi
+  "
+  mock_command "osascript" 0
+
+  cd "$REPO_DIR"
+  run bash "$SCRIPT_PATH" --seq --no-tui --dry-run "https://github.com/test-owner/test-repo/pull/1"
+  [ "$status" -eq 0 ]
+  assert_output --partial "Could not merge base branch"
+  refute_output --partial "Fetching unresolved threads"
+  run git -C "$REPO_DIR/.gh-crfix/worktrees/pr-1" status --short
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
 }
