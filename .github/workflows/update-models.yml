@@ -1,0 +1,35 @@
+name: Update Model Registry
+
+on:
+  schedule:
+    - cron: '17 * * * *'  # every hour at :17
+  workflow_dispatch: {}    # manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  update-models:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch model lists
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: bash registry/update.sh
+
+      - name: Check for changes
+        id: diff
+        run: |
+          git diff --quiet registry/models.json && echo "changed=false" >> "$GITHUB_OUTPUT" || echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add registry/models.json
+          git commit -m "chore(registry): update model lists [$(date -u +%Y-%m-%d)]"
+          git push
