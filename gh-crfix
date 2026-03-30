@@ -805,17 +805,129 @@ setup_worktree() {
 
 detect_case_collisions() {
   local worktree_path="$1"
+  case_collision_groups_json "$worktree_path" \
+    | jq -r '.[] | join(" | ")'
+}
+
+case_collision_groups_json() {
+  local worktree_path="$1"
   git -C "$worktree_path" ls-tree -r --name-only HEAD 2>/dev/null \
-    | awk '
-        {
-          lc = tolower($0)
-          if (lc in seen) {
-            print seen[lc] " | " $0
-          } else {
-            seen[lc] = $0
-          }
-        }
+    | jq -Rsc '
+        split("\n")
+        | map(select(length > 0))
+        | reduce .[] as $path ({}; .[($path | ascii_downcase)] += [$path])
+        | to_entries
+        | map(.value | unique)
+        | map(select(length > 1))
       '
+}
+
+build_case_collision_prompt() {
+  local owner_repo="$1" pr_num="$2" branch="$3" worktree_path="$4" groups_json="$5"
+
+  cat <<EOF
+You are fixing case-colliding tracked paths on a Git branch.
+
+Repo: $owner_repo
+PR: #$pr_num
+Branch: $branch
+Worktree: $worktree_path
+
+Problem:
+- The current branch contains tracked paths that differ only by case.
+- On case-insensitive filesystems this leaves the worktree dirty and blocks merge automation.
+
+Collision groups:
+$groups_json
+
+Required approach:
+1. Inspect the conflicting paths with git-aware commands such as:
+   - git ls-tree -r --name-only HEAD
+   - git show HEAD:<path>
+   - git show origin/$branch:<path>
+   - search for similar sibling files to infer the repo naming convention
+2. Decide the canonical filename casing for each collision group by following repo patterns.
+3. If duplicate paths contain different useful content, merge that content into the canonical file.
+4. On case-insensitive filesystems, normalize in TWO commits:
+   - Commit 1: remove the losing case-variant path(s) from git and push
+   - Commit 2: restore/add the canonical path(s) with the chosen casing/content and push
+5. Use temporary filenames if needed for casing-only renames.
+6. Do not create thread-responses.json.
+7. End with a clean git status and no remaining case collisions in tracked paths.
+
+When done, print a short summary of the canonical names you chose.
+EOF
+}
+
+run_case_collision_model() {
+  local owner_repo="$1" pr_num="$2" branch="$3" worktree_path="$4" groups_json="$5" log_file="$6"
+  local prompt_file="$LOG_DIR/case-collision-$pr_num.txt"
+
+  build_case_collision_prompt "$owner_repo" "$pr_num" "$branch" "$worktree_path" "$groups_json" > "$prompt_file"
+
+  {
+    echo "[case-collision] model=$FIX_MODEL"
+    echo "[case-collision] backend=$AI_BACKEND"
+    echo "[case-collision] groups=$groups_json"
+
+    local cmd_failed=false
+    if [ "$AI_BACKEND" = "claude" ]; then
+      (cd "$worktree_path" && claude -p --model "$FIX_MODEL" --dangerously-skip-permissions < "$prompt_file") || cmd_failed=true
+    else
+      codex exec \
+        --cd "$worktree_path" \
+        --model "$FIX_MODEL" \
+        --dangerously-bypass-approvals-and-sandbox \
+        --color never \
+        - < "$prompt_file" || cmd_failed=true
+    fi
+
+    if [ "$cmd_failed" = true ]; then
+      echo "[case-collision] FAILED"
+      return 1
+    fi
+
+    echo "[case-collision] status:"
+    git -C "$worktree_path" status --short || true
+    echo "[case-collision] remaining collisions:"
+    detect_case_collisions "$worktree_path" || true
+    echo "[case-collision] done"
+  } >> "$log_file" 2>&1
+
+  [ -z "$(detect_case_collisions "$worktree_path")" ] || return 1
+  [ -z "$(git -C "$worktree_path" status --short 2>/dev/null || true)" ] || return 1
+}
+
+handle_case_collisions() {
+  local owner_repo="$1" pr_num="$2" branch="$3" worktree_path="$4" log_file="$5"
+  local groups_json group_count collisions sample
+
+  groups_json="$(case_collision_groups_json "$worktree_path")"
+  group_count="$(jq 'length' <<< "$groups_json" 2>/dev/null || echo "0")"
+  [ "${group_count:-0}" -gt 0 ] || return 1
+
+  collisions="$(jq -r '.[] | join(" | ")' <<< "$groups_json")"
+  sample="$(printf '%s\n' "$collisions" | sed -n '1,2p' | paste -sd '; ' -)"
+
+  if [ "$DRY_RUN" = true ]; then
+    echo "  ⚠ Worktree is dirty before processing — case-colliding paths detected on this filesystem: $sample"
+    progress_set "$pr_num" normalize_case failed "dry-run"
+    return 1
+  fi
+
+  progress_set "$pr_num" normalize_case running "$group_count group(s)"
+  echo "  → normalizing case-colliding tracked paths ($group_count group(s))"
+
+  [ "$AI_BACKEND" = "auto" ] && resolve_ai_backend
+
+  if run_case_collision_model "$owner_repo" "$pr_num" "$branch" "$worktree_path" "$groups_json" "$log_file"; then
+    progress_set "$pr_num" normalize_case done "$group_count group(s) normalized"
+    return 0
+  fi
+
+  echo "  ⚠ Worktree is dirty before processing — case-colliding paths detected on this filesystem: $sample"
+  progress_set "$pr_num" normalize_case failed "automatic normalization failed"
+  return 1
 }
 
 # ── GitHub API helpers ───────────────────────────────────────────────────────
@@ -1778,6 +1890,7 @@ pr_at_index() {
 
 progress_steps() {
   cat <<'EOF'
+normalize_case
 merge_base
 resolve_conflicts
 fetch_threads
@@ -1795,6 +1908,7 @@ EOF
 
 progress_label() {
   case "$1" in
+    normalize_case) echo "normalizing case-colliding tracked paths" ;;
     merge_base) echo "fetching new base branch and merging base branch" ;;
     resolve_conflicts) echo "optionally resolving conflicts and pushing" ;;
     fetch_threads) echo "fetching review comments from GitHub" ;;
@@ -1906,6 +2020,7 @@ progress_should_render() {
   note="$(progress_get_note "$pr_num" "$step")"
 
   case "$step:$status:$note" in
+    normalize_case:skipped:not\ needed) return 1 ;;
     resolve_conflicts:skipped:not\ needed) return 1 ;;
   esac
 
@@ -2978,23 +3093,25 @@ setup_all() {
     local log_file="$LOG_DIR/pr-$pr_num.log"
     : > "$log_file"
     progress_init "$pr_num"
+    progress_set "$pr_num" normalize_case skipped "not needed"
 
     local dirty_status
     dirty_status="$(git -C "$worktree_path" status --short 2>/dev/null || true)"
     if [ -n "$dirty_status" ]; then
-      local case_conflicts dirty_preview
-      case_conflicts="$(detect_case_collisions "$worktree_path" | sed -n '1,2p' | paste -sd '; ' -)"
-      if [ -n "$case_conflicts" ]; then
-        echo "  ⚠ Worktree is dirty before processing — case-colliding paths detected on this filesystem: $case_conflicts"
-        progress_mark_remaining "$pr_num" failed "worktree not clean (case-colliding paths)"
-      else
-        dirty_preview="$(printf '%s\n' "$dirty_status" | sed -n '1,3p' | paste -sd '; ' -)"
-        echo "  ⚠ Worktree is dirty before processing — $dirty_preview"
-        progress_mark_remaining "$pr_num" failed "worktree not clean"
+      if handle_case_collisions "$OWNER_REPO" "$pr_num" "$branch" "$worktree_path" "$log_file"; then
+        dirty_status="$(git -C "$worktree_path" status --short 2>/dev/null || true)"
       fi
-      echo "FAIL" > "$LOG_DIR/pr-$pr_num.status"
-      kv_append skipped "$pr_num"
-      continue
+
+      if [ -n "$dirty_status" ]; then
+        local dirty_preview
+        dirty_preview="$(printf '%s\n' "$dirty_status" | sed -n '1,3p' | paste -sd '; ' -)"
+        [ "$(progress_get_status "$pr_num" normalize_case)" = "failed" ] || progress_set "$pr_num" normalize_case failed "worktree not clean"
+        echo "  ⚠ Worktree is dirty before processing — $dirty_preview"
+        progress_mark_remaining "$pr_num" failed "$(progress_get_note "$pr_num" normalize_case)"
+        echo "FAIL" > "$LOG_DIR/pr-$pr_num.status"
+        kv_append skipped "$pr_num"
+        continue
+      fi
     fi
 
     if [ "$SETUP_ONLY" = true ]; then

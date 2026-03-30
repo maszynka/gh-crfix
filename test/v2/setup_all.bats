@@ -44,3 +44,21 @@ teardown() {
   [ "$(kv_list skipped)" = "1" ]
   [ ! -f "$TEST_TMPDIR/merge-called" ]
 }
+
+@test "setup_all: case-colliding worktree triggers automatic normalization before setup-only skip" {
+  echo "dirty change" > tracked.txt
+  SETUP_ONLY=true
+  detect_case_collisions() { echo "apps/Foo.ts | apps/foo.ts"; }
+  case_collision_groups_json() { echo '[["apps/Foo.ts","apps/foo.ts"]]'; }
+  handle_case_collisions() {
+    git -C "$3" checkout -- tracked.txt >/dev/null 2>&1
+    progress_set "$2" normalize_case done "1 group normalized"
+    return 0
+  }
+
+  run setup_all "$REPO_DIR"
+  [ "$status" -eq 0 ]
+  assert_output --partial "cd $REPO_DIR"
+  [ "$(progress_get_status "1" "normalize_case")" = "done" ]
+  [ "$(progress_get_note "1" "normalize_case")" = "1 group normalized" ]
+}

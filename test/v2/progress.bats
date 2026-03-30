@@ -12,6 +12,7 @@ teardown() { teardown_common; }
 
 @test "progress_snapshot: hides skipped resolve_conflicts when not needed" {
   progress_init "123"
+  progress_set "123" normalize_case skipped "not needed"
   progress_set "123" merge_base done " merge not needed - branch up to date "
   progress_set "123" resolve_conflicts skipped " not needed "
   progress_set "123" fetch_threads done " 3 unresolved thread(s) "
@@ -20,6 +21,7 @@ teardown() { teardown_common; }
   [ "$status" -eq 0 ]
   [[ "$output" == *"merge not needed - branch up to date"* ]]
   [[ "$output" == *"3 unresolved thread(s)"* ]]
+  [[ "$output" != *"normalizing case-colliding tracked paths"* ]]
   [[ "$output" != *"optionally resolving conflicts and pushing"* ]]
 }
 
