@@ -49,16 +49,17 @@ teardown() {
   [ "$first" = "$second" ]
 }
 
-@test "setup_worktree: detects branch in another worktree" {
+@test "setup_worktree: creates dedicated pr worktree even when branch exists elsewhere" {
   # Create worktree at a custom path (simulating existing worktree)
   local custom_path="$REPO_DIR/$WORKTREE_SUBDIR/custom-name"
   mkdir -p "$(dirname "$custom_path")"
   git -C "$REPO_DIR" worktree add "$custom_path" "test-branch" 2>/dev/null
 
-  # Now setup_worktree for pr-99 should find the branch already checked out
+  # setup_worktree should still create a dedicated pr worktree
   result="$(setup_worktree 99 "$REPO_DIR" "test-branch" 2>/dev/null)"
-  # Should reuse the custom path, not create pr-99
-  [ "$result" = "$custom_path" ]
+  [ "$result" = "$REPO_DIR/$WORKTREE_SUBDIR/pr-99" ]
+  [ -d "$result" ]
+  [ "$custom_path" != "$result" ]
 }
 
 @test "setup_worktree: logs to stderr, path on stdout" {

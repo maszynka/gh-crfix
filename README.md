@@ -9,8 +9,9 @@ Hybrid GitHub PR review fixer — automatically addresses unresolved review comm
 ```
 Parse PR → Create worktree → Merge base branch → Fetch review threads
   → Deterministic triage (skip / auto / already-fixed / needs-LLM)
-  → Haiku gate (is advanced model needed?)
-  → Sonnet fix (only for residual hard cases)
+  → Deterministic validation/tests + score threshold
+  → Small-model gate (only when score >= 1)
+  → Advanced-model fix (only for residual hard cases)
   → Reply & resolve threads
   → Post fix summary → Request Copilot re-review
   → Post-fix cycle (wait → check new comments → merge base)
@@ -29,12 +30,15 @@ git clone https://github.com/maszynka/gh-crfix && cd gh-crfix && bash install.sh
 Then run:
 
 ```bash
-gh crfix 123
+gh crfix
 ```
 
 ## Usage
 
 ```bash
+# Interactive launcher (TTY)
+gh crfix
+
 # Single PR (inside a git repo)
 gh crfix 123
 
@@ -52,6 +56,12 @@ gh crfix 100-110 -c 5
 
 # Dry run (no mutations)
 gh crfix 123 --dry-run
+
+# Force Codex backend
+gh crfix 123 --ai-backend codex --gate-model gpt-5.4-mini --fix-model gpt-5.4
+
+# Tune gate score threshold inputs
+gh crfix 123 --score-needs-llm .2 --score-pr-comment .4 --score-test-failure 1
 ```
 
 ## Flags
@@ -59,14 +69,20 @@ gh crfix 123 --dry-run
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-c N, --concurrency N` | 3 | Max parallel PR workers |
+| `--ai-backend BACKEND` | auto | AI backend: `auto`, `claude`, `codex` |
 | `--seq` | | Sequential mode (same as `-c 1`) |
 | `--no-tui` | | Disable TUI dashboard |
 | `--no-post-fix` | | Skip post-fix review cycle |
 | `--setup-only` | | Only setup worktrees + triage |
 | `--no-resolve` | | Do not resolve GitHub threads |
 | `--include-outdated` | | Include outdated unresolved threads |
-| `--gate-model MODEL` | haiku | Small model for gate decision |
+| `--gate-model MODEL` | sonnet | Small model for gate decision |
 | `--fix-model MODEL` | sonnet | Advanced model for fixing |
+| `--validate-hook PATH` | | Deterministic validation script |
+| `--no-validate` | | Skip validation hook and built-in test detection |
+| `--score-needs-llm N` | 1 | Gate score contribution for residual semantic review |
+| `--score-pr-comment N` | 0.4 | Gate score contribution for PR-level comments |
+| `--score-test-failure N` | 1 | Gate score contribution for failed validation/tests |
 | `--max-threads N` | 100 | Max threads fetched per PR |
 | `--autofix-hook PATH` | | Repo-local deterministic autofix script |
 | `--no-autofix` | | Skip autofix hook |
@@ -77,13 +93,61 @@ gh crfix 123 --dry-run
 
 - [`gh`](https://cli.github.com/) (authenticated)
 - `jq`
-- [`claude`](https://docs.anthropic.com/en/docs/claude-code) CLI (for gate + fix models)
+- One AI CLI:
+  - [`claude`](https://docs.anthropic.com/en/docs/claude-code)
+  - [`codex`](https://developers.openai.com/codex/cli/)
 - `bash` 4+
 - `bats` (for tests only)
 
+By default `gh crfix` uses `--ai-backend auto`, which prefers `claude` if installed and otherwise falls back to `codex`.
+
+## Launcher
+
+Running plain `gh crfix` in a TTY opens a full-screen launcher where you can:
+
+- enter a PR number, range, list, or full GitHub PR URL
+- choose `auto`, `claude`, or `codex` with arrow keys
+- choose gate and fix models with arrow keys
+- set concurrency with arrow keys
+- tune the gate score inputs with arrow keys
+
+After you launch from this screen, `gh crfix` persists those defaults to:
+
+```bash
+${XDG_CONFIG_HOME:-~/.config}/gh-crfix/defaults
+```
+
+The next launcher run will preload them, and CLI runs without explicit flags will also use them unless overridden by env vars or flags.
+
+The launcher keeps the target field as free text, but the other fields use allowed option lists. It starts with static fallback model names and then tries to refresh live model lists in the background when API credentials are available.
+
+The gate score uses three weights:
+
+- `needs_llm`
+- `pr_comment`
+- `test_failure`
+
+Each accepts a value between `0` and `1`, including shorthand like `.2` or `.4`. The weights for the current PR are summed, and the gate model runs only when the total is at least `1`.
+
+## Codex Usage
+
+```bash
+# Recommended Codex setup
+gh crfix 123 \
+  --ai-backend codex \
+  --gate-model gpt-5.4-mini \
+  --fix-model gpt-5.4
+
+# Works with full URL too
+gh crfix https://github.com/owner/repo/pull/123 \
+  --ai-backend codex \
+  --gate-model gpt-5.4-mini \
+  --fix-model gpt-5.4
+```
+
 ## Security note
 
-When fixing code, `gh crfix` runs `claude` with `--dangerously-skip-permissions`, granting the AI model full filesystem and shell access **within the worktree**. It can read, write, commit, and push code autonomously. This is by design — the tool needs to edit files and push fixes without interactive approval.
+When fixing code, `gh crfix` runs the selected AI CLI with full filesystem and shell access **within the worktree**. For `claude` this uses `--dangerously-skip-permissions`; for `codex` it uses `--dangerously-bypass-approvals-and-sandbox`. The model can read, write, commit, and push code autonomously. This is by design — the tool needs to edit files and push fixes without interactive approval.
 
 Use `--dry-run` to preview what would happen without any mutations. Review the generated commits before merging.
 
@@ -97,15 +161,30 @@ Use `--dry-run` to preview what would happen without any mutations. Review the g
 
 The hook runs in the worktree before the AI gate/fix phase.
 
+## Deterministic validation
+
+`gh crfix` also looks for deterministic validation before running the gate model:
+
+1. `--validate-hook PATH`
+2. `.gh-crfix/validate.sh` (executable)
+3. `scripts/gh-crfix-validate.sh` (executable)
+4. built-in `package.json` test detection (`npm`, `pnpm`, `yarn`, `bun`)
+
+Validation runs after the deterministic autofix phase and before the gate model. If validation fails, that contributes to the gate score via `--score-test-failure`.
+
 ## Environment variables
 
 | Variable | Description |
 |----------|-------------|
 | `GH_CRFIX_DIR` | Force local repo path (auto-detected otherwise) |
+| `GH_CRFIX_AI_BACKEND` | AI backend override: `auto`, `claude`, `codex` |
 | `GH_CRFIX_REVIEW_WAIT` | Seconds to wait for re-review (default: 90) |
 | `GH_CRFIX_GATE_MODEL` | Gate model override |
 | `GH_CRFIX_FIX_MODEL` | Fix model override |
 | `GH_CRFIX_MODEL_REGISTRY` | Override model registry URL |
+| `GH_CRFIX_SCORE_NEEDS_LLM` | Gate score contribution for residual semantic review |
+| `GH_CRFIX_SCORE_PR_COMMENT` | Gate score contribution for PR-level comments |
+| `GH_CRFIX_SCORE_TEST_FAILURE` | Gate score contribution for failed validation/tests |
 
 ## Model registry
 
