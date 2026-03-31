@@ -23,6 +23,7 @@ setup() {
   detect_validate_runner() { :; }
   setup_worktree() { echo "$REPO_DIR"; }
   merge_base_branch() { echo "merge should not run" >> "$TEST_TMPDIR/merge-called"; return 0; }
+  get_unresolved_threads() { echo '[]'; }
 
   mock_command_script "gh" '
     if echo "$@" | grep -q "pr view"; then
@@ -61,4 +62,13 @@ teardown() {
   assert_output --partial "cd $REPO_DIR"
   [ "$(progress_get_status "1" "normalize_case")" = "done" ]
   [ "$(progress_get_note "1" "normalize_case")" = "1 group normalized" ]
+}
+
+@test "setup_all: skips merge when there are no unresolved threads" {
+  run setup_all "$REPO_DIR"
+  [ "$status" -eq 0 ]
+  assert_output --partial "No unresolved threads"
+  [ -z "$(kv_list ready)" ]
+  [ "$(kv_list skipped)" = "1" ]
+  [ ! -f "$TEST_TMPDIR/merge-called" ]
 }

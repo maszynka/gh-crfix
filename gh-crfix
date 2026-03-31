@@ -286,7 +286,6 @@ resolve_ai_backend() {
             return 0
           fi
           die "'codex' CLI not found for the selected Codex models"
-          return 0
           ;;
         mixed)
           die "Auto backend cannot mix Claude and Codex model selections. Pick models from one family or set --ai-backend explicitly."
@@ -1578,6 +1577,28 @@ write_uncovered_responses() {
   ' > "$out_file"
 }
 
+cleanup_thread_responses_artifact() {
+  local pr_num="$1" worktree_path="$2"
+
+  if [ ! -f "$worktree_path/thread-responses.json" ]; then
+    progress_set "$pr_num" cleanup skipped "nothing to clean"
+    return 0
+  fi
+
+  if [ "$DRY_RUN" = true ]; then
+    echo "[cleanup] dry-run: would remove thread-responses.json from git"
+    progress_set "$pr_num" cleanup skipped "dry-run (artifact present)"
+    return 0
+  fi
+
+  progress_set "$pr_num" cleanup running "removing tracked artifact"
+  git -C "$worktree_path" rm -f thread-responses.json >/dev/null 2>&1 || rm -f "$worktree_path/thread-responses.json"
+  git -C "$worktree_path" commit -q -m "chore: remove thread-responses.json artifact" 2>/dev/null || true
+  git -C "$worktree_path" push -q 2>/dev/null || true
+  echo "[cleanup] removed thread-responses.json from git"
+  progress_set "$pr_num" cleanup done "artifact removed"
+}
+
 # ── conflict resolution ──────────────────────────────────────────────────────
 
 merge_base_branch() {
@@ -1595,6 +1616,18 @@ merge_base_branch() {
     git -C "$worktree_path" merge-base --is-ancestor "origin/$base_branch" HEAD >/dev/null 2>&1 && merge_not_needed=true
     echo "[merge] merging origin/$base_branch"
     if git -C "$worktree_path" merge "origin/$base_branch" --no-edit -q 2>/dev/null; then
+      if [ "$DRY_RUN" = true ]; then
+        echo "[merge] clean"
+        echo "[merge] dry-run: not pushing"
+        if [ "$merge_not_needed" = true ]; then
+          progress_set "$pr_num" merge_base done "merge not needed - branch up to date"
+        else
+          progress_set "$pr_num" merge_base done "dry-run - merged origin/$base_branch locally"
+        fi
+        progress_set "$pr_num" resolve_conflicts skipped "not needed"
+        return 0
+      fi
+
       if git -C "$worktree_path" push --quiet 2>/dev/null; then
         echo "[merge] clean"
         echo "[merge] pushed"
@@ -1643,6 +1676,12 @@ merge_base_branch() {
         echo "[merge] auto-resolve commit failed"
         progress_set "$pr_num" resolve_conflicts failed "auto-resolved $auto_resolved file(s), but the merge commit failed"
         return 1
+      fi
+      if [ "$DRY_RUN" = true ]; then
+        echo "[merge] auto-resolved"
+        echo "[merge] dry-run: not pushing"
+        progress_set "$pr_num" resolve_conflicts done "auto-resolved $auto_resolved file(s) locally (dry-run)"
+        return 0
       fi
       if ! git -C "$worktree_path" push --quiet 2>/dev/null; then
         echo "[merge] WARNING: push failed after auto-resolve"
@@ -2549,10 +2588,24 @@ launcher_apply() {
     return 1
   fi
 
-  if ! (parse_input "$LAUNCH_TARGET") >/dev/null 2>&1; then
+  local parse_input_err=""
+  if ! parse_input_err="$(parse_input "$LAUNCH_TARGET" 2>&1 >/dev/null)"; then
     OWNER_REPO="$old_owner"
     PR_NUMBERS="$old_prs"
-    LAUNCH_ERROR="Target could not be parsed. Use PR number, range, list or GitHub URL."
+    case "$parse_input_err" in
+      *"gh auth login"*|*"'gh' is not authenticated"*|*"Not logged in"*|*"not logged in"*)
+        LAUNCH_ERROR="GitHub CLI is not authenticated. Run 'gh auth login' and try again."
+        ;;
+      *"'gh' CLI not found"*)
+        LAUNCH_ERROR="GitHub CLI is required for numeric or shorthand targets."
+        ;;
+      *"not a git repository"*|*"fatal: not a git repository"*|*"This directory does not appear to be a git repository"*|*"Not inside a GitHub repo"*)
+        LAUNCH_ERROR="Numeric or shorthand targets require running inside a GitHub git repository."
+        ;;
+      *)
+        LAUNCH_ERROR="Target could not be parsed. Use PR number, range, list or GitHub URL."
+        ;;
+    esac
     return 1
   fi
 
@@ -3121,20 +3174,12 @@ setup_all() {
       continue
     fi
 
-    # Merge base branch before fixing (resolve conflicts first)
-    if ! merge_base_branch "$pr_num" "$worktree_path" "$log_file"; then
-      echo "  ⚠ Could not merge base branch — skipping PR"
-      progress_mark_remaining "$pr_num" failed "merge base failed"
-      echo "FAIL" > "$LOG_DIR/pr-$pr_num.status"
-      kv_append skipped "$pr_num"
-      continue
-    fi
-
     echo "  Fetching unresolved threads..."
     local threads_json threads_file triage_file thread_count residual_count
     progress_set "$pr_num" fetch_threads running "review threads"
     threads_json="$(get_unresolved_threads "$OWNER_REPO" "$pr_num")"
-    thread_count="$(echo "$threads_json" | jq 'length')"
+    thread_count="$(echo "$threads_json" | jq 'length' 2>/dev/null || echo 0)"
+    thread_count="${thread_count:-0}"
     threads_file="$LOG_DIR/pr-$pr_num-threads.json"
     triage_file="$LOG_DIR/pr-$pr_num-triage.json"
 
@@ -3145,6 +3190,17 @@ setup_all() {
       echo "  ✓ No unresolved threads"
       progress_set "$pr_num" filter_threads skipped "no unresolved threads"
       progress_mark_remaining "$pr_num" skipped "no unresolved threads"
+      kv_append skipped "$pr_num"
+      continue
+    fi
+
+    resolve_ai_backend
+
+    # Merge base branch before fixing (resolve conflicts first)
+    if ! merge_base_branch "$pr_num" "$worktree_path" "$log_file"; then
+      echo "  ⚠ Could not merge base branch — skipping PR"
+      progress_mark_remaining "$pr_num" failed "merge base failed"
+      echo "FAIL" > "$LOG_DIR/pr-$pr_num.status"
       kv_append skipped "$pr_num"
       continue
     fi
@@ -3311,16 +3367,7 @@ process_pr() {
     fi
 
     # 7. Remove thread-responses.json from git (prevents future merge conflicts)
-    if [ -f "$worktree_path/thread-responses.json" ]; then
-      progress_set "$pr_num" cleanup running "removing tracked artifact"
-      git -C "$worktree_path" rm -f thread-responses.json >/dev/null 2>&1 || rm -f "$worktree_path/thread-responses.json"
-      git -C "$worktree_path" commit -q -m "chore: remove thread-responses.json artifact" 2>/dev/null || true
-      git -C "$worktree_path" push -q 2>/dev/null || true
-      echo "[cleanup] removed thread-responses.json from git"
-      progress_set "$pr_num" cleanup done "artifact removed"
-    else
-      progress_set "$pr_num" cleanup skipped "nothing to clean"
-    fi
+    cleanup_thread_responses_artifact "$pr_num" "$worktree_path"
 
     # 8. Post-fix summary
     post_fix_summary "$pr_num" "$triage_file" "$combined" "$log_file"
@@ -3511,16 +3558,7 @@ process_pr_sequential() {
   fi
 
   # 7. Remove thread-responses.json from git (prevents future merge conflicts)
-  if [ -f "$worktree_path/thread-responses.json" ]; then
-    progress_set "$pr_num" cleanup running "removing tracked artifact"
-    git -C "$worktree_path" rm -f thread-responses.json >/dev/null 2>&1 || rm -f "$worktree_path/thread-responses.json"
-    git -C "$worktree_path" commit -q -m "chore: remove thread-responses.json artifact" 2>/dev/null || true
-    git -C "$worktree_path" push -q 2>/dev/null || true
-    echo "  [cleanup] removed thread-responses.json from git"
-    progress_set "$pr_num" cleanup done "artifact removed"
-  else
-    progress_set "$pr_num" cleanup skipped "nothing to clean"
-  fi
+  cleanup_thread_responses_artifact "$pr_num" "$worktree_path"
 
   # 8. Post-fix summary
   post_fix_summary "$pr_num" "$triage_file" "$combined" "$log_file"
@@ -3684,7 +3722,6 @@ main() {
     return 0
   fi
 
-  resolve_ai_backend
   echo "AI backend : $AI_BACKEND"
 
   echo ""

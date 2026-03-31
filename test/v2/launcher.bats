@@ -77,3 +77,35 @@ teardown() { teardown_common; }
   [ "$status" -ne 0 ]
   [[ "$output" == *"Auto backend cannot mix"* ]] || [ "$LAUNCH_ERROR" = "Auto backend cannot mix Claude and Codex model families." ]
 }
+
+@test "launcher_apply: maps parse_input auth failures to a clear launcher error" {
+  LAUNCH_TARGET="123"
+  LAUNCH_BACKEND="codex"
+  LAUNCH_GATE_MODEL="gpt-5.4-mini"
+  LAUNCH_FIX_MODEL="gpt-5.4"
+  LAUNCH_CONCURRENCY="5"
+  LAUNCH_SCORE_NEEDS_LLM=".2"
+  LAUNCH_SCORE_PR_COMMENT=".4"
+  LAUNCH_SCORE_TEST_FAILURE="1"
+  parse_input() { echo "'gh' is not authenticated. Run: gh auth login" >&2; return 1; }
+
+  run launcher_apply
+  [ "$status" -ne 0 ]
+  [ "$LAUNCH_ERROR" = "GitHub CLI is not authenticated. Run 'gh auth login' and try again." ]
+}
+
+@test "launcher_apply: maps non-repo numeric targets to a clear launcher error" {
+  LAUNCH_TARGET="123"
+  LAUNCH_BACKEND="codex"
+  LAUNCH_GATE_MODEL="gpt-5.4-mini"
+  LAUNCH_FIX_MODEL="gpt-5.4"
+  LAUNCH_CONCURRENCY="5"
+  LAUNCH_SCORE_NEEDS_LLM=".2"
+  LAUNCH_SCORE_PR_COMMENT=".4"
+  LAUNCH_SCORE_TEST_FAILURE="1"
+  parse_input() { echo "Not inside a GitHub repo and no URL given." >&2; return 1; }
+
+  run launcher_apply
+  [ "$status" -ne 0 ]
+  [ "$LAUNCH_ERROR" = "Numeric or shorthand targets require running inside a GitHub git repository." ]
+}

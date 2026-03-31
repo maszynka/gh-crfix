@@ -425,6 +425,9 @@ EOF
       else
         echo '{\"headRefName\":\"pr-branch-1\",\"title\":\"Conflict PR\",\"state\":\"OPEN\",\"isDraft\":false}'
       fi
+    elif echo \"\$all\" | grep -q 'api graphql'; then
+      json='{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[{\"id\":\"PRRT_t1\",\"isResolved\":false,\"isOutdated\":false,\"path\":\"conflict.txt\",\"line\":1,\"comments\":{\"nodes\":[{\"body\":\"Fix\",\"path\":\"conflict.txt\",\"line\":1,\"originalLine\":1,\"author\":{\"login\":\"rev\"},\"createdAt\":\"2025-01-01T00:00:00Z\"}]}}]}}}}}'
+      apply_jq \"\$json\"
     fi
   "
   mock_command "osascript" 0
@@ -433,8 +436,42 @@ EOF
   run bash "$SCRIPT_PATH" --seq --no-tui --dry-run "https://github.com/test-owner/test-repo/pull/1"
   [ "$status" -eq 0 ]
   assert_output --partial "Could not merge base branch"
-  refute_output --partial "Fetching unresolved threads"
+  assert_output --partial "Fetching unresolved threads"
   run git -C "$REPO_DIR/.gh-crfix/worktrees/pr-1" status --short
   [ "$status" -eq 0 ]
   [ -z "$output" ]
+}
+
+@test "integration: dry-run does not push merge or cleanup commits" {
+  local base_branch before_sha after_sha
+  base_branch="$(git -C "$REPO_DIR" symbolic-ref --short HEAD)"
+
+  git -C "$REPO_DIR" checkout -q pr-branch-1
+  cat > "$REPO_DIR/thread-responses.json" <<'EOF'
+[]
+EOF
+  git -C "$REPO_DIR" add thread-responses.json
+  git -C "$REPO_DIR" commit -q -m "add tracked thread responses artifact"
+  git -C "$REPO_DIR" push -q origin pr-branch-1
+
+  git -C "$REPO_DIR" checkout -q "$base_branch"
+  cat > "$REPO_DIR/base-change.txt" <<'EOF'
+base update
+EOF
+  git -C "$REPO_DIR" add base-change.txt
+  git -C "$REPO_DIR" commit -q -m "update base branch"
+  git -C "$REPO_DIR" push -q origin "$base_branch"
+
+  before_sha="$(git -C "$REMOTE_DIR" rev-parse refs/heads/pr-branch-1)"
+
+  setup_mocks "OPEN" 1 0
+
+  cd "$REPO_DIR"
+  run bash "$SCRIPT_PATH" --seq --no-tui --dry-run "https://github.com/test-owner/test-repo/pull/1"
+  [ "$status" -eq 0 ]
+  assert_output --partial "Mode       : DRY RUN"
+  assert_output --partial "dry-run"
+
+  after_sha="$(git -C "$REMOTE_DIR" rev-parse refs/heads/pr-branch-1)"
+  [ "$before_sha" = "$after_sha" ]
 }
