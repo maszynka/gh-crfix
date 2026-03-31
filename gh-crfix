@@ -3557,7 +3557,6 @@ setup_all() {
       continue
     fi
 
-
     echo "  Threads total      : $thread_count"
     echo "  Worktree           : $worktree_path"
     [ "$(kv_get "$pr_num" has_case_collisions)" = "true" ] && \
