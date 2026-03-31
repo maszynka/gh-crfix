@@ -9,18 +9,9 @@ setup() {
 
 teardown() { teardown_common; }
 
-# ── reply_and_resolve_all ────────────────────────────────────────────────────
+# ── reply_and_resolve_from_responses ─────────────────────────────────────────
 
-@test "reply_and_resolve_all: with valid responses file" {
-  # Create threads file
-  cat > "$TEST_TMPDIR/threads.json" <<'EOF'
-[
-  {"id": "PRRT_1", "comments": {"nodes": [{"body": "fix x"}]}},
-  {"id": "PRRT_2", "comments": {"nodes": [{"body": "fix y"}]}}
-]
-EOF
-
-  # Create responses file
+@test "reply_and_resolve_from_responses: with valid responses file" {
   cat > "$TEST_TMPDIR/responses.json" <<'EOF'
 [
   {"thread_id": "PRRT_1", "action": "fixed", "comment": "Fixed X"},
@@ -28,51 +19,146 @@ EOF
 ]
 EOF
 
-  # Mock gh to succeed silently
   mock_command "gh" 0
 
-  run reply_and_resolve_all 42 "$TEST_TMPDIR/threads.json" "$TEST_TMPDIR/responses.json"
+  run reply_and_resolve_from_responses "$TEST_TMPDIR/responses.json"
   [ "$status" -eq 0 ]
-  assert_output --partial "Replied & resolved 2/2"
+  assert_output "replied=2 resolved=1 unresolved_skipped=1"
 }
 
-@test "reply_and_resolve_all: without responses file uses fallback" {
-  cat > "$TEST_TMPDIR/threads.json" <<'EOF'
+@test "reply_and_resolve_from_responses: missing file returns empty output" {
+  mock_command "gh" 0
+
+  run reply_and_resolve_from_responses "$TEST_TMPDIR/nonexistent.json"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "reply_and_resolve_from_responses: malformed file returns empty output" {
+  echo "NOT JSON" > "$TEST_TMPDIR/bad.json"
+  mock_command "gh" 0
+
+  run reply_and_resolve_from_responses "$TEST_TMPDIR/bad.json"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "reply_and_resolve_from_responses: empty array" {
+  echo "[]" > "$TEST_TMPDIR/responses.json"
+  mock_command "gh" 0
+
+  run reply_and_resolve_from_responses "$TEST_TMPDIR/responses.json"
+  [ "$status" -eq 0 ]
+  assert_output "replied=0 resolved=0 unresolved_skipped=0"
+}
+
+@test "reply_and_resolve_from_responses: RESOLVE_SKIPPED resolves skipped entries" {
+  cat > "$TEST_TMPDIR/responses.json" <<'EOF'
 [
-  {"id": "PRRT_1", "comments": {"nodes": [{"body": "fix"}]}},
-  {"id": "PRRT_2", "comments": {"nodes": [{"body": "fix"}]}}
+  {"thread_id": "PRRT_1", "action": "skipped", "comment": "Skipped but resolve"}
+]
+EOF
+
+  RESOLVE_SKIPPED=true
+  mock_command "gh" 0
+
+  run reply_and_resolve_from_responses "$TEST_TMPDIR/responses.json"
+  [ "$status" -eq 0 ]
+  assert_output "replied=1 resolved=1 unresolved_skipped=0"
+}
+
+@test "reply_and_resolve_from_responses: non-actionable skipped entry resolves by default" {
+  cat > "$TEST_TMPDIR/responses.json" <<'EOF'
+[
+  {"thread_id": "PRRT_1", "action": "skipped", "comment": "LGTM", "resolve_when_skipped": true}
 ]
 EOF
 
   mock_command "gh" 0
 
-  run reply_and_resolve_all 42 "$TEST_TMPDIR/threads.json" "$TEST_TMPDIR/nonexistent.json"
+  run reply_and_resolve_from_responses "$TEST_TMPDIR/responses.json"
   [ "$status" -eq 0 ]
-  assert_output --partial "Replied & resolved 2/2"
+  assert_output "replied=1 resolved=1 unresolved_skipped=0"
 }
 
-@test "reply_and_resolve_all: malformed responses file uses fallback" {
-  cat > "$TEST_TMPDIR/threads.json" <<'EOF'
-[{"id": "PRRT_1", "comments": {"nodes": [{"body": "fix"}]}}]
+# ── write_uncovered_responses ────────────────────────────────────────────────
+
+@test "write_uncovered_responses: adds skipped reply for uncovered auto thread" {
+  cat > "$TEST_TMPDIR/triage.json" <<'EOF'
+{
+  "all": [],
+  "skip": [],
+  "auto": [{"thread_id": "PRRT_auto", "reason": "mechanical/simple comment"}],
+  "already_likely_fixed": [],
+  "needs_llm": []
+}
 EOF
+  echo '[]' > "$TEST_TMPDIR/combined.json"
+  : > "$TEST_TMPDIR/selected.txt"
 
-  echo "NOT JSON" > "$TEST_TMPDIR/bad.json"
-  mock_command "gh" 0
-
-  run reply_and_resolve_all 42 "$TEST_TMPDIR/threads.json" "$TEST_TMPDIR/bad.json"
+  run write_uncovered_responses "$TEST_TMPDIR/triage.json" "$TEST_TMPDIR/selected.txt" "$TEST_TMPDIR/combined.json" "$TEST_TMPDIR/out.json"
   [ "$status" -eq 0 ]
-  assert_output --partial "Replied & resolved 1/1"
+  jq -e 'length == 1' "$TEST_TMPDIR/out.json" >/dev/null
+  jq -e '.[0].thread_id == "PRRT_auto"' "$TEST_TMPDIR/out.json" >/dev/null
+  jq -e '.[0].action == "skipped"' "$TEST_TMPDIR/out.json" >/dev/null
 }
 
-@test "reply_and_resolve_all: empty threads" {
-  echo "[]" > "$TEST_TMPDIR/threads.json"
-  echo "[]" > "$TEST_TMPDIR/responses.json"
+@test "write_uncovered_responses: adds skipped reply for unselected needs_llm thread" {
+  cat > "$TEST_TMPDIR/triage.json" <<'EOF'
+{
+  "all": [],
+  "skip": [],
+  "auto": [],
+  "already_likely_fixed": [],
+  "needs_llm": [
+    {"thread_id": "PRRT_selected"},
+    {"thread_id": "PRRT_left_open"}
+  ]
+}
+EOF
+  cat > "$TEST_TMPDIR/combined.json" <<'EOF'
+[
+  {"thread_id": "PRRT_selected", "action": "fixed", "comment": "Done"}
+]
+EOF
+  printf 'PRRT_selected\n' > "$TEST_TMPDIR/selected.txt"
 
-  mock_command "gh" 0
-
-  run reply_and_resolve_all 42 "$TEST_TMPDIR/threads.json" "$TEST_TMPDIR/responses.json"
+  run write_uncovered_responses "$TEST_TMPDIR/triage.json" "$TEST_TMPDIR/selected.txt" "$TEST_TMPDIR/combined.json" "$TEST_TMPDIR/out.json"
   [ "$status" -eq 0 ]
-  assert_output --partial "0/0"
+  jq -e 'length == 1' "$TEST_TMPDIR/out.json" >/dev/null
+  jq -e '.[0].thread_id == "PRRT_left_open"' "$TEST_TMPDIR/out.json" >/dev/null
+  jq -e '.[0].action == "skipped"' "$TEST_TMPDIR/out.json" >/dev/null
+}
+
+@test "write_uncovered_responses: ignores already covered auto and selected needs_llm threads" {
+  cat > "$TEST_TMPDIR/triage.json" <<'EOF'
+{
+  "all": [],
+  "skip": [],
+  "auto": [
+    {"thread_id": "PRRT_auto_done", "reason": "mechanical/simple comment"},
+    {"thread_id": "PRRT_auto_open", "reason": "mechanical/simple comment"}
+  ],
+  "already_likely_fixed": [],
+  "needs_llm": [
+    {"thread_id": "PRRT_selected"},
+    {"thread_id": "PRRT_left_open"}
+  ]
+}
+EOF
+  cat > "$TEST_TMPDIR/combined.json" <<'EOF'
+[
+  {"thread_id": "PRRT_auto_done", "action": "skipped", "comment": "Handled"},
+  {"thread_id": "PRRT_selected", "action": "fixed", "comment": "Done"}
+]
+EOF
+  printf 'PRRT_selected\n' > "$TEST_TMPDIR/selected.txt"
+
+  run write_uncovered_responses "$TEST_TMPDIR/triage.json" "$TEST_TMPDIR/selected.txt" "$TEST_TMPDIR/combined.json" "$TEST_TMPDIR/out.json"
+  [ "$status" -eq 0 ]
+  jq -e 'length == 2' "$TEST_TMPDIR/out.json" >/dev/null
+  jq -e 'map(.thread_id) | index("PRRT_auto_open")' "$TEST_TMPDIR/out.json" >/dev/null
+  jq -e 'map(.thread_id) | index("PRRT_left_open")' "$TEST_TMPDIR/out.json" >/dev/null
 }
 
 # ── resolve_thread ───────────────────────────────────────────────────────────

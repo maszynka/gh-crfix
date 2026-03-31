@@ -30,6 +30,11 @@ teardown() { teardown_common; }
   [ "$DRY_RUN" = "true" ]
 }
 
+@test "parse_flags: --ai-backend sets AI_BACKEND" {
+  parse_flags --ai-backend "codex" "https://github.com/o/r/pull/1"
+  [ "$AI_BACKEND" = "codex" ]
+}
+
 @test "parse_flags: --gate-model sets GATE_MODEL" {
   parse_flags --gate-model "gpt-4o-mini" "https://github.com/o/r/pull/1"
   [ "$GATE_MODEL" = "gpt-4o-mini" ]
@@ -75,6 +80,28 @@ teardown() { teardown_common; }
   [ "$AUTO_FIX_HOOK" = "/path/to/hook.sh" ]
 }
 
+@test "parse_flags: --validate-hook sets VALIDATE_HOOK" {
+  parse_flags --validate-hook "/path/to/validate.sh" "https://github.com/o/r/pull/1"
+  [ "$VALIDATE_HOOK" = "/path/to/validate.sh" ]
+}
+
+@test "parse_flags: --no-validate sets NO_VALIDATE=true" {
+  parse_flags --no-validate "https://github.com/o/r/pull/1"
+  [ "$NO_VALIDATE" = "true" ]
+}
+
+@test "parse_flags: score flags set weights" {
+  parse_flags \
+    --score-needs-llm .2 \
+    --score-pr-comment 0.4 \
+    --score-test-failure 1 \
+    "https://github.com/o/r/pull/1"
+
+  [ "$SCORE_NEEDS_LLM" = ".2" ]
+  [ "$SCORE_PR_COMMENT" = "0.4" ]
+  [ "$SCORE_TEST_FAILURE" = "1" ]
+}
+
 @test "parse_flags: --max-threads sets MAX_THREADS" {
   parse_flags --max-threads 50 "https://github.com/o/r/pull/1"
   [ "$MAX_THREADS" -eq 50 ]
@@ -94,8 +121,13 @@ teardown() { teardown_common; }
 
 @test "parse_flags: all gpt-5.4 flags combined" {
   parse_flags \
+    --ai-backend "codex" \
     --gate-model "gpt-5.4-mini" \
     --fix-model "gpt-5.4" \
+    --validate-hook "/repo/.gh-crfix/validate.sh" \
+    --score-needs-llm .2 \
+    --score-pr-comment 0.4 \
+    --score-test-failure 1 \
     --no-tui \
     --no-post-fix \
     --dry-run \
@@ -105,8 +137,13 @@ teardown() { teardown_common; }
     -c 8 \
     "https://github.com/o/r/pull/55"
 
+  [ "$AI_BACKEND" = "codex" ]
   [ "$GATE_MODEL" = "gpt-5.4-mini" ]
   [ "$FIX_MODEL" = "gpt-5.4" ]
+  [ "$VALIDATE_HOOK" = "/repo/.gh-crfix/validate.sh" ]
+  [ "$SCORE_NEEDS_LLM" = ".2" ]
+  [ "$SCORE_PR_COMMENT" = "0.4" ]
+  [ "$SCORE_TEST_FAILURE" = "1" ]
   [ "$NO_TUI" = "true" ]
   [ "$NO_POST_FIX" = "true" ]
   [ "$DRY_RUN" = "true" ]
@@ -119,23 +156,27 @@ teardown() { teardown_common; }
 
 @test "parse_flags: Claude flags combined" {
   parse_flags \
+    --ai-backend "claude" \
     --gate-model "haiku" \
     --fix-model "sonnet" \
     --no-tui \
     --dry-run \
     --seq \
     --no-autofix \
+    --no-validate \
     --no-resolve \
     --setup-only \
     --autofix-hook "/repo/.gh-crfix/fix.sh" \
     "https://github.com/owner/repo/pull/10"
 
+  [ "$AI_BACKEND" = "claude" ]
   [ "$GATE_MODEL" = "haiku" ]
   [ "$FIX_MODEL" = "sonnet" ]
   [ "$NO_TUI" = "true" ]
   [ "$DRY_RUN" = "true" ]
   [ "$CONCURRENCY" -eq 1 ]
   [ "$NO_AUTOFIX" = "true" ]
+  [ "$NO_VALIDATE" = "true" ]
   [ "$NO_RESOLVE" = "true" ]
   [ "$SETUP_ONLY" = "true" ]
   [ "$AUTO_FIX_HOOK" = "/repo/.gh-crfix/fix.sh" ]
@@ -144,6 +185,7 @@ teardown() { teardown_common; }
 
 @test "parse_flags: all gpt-5.4 + Claude flags combined" {
   parse_flags \
+    --ai-backend "codex" \
     --gate-model "gpt-5.4-mini" \
     --fix-model "claude-sonnet-4-20250514" \
     --no-tui \
@@ -159,6 +201,7 @@ teardown() { teardown_common; }
     -c 2 \
     "https://github.com/org/monorepo/pull/123"
 
+  [ "$AI_BACKEND" = "codex" ]
   [ "$GATE_MODEL" = "gpt-5.4-mini" ]
   [ "$FIX_MODEL" = "claude-sonnet-4-20250514" ]
   [ "$NO_TUI" = "true" ]

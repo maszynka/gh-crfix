@@ -58,6 +58,43 @@ EOF
   echo "$result" | grep -q "residual needs_llm candidates: 1"
 }
 
+@test "build_gate_prompt: includes validation and score context" {
+  cat > "$TEST_TMPDIR/triage.json" <<'EOF'
+{
+  "all": [],
+  "skip": [],
+  "auto": [],
+  "already_likely_fixed": [],
+  "needs_llm": [{"thread_id": "L1", "path": "a.ts", "line": 1, "reason": "complex", "body": "fix logic"}]
+}
+EOF
+
+  cat > "$TEST_TMPDIR/validation.json" <<'EOF'
+{
+  "tests_failed": true,
+  "summary": "pnpm test failed in packages/api"
+}
+EOF
+
+  cat > "$TEST_TMPDIR/gate-context.json" <<'EOF'
+{
+  "total_score": 1.4,
+  "should_run_gate": true,
+  "components": {
+    "needs_llm": {"score": 1},
+    "pr_comment": {"score": 0.4},
+    "test_failure": {"score": 0}
+  }
+}
+EOF
+
+  result="$(build_gate_prompt "owner/repo" 10 "$TEST_TMPDIR/triage.json" "$TEST_TMPDIR/validation.json" "$TEST_TMPDIR/gate-context.json")"
+  echo "$result" | grep -q "tests_failed: true"
+  echo "$result" | grep -q "pnpm test failed in packages/api"
+  echo "$result" | grep -q "total: 1.4"
+  echo "$result" | grep -q "threshold met: true"
+}
+
 @test "build_gate_prompt: includes residual thread body" {
   cat > "$TEST_TMPDIR/triage.json" <<'EOF'
 {
@@ -73,6 +110,40 @@ EOF
   echo "$result" | grep -q "PRRT_xyz"
   echo "$result" | grep -q "src/auth.ts"
   echo "$result" | grep -q "race condition"
+}
+
+@test "build_gate_context: sums residual comments and test failures" {
+  SCORE_NEEDS_LLM=".2"
+  SCORE_PR_COMMENT="0.4"
+  SCORE_TEST_FAILURE="1"
+
+  cat > "$TEST_TMPDIR/triage.json" <<'EOF'
+{
+  "all": [],
+  "skip": [],
+  "auto": [],
+  "already_likely_fixed": [],
+  "needs_llm": [
+    {"thread_id": "L1", "reason": "needs semantic review"},
+    {"thread_id": "L2", "reason": "PR-level comment (no file path)"}
+  ]
+}
+EOF
+
+  cat > "$TEST_TMPDIR/validation.json" <<'EOF'
+{
+  "tests_failed": true,
+  "summary": "tests failed"
+}
+EOF
+
+  run build_gate_context "$TEST_TMPDIR/triage.json" "$TEST_TMPDIR/validation.json" "$TEST_TMPDIR/out.json"
+  [ "$status" -eq 0 ]
+  [ "$(jq -r '.total_score' < "$TEST_TMPDIR/out.json")" = "1.6" ]
+  [ "$(jq -r '.should_run_gate' < "$TEST_TMPDIR/out.json")" = "true" ]
+  [ "$(jq -r '.components.needs_llm.score' < "$TEST_TMPDIR/out.json")" = "0.2" ]
+  [ "$(jq -r '.components.pr_comment.score' < "$TEST_TMPDIR/out.json")" = "0.4" ]
+  [ "$(jq -r '.components.test_failure.score' < "$TEST_TMPDIR/out.json")" = "1" ]
 }
 
 # ── gate_schema ──────────────────────────────────────────────────────────────
