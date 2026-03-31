@@ -3194,8 +3194,6 @@ setup_all() {
       continue
     fi
 
-    resolve_ai_backend
-
     # Merge base branch before fixing (resolve conflicts first)
     if ! merge_base_branch "$pr_num" "$worktree_path" "$log_file"; then
       echo "  ⚠ Could not merge base branch — skipping PR"
@@ -3204,6 +3202,8 @@ setup_all() {
       kv_append skipped "$pr_num"
       continue
     fi
+
+    resolve_ai_backend
 
     progress_set "$pr_num" filter_threads running "deterministic triage"
     triage_threads "$worktree_path" "$threads_file" "$triage_file"
