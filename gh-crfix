@@ -55,6 +55,7 @@
 set -euo pipefail
 
 WORKTREE_SUBDIR=".gh-crfix/worktrees"
+SETUP_MAX_CONCURRENCY=8
 OWNER_REPO=""
 PR_NUMBERS=""
 CONCURRENCY=3
@@ -3099,6 +3100,115 @@ tui_loop() {
 
 # ── setup phase (sequential) ─────────────────────────────────────────────────
 
+setup_phase_concurrency() {
+  local limit="$CONCURRENCY"
+  [ "$limit" -gt "$SETUP_MAX_CONCURRENCY" ] && limit="$SETUP_MAX_CONCURRENCY"
+  [ "$limit" -ge 1 ] || limit=1
+  echo "$limit"
+}
+
+setup_pr() {
+  local repo_dir="$1" pr_num="$2"
+  local log_file="$LOG_DIR/pr-$pr_num.log"
+  : > "$log_file"
+  progress_init "$pr_num"
+  kv_set "$pr_num" setup_status "skipped"
+
+  {
+    local pr_json
+    pr_json=$(gh pr view "$pr_num" --repo "$OWNER_REPO" \
+      --json headRefName,title,state,isDraft 2>/dev/null) \
+      || {
+        kv_set "$pr_num" title ""
+        kv_set "$pr_num" branch ""
+        kv_set "$pr_num" state_label ""
+        kv_set "$pr_num" setup_reason "not found"
+        progress_mark_remaining "$pr_num" skipped "not found"
+        return 0
+      }
+
+    local branch title state is_draft state_label
+    branch=$(echo "$pr_json" | jq -r '.headRefName')
+    title=$(echo "$pr_json" | jq -r '.title')
+    state=$(echo "$pr_json" | jq -r '.state')
+    is_draft=$(echo "$pr_json" | jq -r '.isDraft')
+    state_label="$state"
+    [ "$is_draft" = "true" ] && state_label="DRAFT"
+
+    kv_set "$pr_num" title "$title"
+    kv_set "$pr_num" branch "$branch"
+    kv_set "$pr_num" state_label "$state_label"
+
+    if [ "$state" != "OPEN" ]; then
+      kv_set "$pr_num" setup_reason "PR is $state"
+      progress_mark_remaining "$pr_num" skipped "PR is $state"
+      return 0
+    fi
+
+    local worktree_path
+    worktree_path="$(setup_worktree "$pr_num" "$repo_dir" "$branch")"
+    kv_set "$pr_num" worktree "$worktree_path"
+
+    local dirty_status
+    dirty_status="$(git -C "$worktree_path" status --short 2>/dev/null || true)"
+    if [ -n "$dirty_status" ]; then
+      local collision_summary
+      collision_summary="$(detect_case_collisions "$worktree_path")"
+      if [ -n "$collision_summary" ]; then
+        local collision_count
+        collision_count="$(printf '%s\n' "$collision_summary" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
+        kv_set "$pr_num" has_case_collisions "true"
+        progress_set "$pr_num" normalize_case pending "$collision_count group(s) detected"
+      else
+        local dirty_preview
+        dirty_preview="$(printf '%s\n' "$dirty_status" | sed -n '1,3p' | paste -sd '; ' -)"
+        kv_set "$pr_num" setup_reason "worktree is dirty before processing — $dirty_preview"
+        progress_set "$pr_num" normalize_case failed "worktree not clean"
+        progress_mark_remaining "$pr_num" failed "worktree not clean"
+        return 0
+      fi
+    else
+      kv_set "$pr_num" has_case_collisions "false"
+      progress_set "$pr_num" normalize_case skipped "not needed"
+    fi
+
+    if [ "$SETUP_ONLY" = true ]; then
+      kv_set "$pr_num" setup_reason "setup-only"
+      [ "$(progress_get_status "$pr_num" normalize_case)" = "pending" ] && progress_set "$pr_num" normalize_case skipped "not needed"
+      progress_mark_remaining "$pr_num" skipped "setup-only"
+      return 0
+    fi
+
+    local threads_json threads_file thread_count
+    threads_file="$LOG_DIR/pr-$pr_num-threads.json"
+    progress_set "$pr_num" fetch_threads running "review threads"
+    threads_json="$(get_unresolved_threads "$OWNER_REPO" "$pr_num")"
+    thread_count="$(echo "$threads_json" | jq 'length' 2>/dev/null || echo 0)"
+    thread_count="${thread_count:-0}"
+
+    echo "$threads_json" > "$threads_file"
+    kv_set "$pr_num" threads_file "$threads_file"
+    kv_set "$pr_num" thread_count "$thread_count"
+    progress_set "$pr_num" fetch_threads done "$thread_count unresolved thread(s)"
+
+    if [ "$thread_count" -eq 0 ]; then
+      kv_set "$pr_num" setup_reason "no unresolved threads"
+      [ "$(progress_get_status "$pr_num" normalize_case)" = "pending" ] && progress_set "$pr_num" normalize_case skipped "not needed"
+      progress_set "$pr_num" filter_threads skipped "no unresolved threads"
+      progress_mark_remaining "$pr_num" skipped "no unresolved threads"
+      return 0
+    fi
+
+    kv_set "$pr_num" setup_status "ready"
+    kv_set "$pr_num" setup_reason "ready"
+  } >> "$log_file" 2>&1 || {
+    kv_set "$pr_num" setup_reason "setup failed"
+    progress_mark_remaining "$pr_num" failed "setup failed"
+    echo "FAIL" > "$LOG_DIR/pr-$pr_num.status"
+    return 0
+  }
+}
+
 setup_all() {
   local repo_dir="$1"
   local autofix_hook
@@ -3108,119 +3218,90 @@ setup_all() {
   kv_set global autofix_hook "$autofix_hook"
   kv_set global validate_runner "$validate_runner"
 
+  local setup_concurrency
+  setup_concurrency="$(setup_phase_concurrency)"
+  local previous_concurrency="$CONCURRENCY"
+  CONCURRENCY="$setup_concurrency"
+  sem_init
+
+  local pids=""
+  for pr_num in $PR_NUMBERS; do
+    (
+      sem_acquire
+      setup_pr "$repo_dir" "$pr_num"
+      sem_release
+    ) &
+    pids="${pids:+$pids }$!"
+  done
+
+  for pid in $pids; do
+    wait "$pid" 2>/dev/null || true
+  done
+  sem_destroy
+  CONCURRENCY="$previous_concurrency"
+
   for pr_num in $PR_NUMBERS; do
     echo ""
     echo "━━━ PR #$pr_num ━━━"
 
-    local pr_json
-    pr_json=$(gh pr view "$pr_num" --repo "$OWNER_REPO" \
-      --json headRefName,title,state,isDraft 2>/dev/null) \
-      || { echo "  ⚠ not found — skipping"; kv_append skipped "$pr_num"; continue; }
+    local title branch state_label setup_status setup_reason worktree_path thread_count
+    title="$(kv_get "$pr_num" title)"
+    branch="$(kv_get "$pr_num" branch)"
+    state_label="$(kv_get "$pr_num" state_label)"
+    setup_status="$(kv_get "$pr_num" setup_status)"
+    setup_reason="$(kv_get "$pr_num" setup_reason)"
+    worktree_path="$(kv_get "$pr_num" worktree)"
+    thread_count="$(kv_get "$pr_num" thread_count)"
 
-    local branch title state is_draft
-    branch=$(echo "$pr_json" | jq -r '.headRefName')
-    title=$(echo "$pr_json" | jq -r '.title')
-    state=$(echo "$pr_json" | jq -r '.state')
-    is_draft=$(echo "$pr_json" | jq -r '.isDraft')
-
-    local state_label="$state"
-    [ "$is_draft" = "true" ] && state_label="DRAFT"
-
-    echo "  Title : $title"
-    echo "  Branch: $branch"
-    echo "  State : $state_label"
-
-    kv_set "$pr_num" title "$title"
-    kv_set "$pr_num" branch "$branch"
-
-    if [ "$state" != "OPEN" ]; then
-      echo "  ⚠ PR is $state — skipping"
-      kv_append skipped "$pr_num"
-      continue
+    if [ -n "$title" ]; then
+      echo "  Title : $title"
+      echo "  Branch: $branch"
+      echo "  State : $state_label"
     fi
 
-    local worktree_path
-    worktree_path="$(setup_worktree "$pr_num" "$repo_dir" "$branch")"
-    kv_set "$pr_num" worktree "$worktree_path"
-
-    local log_file="$LOG_DIR/pr-$pr_num.log"
-    : > "$log_file"
-    progress_init "$pr_num"
-    progress_set "$pr_num" normalize_case skipped "not needed"
-
-    local dirty_status
-    dirty_status="$(git -C "$worktree_path" status --short 2>/dev/null || true)"
-    if [ -n "$dirty_status" ]; then
-      if handle_case_collisions "$OWNER_REPO" "$pr_num" "$branch" "$worktree_path" "$log_file"; then
-        dirty_status="$(git -C "$worktree_path" status --short 2>/dev/null || true)"
-      fi
-
-      if [ -n "$dirty_status" ]; then
-        local dirty_preview
-        dirty_preview="$(printf '%s\n' "$dirty_status" | sed -n '1,3p' | paste -sd '; ' -)"
-        [ "$(progress_get_status "$pr_num" normalize_case)" = "failed" ] || progress_set "$pr_num" normalize_case failed "worktree not clean"
-        echo "  ⚠ Worktree is dirty before processing — $dirty_preview"
-        progress_mark_remaining "$pr_num" failed "$(progress_get_note "$pr_num" normalize_case)"
-        echo "FAIL" > "$LOG_DIR/pr-$pr_num.status"
+    case "$setup_reason" in
+      not\ found)
+        echo "  ⚠ not found — skipping"
         kv_append skipped "$pr_num"
         continue
-      fi
-    fi
+        ;;
+      PR\ is\ *)
+        echo "  ⚠ $setup_reason — skipping"
+        kv_append skipped "$pr_num"
+        continue
+        ;;
+      setup-only)
+        echo "  → cd $worktree_path"
+        kv_append skipped "$pr_num"
+        continue
+        ;;
+      no\ unresolved\ threads)
+        echo "  ✓ No unresolved threads"
+        kv_append skipped "$pr_num"
+        continue
+        ;;
+      worktree\ is\ dirty\ before\ processing\ —*)
+        echo "  ⚠ $setup_reason"
+        kv_append skipped "$pr_num"
+        continue
+        ;;
+      setup\ failed)
+        echo "  ⚠ setup failed — skipping PR"
+        kv_append skipped "$pr_num"
+        continue
+        ;;
+    esac
 
-    if [ "$SETUP_ONLY" = true ]; then
-      echo "  → cd $worktree_path"
-      progress_mark_remaining "$pr_num" skipped "setup-only"
+    if [ "$setup_status" != "ready" ]; then
+      echo "  ⚠ $setup_reason — skipping"
       kv_append skipped "$pr_num"
       continue
     fi
-
-    echo "  Fetching unresolved threads..."
-    local threads_json threads_file triage_file thread_count residual_count
-    progress_set "$pr_num" fetch_threads running "review threads"
-    threads_json="$(get_unresolved_threads "$OWNER_REPO" "$pr_num")"
-    thread_count="$(echo "$threads_json" | jq 'length' 2>/dev/null || echo 0)"
-    thread_count="${thread_count:-0}"
-    threads_file="$LOG_DIR/pr-$pr_num-threads.json"
-    triage_file="$LOG_DIR/pr-$pr_num-triage.json"
-
-    echo "$threads_json" > "$threads_file"
-    progress_set "$pr_num" fetch_threads done "$thread_count unresolved thread(s)"
-
-    if [ "$thread_count" -eq 0 ]; then
-      echo "  ✓ No unresolved threads"
-      progress_set "$pr_num" filter_threads skipped "no unresolved threads"
-      progress_mark_remaining "$pr_num" skipped "no unresolved threads"
-      kv_append skipped "$pr_num"
-      continue
-    fi
-
-    resolve_ai_backend
-
-    # Merge base branch before fixing (resolve conflicts first)
-    if ! merge_base_branch "$pr_num" "$worktree_path" "$log_file"; then
-      echo "  ⚠ Could not merge base branch — skipping PR"
-      progress_mark_remaining "$pr_num" failed "merge base failed"
-      echo "FAIL" > "$LOG_DIR/pr-$pr_num.status"
-      kv_append skipped "$pr_num"
-      continue
-    fi
-
-    progress_set "$pr_num" filter_threads running "deterministic triage"
-    triage_threads "$worktree_path" "$threads_file" "$triage_file"
-    residual_count="$(jq '.needs_llm | length' < "$triage_file")"
-
-    kv_set "$pr_num" threads_file "$threads_file"
-    kv_set "$pr_num" triage_file "$triage_file"
-    kv_set "$pr_num" thread_count "$thread_count"
-    kv_set "$pr_num" residual_count "$residual_count"
-    progress_set "$pr_num" filter_threads done \
-      "$(jq -r '"\(.skip | length) skipped, \(.auto | length) auto, \(.already_likely_fixed | length) already fixed, \(.needs_llm | length) need review"' < "$triage_file")"
 
     echo "  Threads total      : $thread_count"
-    echo "  deterministic skip : $(jq '.skip | length' < "$triage_file")"
-    echo "  auto/mechanical    : $(jq '.auto | length' < "$triage_file")"
-    echo "  already-likely-fix : $(jq '.already_likely_fixed | length' < "$triage_file")"
-    echo "  residual needs llm : $residual_count"
+    echo "  Worktree           : $worktree_path"
+    [ "$(kv_get "$pr_num" has_case_collisions)" = "true" ] && \
+      echo "  Case collisions    : detected (will normalize in worker)"
 
     kv_append ready "$pr_num"
   done
@@ -3234,10 +3315,10 @@ process_pr() {
   title="$(kv_get "$pr_num" title)"
   worktree_path="$(kv_get "$pr_num" worktree)"
   threads_file="$(kv_get "$pr_num" threads_file)"
-  triage_file="$(kv_get "$pr_num" triage_file)"
   hook="$(kv_get global autofix_hook)"
   validate_runner="$(kv_get global validate_runner)"
   log_file="$LOG_DIR/pr-$pr_num.log"
+  triage_file="$LOG_DIR/pr-$pr_num-triage.json"
 
   # Signal start
   date +%s > "$LOG_DIR/pr-${pr_num}.started"
@@ -3248,6 +3329,30 @@ process_pr() {
     echo "gate model: $GATE_MODEL"
     echo "fix model : $FIX_MODEL"
     echo ""
+
+    local dirty_status
+    dirty_status="$(git -C "$worktree_path" status --short 2>/dev/null || true)"
+    if [ -n "$dirty_status" ]; then
+      handle_case_collisions "$OWNER_REPO" "$pr_num" "$(kv_get "$pr_num" branch)" "$worktree_path" "$log_file" || true
+      dirty_status="$(git -C "$worktree_path" status --short 2>/dev/null || true)"
+      if [ -n "$dirty_status" ]; then
+        echo "[setup] worktree is dirty before merge"
+        progress_mark_remaining "$pr_num" failed "worktree not clean"
+        return 1
+      fi
+    else
+      progress_set "$pr_num" normalize_case skipped "not needed"
+    fi
+
+    if ! merge_base_branch "$pr_num" "$worktree_path" "$log_file"; then
+      echo "[merge] failed during worker phase"
+      return 1
+    fi
+
+    progress_set "$pr_num" filter_threads running "deterministic triage"
+    triage_threads "$worktree_path" "$threads_file" "$triage_file"
+    progress_set "$pr_num" filter_threads done \
+      "$(jq -r '"\(.skip | length) skipped, \(.auto | length) auto, \(.already_likely_fixed | length) already fixed, \(.needs_llm | length) need review"' < "$triage_file")"
 
     # 1. Write deterministic responses
     local deterministic_responses="$LOG_DIR/pr-$pr_num-deterministic-responses.json"
@@ -3413,10 +3518,10 @@ process_pr_sequential() {
   title="$(kv_get "$pr_num" title)"
   worktree_path="$(kv_get "$pr_num" worktree)"
   threads_file="$(kv_get "$pr_num" threads_file)"
-  triage_file="$(kv_get "$pr_num" triage_file)"
   hook="$(kv_get global autofix_hook)"
   validate_runner="$(kv_get global validate_runner)"
   log_file="$LOG_DIR/pr-$pr_num.log"
+  triage_file="$LOG_DIR/pr-$pr_num-triage.json"
 
   date +%s > "$LOG_DIR/pr-${pr_num}.started"
 
@@ -3426,6 +3531,39 @@ process_pr_sequential() {
   echo "  Gate model: $GATE_MODEL"
   echo "  Fix model : $FIX_MODEL"
   echo ""
+
+  local dirty_status
+  dirty_status="$(git -C "$worktree_path" status --short 2>/dev/null || true)"
+  if [ -n "$dirty_status" ]; then
+    handle_case_collisions "$OWNER_REPO" "$pr_num" "$(kv_get "$pr_num" branch)" "$worktree_path" "$log_file" || true
+    dirty_status="$(git -C "$worktree_path" status --short 2>/dev/null || true)"
+    if [ -n "$dirty_status" ]; then
+      echo "  ⚠ Worktree is dirty before merge"
+      progress_mark_remaining "$pr_num" failed "worktree not clean"
+      echo "FAIL" > "$LOG_DIR/pr-$pr_num.status"
+      return 0
+    fi
+  else
+    progress_set "$pr_num" normalize_case skipped "not needed"
+  fi
+
+  if ! merge_base_branch "$pr_num" "$worktree_path" "$log_file"; then
+    echo "  ⚠ Could not merge base branch — skipping PR"
+    progress_mark_remaining "$pr_num" failed "merge base failed"
+    echo "FAIL" > "$LOG_DIR/pr-$pr_num.status"
+    return 0
+  fi
+
+  progress_set "$pr_num" filter_threads running "deterministic triage"
+  triage_threads "$worktree_path" "$threads_file" "$triage_file"
+  local residual_count
+  residual_count="$(jq '.needs_llm | length' < "$triage_file")"
+  progress_set "$pr_num" filter_threads done \
+    "$(jq -r '"\(.skip | length) skipped, \(.auto | length) auto, \(.already_likely_fixed | length) already fixed, \(.needs_llm | length) need review"' < "$triage_file")"
+  echo "  deterministic skip : $(jq '.skip | length' < "$triage_file")"
+  echo "  auto/mechanical    : $(jq '.auto | length' < "$triage_file")"
+  echo "  already-likely-fix : $(jq '.already_likely_fixed | length' < "$triage_file")"
+  echo "  residual needs llm : $residual_count"
 
   # 1. Write deterministic responses
   local deterministic_responses="$LOG_DIR/pr-$pr_num-deterministic-responses.json"
@@ -3651,13 +3789,13 @@ trap cleanup_sigint INT TERM
 sem_init() {
   SEMAPHORE=$(mktemp -u /tmp/gh-crfix-sem.XXXXXX)
   mkfifo "$SEMAPHORE"
-  exec 3<>"$SEMAPHORE"
+  exec 9<>"$SEMAPHORE"
   local i=0
-  while [ "$i" -lt "$CONCURRENCY" ]; do printf '\n' >&3; i=$((i + 1)); done
+  while [ "$i" -lt "$CONCURRENCY" ]; do printf '\n' >&9; i=$((i + 1)); done
 }
-sem_acquire() { IFS= read -r -u 3; }
-sem_release() { printf '\n' >&3; }
-sem_destroy() { exec 3>&- 2>/dev/null || true; rm -f "$SEMAPHORE" 2>/dev/null || true; }
+sem_acquire() { IFS= read -r -u 9; }
+sem_release() { printf '\n' >&9; }
+sem_destroy() { exec 9>&- 2>/dev/null || true; rm -f "$SEMAPHORE" 2>/dev/null || true; }
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
@@ -3683,6 +3821,7 @@ main() {
   repo_dir="$(find_local_repo "$OWNER_REPO")"
   echo "Local repo : $repo_dir"
   echo "Concurrency: $CONCURRENCY"
+  echo "Prepare    : $(setup_phase_concurrency)"
   echo "Gate model : $GATE_MODEL"
   echo "Fix model  : $FIX_MODEL"
 
@@ -3704,7 +3843,7 @@ main() {
 
   [ "$DRY_RUN" = true ] && echo "Mode       : DRY RUN"
 
-  # Phase 1: sequential setup (worktrees, merge, threads, triage)
+  # Phase 1: parallel prepare (metadata, worktrees, unresolved-thread discovery, skips)
   setup_all "$repo_dir"
 
   local total=0 ready=0 skipped=0
