@@ -213,6 +213,16 @@ CREOF
   assert_output --partial "1 fixed"
 }
 
+@test "integration: prepare phase clamps high concurrency" {
+  setup_mocks "OPEN" 1 0
+
+  cd "$REPO_DIR"
+  run bash "$SCRIPT_PATH" --no-tui --dry-run -c 20 "https://github.com/test-owner/test-repo/pull/1"
+  [ "$status" -eq 0 ]
+  assert_output --partial "Concurrency: 20"
+  assert_output --partial "Prepare    : 8"
+}
+
 @test "integration: summary counts are correct for skipped PR" {
   mock_command_script "gh" '
     jq_expr=""
@@ -436,7 +446,7 @@ EOF
   run bash "$SCRIPT_PATH" --seq --no-tui --dry-run "https://github.com/test-owner/test-repo/pull/1"
   [ "$status" -eq 0 ]
   assert_output --partial "Could not merge base branch"
-  assert_output --partial "Fetching unresolved threads"
+  assert_output --partial "Threads total      : 1"
   run git -C "$REPO_DIR/.gh-crfix/worktrees/pr-1" status --short
   [ "$status" -eq 0 ]
   [ -z "$output" ]

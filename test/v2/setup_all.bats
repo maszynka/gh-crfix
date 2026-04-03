@@ -22,7 +22,6 @@ setup() {
   detect_autofix_hook() { :; }
   detect_validate_runner() { :; }
   setup_worktree() { echo "$REPO_DIR"; }
-  merge_base_branch() { echo "merge should not run" >> "$TEST_TMPDIR/merge-called"; return 0; }
   get_unresolved_threads() { echo '[]'; }
 
   mock_command_script "gh" '
@@ -43,32 +42,33 @@ teardown() {
   assert_output --partial "Worktree is dirty before processing"
   [ -z "$(kv_list ready)" ]
   [ "$(kv_list skipped)" = "1" ]
-  [ ! -f "$TEST_TMPDIR/merge-called" ]
 }
 
-@test "setup_all: case-colliding worktree triggers automatic normalization before setup-only skip" {
+@test "setup_all: case-colliding worktree is queued for worker normalization" {
   echo "dirty change" > tracked.txt
-  SETUP_ONLY=true
+  get_unresolved_threads() { echo '[{"id":"t1"}]'; }
   detect_case_collisions() { echo "apps/Foo.ts | apps/foo.ts"; }
-  case_collision_groups_json() { echo '[["apps/Foo.ts","apps/foo.ts"]]'; }
-  handle_case_collisions() {
-    git -C "$3" checkout -- tracked.txt >/dev/null 2>&1
-    progress_set "$2" normalize_case done "1 group normalized"
-    return 0
-  }
 
   run setup_all "$REPO_DIR"
   [ "$status" -eq 0 ]
-  assert_output --partial "cd $REPO_DIR"
-  [ "$(progress_get_status "1" "normalize_case")" = "done" ]
-  [ "$(progress_get_note "1" "normalize_case")" = "1 group normalized" ]
+  assert_output --partial "Case collisions    : detected"
+  [ "$(kv_list ready)" = "1" ]
+  [ "$(progress_get_status "1" "normalize_case")" = "pending" ]
+  [ "$(progress_get_note "1" "normalize_case")" = "1 group(s) detected" ]
 }
 
-@test "setup_all: skips merge when there are no unresolved threads" {
+@test "setup_all: skips PR when there are no unresolved threads" {
   run setup_all "$REPO_DIR"
   [ "$status" -eq 0 ]
   assert_output --partial "No unresolved threads"
   [ -z "$(kv_list ready)" ]
   [ "$(kv_list skipped)" = "1" ]
-  [ ! -f "$TEST_TMPDIR/merge-called" ]
+}
+
+@test "setup_phase_concurrency: clamps to configured max" {
+  CONCURRENCY=20
+
+  run setup_phase_concurrency
+  [ "$status" -eq 0 ]
+  [ "$output" = "8" ]
 }
