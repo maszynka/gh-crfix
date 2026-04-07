@@ -181,9 +181,32 @@ Validation runs after the deterministic autofix phase and before the gate model.
 | `GH_CRFIX_REVIEW_WAIT` | Seconds to wait for re-review (default: 90) |
 | `GH_CRFIX_GATE_MODEL` | Gate model override |
 | `GH_CRFIX_FIX_MODEL` | Fix model override |
+| `GH_CRFIX_MODEL_REGISTRY` | Override model registry URL |
 | `GH_CRFIX_SCORE_NEEDS_LLM` | Gate score contribution for residual semantic review |
 | `GH_CRFIX_SCORE_PR_COMMENT` | Gate score contribution for PR-level comments |
 | `GH_CRFIX_SCORE_TEST_FAILURE` | Gate score contribution for failed validation/tests |
+
+## Model registry
+
+Available model names (for `--gate-model` / `--fix-model` and the launcher TUI) are loaded from a **public JSON endpoint** — no API keys needed on your machine.
+
+```
+https://raw.githubusercontent.com/maszynka/gh-crfix/main/registry/models.json
+```
+
+The list is **updated automatically every hour** via GitHub Actions, which fetches live model lists from Anthropic and OpenAI APIs. Results are cached locally for 1 hour at `~/.cache/gh-crfix/models.json`.
+
+To update the registry manually:
+
+```bash
+ANTHROPIC_API_KEY=sk-... OPENAI_API_KEY=sk-... bash registry/update.sh
+```
+
+Override the endpoint:
+
+```bash
+export GH_CRFIX_MODEL_REGISTRY="https://your-domain.com/models.json"
+```
 
 ## Tests
 
@@ -205,6 +228,13 @@ gh-crfix/
 ├── gh-crfix              # Main script (gh extension binary)
 ├── install.sh            # Symlink as gh extension
 ├── uninstall.sh          # Remove symlink
+├── registry/
+│   ├── models.json       # Public model list (auto-updated hourly)
+│   └── update.sh         # Script to refresh models from APIs
+├── .github/workflows/
+│   ├── test.yml
+│   ├── e2e.yml
+│   └── update-models.yml # Hourly model list update
 ├── test/
 │   ├── install-test-helpers.sh
 │   ├── test_helper/

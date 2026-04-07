@@ -1,5 +1,15 @@
 # gh crfix — Changelog
 
+## 1.4.0 — 2026-03-30
+
+### Added
+- **Model registry**: public JSON endpoint at `registry/models.json` serving available model names for both Anthropic and OpenAI — no API keys needed on the client side
+- `registry/update.sh` script to refresh the model list from live APIs
+- GitHub Actions workflow (`update-models.yml`) that auto-updates the registry every hour
+- `fetch_model_registry`, `get_claude_models`, `get_openai_models` helpers in the main script with local caching (~/.cache/gh-crfix/models.json, 1h TTL)
+- `GH_CRFIX_MODEL_REGISTRY` env var to override the registry URL
+- Tests for registry functions (`test/model_registry.bats`)
+
 ## 1.3.0 — 2026-03-27
 
 ### Fixed

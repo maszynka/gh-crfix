@@ -47,12 +47,18 @@
 #   GH_CRFIX_REVIEW_WAIT         seconds to wait for re-review (default: 90)
 #   GH_CRFIX_GATE_MODEL          gate model override
 #   GH_CRFIX_FIX_MODEL           fix model override
+#   GH_CRFIX_MODEL_REGISTRY      override model registry URL
 #   GH_CRFIX_SCORE_NEEDS_LLM     score contribution (default: 1)
 #   GH_CRFIX_SCORE_PR_COMMENT    score contribution (default: 0.4)
 #   GH_CRFIX_SCORE_TEST_FAILURE  score contribution (default: 1)
 #   Persistent defaults file     ${XDG_CONFIG_HOME:-~/.config}/gh-crfix/defaults
 
 set -euo pipefail
+
+# ── Model registry ──────────────────────────────────────────────────────────
+# Public JSON endpoint — no API keys needed. Updated hourly by GitHub Actions.
+MODEL_REGISTRY_URL="${GH_CRFIX_MODEL_REGISTRY:-https://raw.githubusercontent.com/maszynka/gh-crfix/main/registry/models.json}"
+MODEL_REGISTRY_CACHE=""
 
 WORKTREE_SUBDIR=".gh-crfix/worktrees"
 SETUP_MAX_CONCURRENCY=8
@@ -85,6 +91,73 @@ BG_PIDS=""
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 die() { echo "ERROR: $*" >&2; exit 1; }
+
+# ── model registry ──────────────────────────────────────────────────────────
+
+fetch_model_registry() {
+  # Returns cached JSON or fetches from MODEL_REGISTRY_URL (no API keys).
+  # Falls back gracefully — never blocks the main flow.
+  if [ -n "$MODEL_REGISTRY_CACHE" ] && [ -f "$MODEL_REGISTRY_CACHE" ]; then
+    cat "$MODEL_REGISTRY_CACHE"
+    return 0
+  fi
+
+  local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/gh-crfix"
+  local cache_file="$cache_dir/models.json"
+  local max_age=3600  # 1 hour
+
+  # Use cached file if fresh enough
+  if [ -f "$cache_file" ]; then
+    local now file_age
+    now="$(date +%s)"
+    file_age="$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null || echo 0)"
+    if [ $((now - file_age)) -lt "$max_age" ]; then
+      MODEL_REGISTRY_CACHE="$cache_file"
+      cat "$cache_file"
+      return 0
+    fi
+  fi
+
+  # Fetch from remote (non-blocking, with timeout)
+  mkdir -p "$cache_dir"
+  if curl --max-time 5 -fsS "$MODEL_REGISTRY_URL" -o "$cache_file.tmp" 2>/dev/null \
+    && jq -e '.anthropic' "$cache_file.tmp" >/dev/null 2>&1; then
+    mv "$cache_file.tmp" "$cache_file"
+    MODEL_REGISTRY_CACHE="$cache_file"
+    cat "$cache_file"
+    return 0
+  fi
+  rm -f "$cache_file.tmp"
+
+  # Fallback to stale cache
+  if [ -f "$cache_file" ]; then
+    MODEL_REGISTRY_CACHE="$cache_file"
+    cat "$cache_file"
+    return 0
+  fi
+
+  # No cache at all — return empty
+  echo '{}'
+}
+
+get_claude_models() {
+  # Returns newline-separated list: aliases first, then full IDs
+  local registry
+  registry="$(fetch_model_registry)"
+  {
+    echo "$registry" | jq -r '.anthropic_aliases[]? // empty' 2>/dev/null
+    echo "$registry" | jq -r '.anthropic[]? // empty' 2>/dev/null
+  } | awk '!seen[$0]++'
+}
+
+get_openai_models() {
+  local registry
+  registry="$(fetch_model_registry)"
+  {
+    echo "$registry" | jq -r '.openai_aliases[]? // empty' 2>/dev/null
+    echo "$registry" | jq -r '.openai[]? // empty' 2>/dev/null
+  } | awk '!seen[$0]++'
+}
 
 config_dir() {
   echo "${XDG_CONFIG_HOME:-$HOME/.config}/gh-crfix"
@@ -402,9 +475,15 @@ Env vars:
   GH_CRFIX_REVIEW_WAIT    seconds to wait for re-review (default: 90)
   GH_CRFIX_GATE_MODEL     gate model override (default: sonnet)
   GH_CRFIX_FIX_MODEL      fix model override (default: sonnet)
+  GH_CRFIX_MODEL_REGISTRY      override model registry URL
   GH_CRFIX_SCORE_NEEDS_LLM     contribution for residual semantic review (default: 1)
   GH_CRFIX_SCORE_PR_COMMENT    contribution for PR-level comments (default: 0.4)
   GH_CRFIX_SCORE_TEST_FAILURE  contribution for failed validation/tests (default: 1)
+
+Model registry:
+  Available model names are loaded from a public JSON endpoint (no API keys
+  needed). The list is updated hourly. Override with GH_CRFIX_MODEL_REGISTRY.
+  Default: https://raw.githubusercontent.com/maszynka/gh-crfix/main/registry/models.json
 EOF
 }
 
