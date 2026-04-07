@@ -1,0 +1,17 @@
+[
+  {
+    "thread_id": "PRRT_kwDORxW1OM54uC7b",
+    "action": "already_fixed",
+    "comment": "Worktree creation is already serialized via setup_worktree_serialized (line 3379), which uses a directory-lock mutex (.git/gh-crfix-worktree.lock.d) to prevent concurrent git worktree add calls. Metadata fetching (gh pr view, get_unresolved_threads) runs in parallel while the critical git operation is serialized."
+  },
+  {
+    "thread_id": "PRRT_kwDORxW1OM55XcXf",
+    "action": "fixed",
+    "comment": "Replaced `fix_committed_conflict_markers ... || true` with an explicit failure check in both process_pr and process_pr_sequential. When conflict markers cannot be auto-fixed, processing now stops: logs a message, calls progress_mark_remaining with failed status, and returns (with FAIL status file in sequential mode)."
+  },
+  {
+    "thread_id": "PRRT_kwDORxW1OM55XcXz",
+    "action": "fixed",
+    "comment": "Added `git -C \"$REPO_DIR\" checkout tracked.txt` before `run setup_all` in the 'no unresolved threads' test. The global setup leaves tracked.txt dirty; with the updated setup_pr logic this causes an early dirty-worktree skip before threads are fetched, so the test never reached 'No unresolved threads'. Restoring the file makes the worktree clean so the expected code path is exercised."
+  }
+]

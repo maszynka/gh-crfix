@@ -3579,7 +3579,11 @@ process_pr() {
       echo "[merge] failed during worker phase"
       return 1
     fi
-    fix_committed_conflict_markers "$pr_num" "$worktree_path" "$log_file" || true
+    if ! fix_committed_conflict_markers "$pr_num" "$worktree_path" "$log_file"; then
+      echo "[conflict-markers] could not auto-fix committed conflict markers — stopping PR processing"
+      progress_mark_remaining "$pr_num" failed "committed conflict markers could not be auto-fixed"
+      return 1
+    fi
 
     progress_set "$pr_num" filter_threads running "deterministic triage"
     triage_threads "$worktree_path" "$threads_file" "$triage_file"
@@ -3787,7 +3791,12 @@ process_pr_sequential() {
     echo "FAIL" > "$LOG_DIR/pr-$pr_num.status"
     return 0
   fi
-  fix_committed_conflict_markers "$pr_num" "$worktree_path" "$log_file" || true
+  if ! fix_committed_conflict_markers "$pr_num" "$worktree_path" "$log_file"; then
+    echo "  ⚠ Committed conflict markers could not be auto-fixed — stopping"
+    progress_mark_remaining "$pr_num" failed "committed conflict markers could not be auto-fixed"
+    echo "FAIL" > "$LOG_DIR/pr-$pr_num.status"
+    return 0
+  fi
 
   progress_set "$pr_num" filter_threads running "deterministic triage"
   triage_threads "$worktree_path" "$threads_file" "$triage_file"

@@ -58,6 +58,7 @@ teardown() {
 }
 
 @test "setup_all: skips PR when there are no unresolved threads" {
+  git -C "$REPO_DIR" checkout tracked.txt
   run setup_all "$REPO_DIR"
   [ "$status" -eq 0 ]
   assert_output --partial "No unresolved threads"
