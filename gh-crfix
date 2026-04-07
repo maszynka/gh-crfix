@@ -87,6 +87,46 @@ LOG_DIR=""
 SEMAPHORE=""
 BG_PIDS=""
 
+# ── Debug logging ───────────────────────────────────────────────────────────
+DEBUG_LOG_FILE="/tmp/gh-crfix-debug.log"
+
+debug_log() {
+  local timestamp
+  timestamp="$(date '+%Y-%m-%d %H:%M:%S.%3N')"
+  local caller="${FUNCNAME[1]:-main}"
+  local line="${BASH_LINENO[0]:-?}"
+  printf '[%s] [%s:%s] %s\n' "$timestamp" "$caller" "$line" "$*" >> "$DEBUG_LOG_FILE"
+}
+
+debug_log_separator() {
+  printf '\n%s\n' "════════════════════════════════════════════════════════════════════" >> "$DEBUG_LOG_FILE"
+  debug_log "$@"
+  printf '%s\n\n' "════════════════════════════════════════════════════════════════════" >> "$DEBUG_LOG_FILE"
+}
+
+debug_log_file_contents() {
+  local label="$1" filepath="$2"
+  debug_log "$label: $filepath"
+  if [ -f "$filepath" ]; then
+    {
+      printf '  --- begin %s ---\n' "$label"
+      head -100 "$filepath" 2>/dev/null || echo "  (could not read)"
+      printf '  --- end %s ---\n' "$label"
+    } >> "$DEBUG_LOG_FILE"
+  else
+    printf '  (file does not exist: %s)\n' "$filepath" >> "$DEBUG_LOG_FILE"
+  fi
+}
+
+# Initialize debug log
+{
+  printf '\n\n'
+  printf '╔══════════════════════════════════════════════════════════════════╗\n'
+  printf '║  gh-crfix DEBUG SESSION started at %s  ║\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+  printf '║  PID: %-56s ║\n' "$$"
+  printf '╚══════════════════════════════════════════════════════════════════╝\n'
+} >> "$DEBUG_LOG_FILE"
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -388,9 +428,11 @@ resolve_ai_backend() {
 }
 
 verify_prereqs() {
+  debug_log "verify_prereqs() — checking gh, jq, gh auth"
   command -v gh >/dev/null 2>&1 || die "'gh' CLI not found"
   command -v jq >/dev/null 2>&1 || die "'jq' not found"
   gh auth status >/dev/null 2>&1 || die "'gh' is not authenticated. Run: gh auth login"
+  debug_log "verify_prereqs: gh=$(command -v gh) jq=$(command -v jq)"
 }
 
 verify_parse_input_prereqs() {
@@ -587,6 +629,7 @@ parse_input() {
 
 find_local_repo() {
   local owner_repo="$1"
+  debug_log "find_local_repo() — owner_repo=$owner_repo GH_CRFIX_DIR=${GH_CRFIX_DIR:-unset}"
 
   if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     local remote
@@ -854,6 +897,7 @@ run_validation() {
 
 setup_worktree() {
   local pr_num="$1" repo_dir="$2" branch="$3"
+  debug_log "setup_worktree() — PR #$pr_num repo_dir=$repo_dir branch=$branch"
   local worktree_path="$repo_dir/$WORKTREE_SUBDIR/pr-$pr_num"
 
   mkdir -p "$repo_dir/$WORKTREE_SUBDIR"
@@ -1012,6 +1056,7 @@ handle_case_collisions() {
 
 get_unresolved_threads() {
   local owner_repo="$1" pr_number="$2"
+  debug_log "get_unresolved_threads() — owner_repo=$owner_repo pr_number=$pr_number INCLUDE_OUTDATED=$INCLUDE_OUTDATED MAX_THREADS=$MAX_THREADS"
   local owner="${owner_repo%%/*}"
   local repo="${owner_repo##*/}"
   local filter
@@ -1212,17 +1257,25 @@ classify_one_thread() {
 
 triage_threads() {
   local worktree_path="$1" threads_file="$2" out_file="$3"
+  debug_log "triage_threads() — worktree=$worktree_path threads_file=$threads_file"
 
   local tmp="$LOG_DIR/triage.tmp.jsonl"
   : > "$tmp"
 
   local count i
   count="$(jq 'length' < "$threads_file")"
+  debug_log "triage_threads: classifying $count thread(s)"
   i=0
   while [ "$i" -lt "$count" ]; do
     local one
     one="$(jq -c ".[$i]" < "$threads_file")"
+    local thread_id
+    thread_id="$(echo "$one" | jq -r '.id // "unknown"')"
+    debug_log "triage_threads: classifying thread [$((i+1))/$count] id=$thread_id"
     classify_one_thread "$worktree_path" "$one" >> "$tmp"
+    local last_decision
+    last_decision="$(tail -1 "$tmp" | jq -r '.decision // "?"')"
+    debug_log "triage_threads: thread $thread_id -> $last_decision"
     i=$((i + 1))
   done
 
@@ -1409,11 +1462,13 @@ EOF
 
 run_gate_model() {
   local owner_repo="$1" pr_num="$2" triage_file="$3" validation_file="$4" score_file="$5" out_file="$6" log_file="$7"
+  debug_log "run_gate_model() — PR #$pr_num model=$GATE_MODEL backend=$AI_BACKEND"
   local prompt_file="$LOG_DIR/gate-$pr_num.txt"
   local schema_file="$LOG_DIR/gate-$pr_num.schema.json"
 
   build_gate_prompt "$owner_repo" "$pr_num" "$triage_file" "$validation_file" "$score_file" > "$prompt_file"
   gate_schema > "$schema_file"
+  debug_log "Gate prompt size: $(wc -c < "$prompt_file") bytes"
 
   {
     echo "[gate] model=$GATE_MODEL"
@@ -1520,9 +1575,12 @@ EOF
 
 run_fix_model() {
   local owner_repo="$1" pr_num="$2" worktree_path="$3" threads_file="$4" selected_file="$5" validation_file="$6" log_file="$7"
+  debug_log "run_fix_model() — PR #$pr_num model=$FIX_MODEL backend=$AI_BACKEND worktree=$worktree_path"
   local prompt_file="$LOG_DIR/fix-$pr_num.txt"
 
   build_fix_prompt "$owner_repo" "$pr_num" "$threads_file" "$selected_file" "$validation_file" > "$prompt_file"
+  debug_log "Fix prompt size: $(wc -c < "$prompt_file") bytes"
+  debug_log_file_contents "fix_prompt" "$prompt_file"
 
   {
     echo "[fix] model=$FIX_MODEL"
@@ -1532,9 +1590,12 @@ run_fix_model() {
     echo ""
 
     local cmd_failed=false
+    debug_log "run_fix_model: executing AI command (backend=$AI_BACKEND model=$FIX_MODEL cwd=$worktree_path)"
     if [ "$AI_BACKEND" = "claude" ]; then
+      debug_log "run_fix_model: claude -p --model $FIX_MODEL --dangerously-skip-permissions"
       (cd "$worktree_path" && claude -p --model "$FIX_MODEL" --dangerously-skip-permissions < "$prompt_file") || cmd_failed=true
     else
+      debug_log "run_fix_model: codex exec --model $FIX_MODEL"
       codex exec \
         --cd "$worktree_path" \
         --model "$FIX_MODEL" \
@@ -1544,9 +1605,11 @@ run_fix_model() {
     fi
 
     if [ "$cmd_failed" = true ]; then
+      debug_log "run_fix_model: COMMAND FAILED (exit code)"
       echo "[fix] FAILED"
       return 1
     fi
+    debug_log "run_fix_model: command completed successfully"
     echo "[fix] done"
   } >> "$log_file" 2>&1
 }
@@ -1555,10 +1618,11 @@ run_fix_model() {
 
 reply_and_resolve_from_responses() {
   local responses_file="$1"
+  debug_log "reply_and_resolve_from_responses() — file=$responses_file"
   local resolved=0 replied=0 skipped=0
 
-  [ -f "$responses_file" ] || return 0
-  jq -e '.' "$responses_file" >/dev/null 2>&1 || return 0
+  [ -f "$responses_file" ] || { debug_log "responses file not found"; return 0; }
+  jq -e '.' "$responses_file" >/dev/null 2>&1 || { debug_log "responses file not valid JSON"; return 0; }
 
   local n i
   n="$(jq 'length' < "$responses_file")"
@@ -1682,8 +1746,10 @@ cleanup_thread_responses_artifact() {
 
 merge_base_branch() {
   local pr_num="$1" worktree_path="$2" log_file="$3"
+  debug_log "merge_base_branch() — PR #$pr_num worktree=$worktree_path"
   local base_branch merge_not_needed=false
   base_branch=$(gh pr view "$pr_num" --repo "$OWNER_REPO" --json baseRefName -q '.baseRefName' 2>/dev/null || echo "master")
+  debug_log "merge_base_branch: base_branch=$base_branch"
   progress_set "$pr_num" merge_base running "origin/$base_branch"
   progress_set "$pr_num" resolve_conflicts pending ""
 
@@ -1901,6 +1967,7 @@ post_fix_review_cycle() {
 
 run_pre_gate_phase() {
   local pr_num="$1" worktree_path="$2" triage_file="$3" hook="$4" validate_runner="$5" log_file="$6"
+  debug_log "run_pre_gate_phase() — PR #$pr_num hook='$hook' validate_runner='$validate_runner'"
   local validation_file="$LOG_DIR/pr-$pr_num-validation.json"
   local gate_context="$LOG_DIR/pr-$pr_num-gate-context.json"
 
@@ -3180,27 +3247,32 @@ tui_loop() {
 
 setup_all() {
   local repo_dir="$1"
+  debug_log_separator "setup_all() — repo_dir=$repo_dir PR_NUMBERS=$PR_NUMBERS"
   local autofix_hook
   local validate_runner
   autofix_hook="$(detect_autofix_hook "$repo_dir")"
   validate_runner="$(detect_validate_runner "$repo_dir")"
+  debug_log "autofix_hook=$autofix_hook validate_runner=$validate_runner"
   kv_set global autofix_hook "$autofix_hook"
   kv_set global validate_runner "$validate_runner"
 
   for pr_num in $PR_NUMBERS; do
+    debug_log "──── setup PR #$pr_num ────"
     echo ""
     echo "━━━ PR #$pr_num ━━━"
 
     local pr_json
+    debug_log "Fetching PR metadata: gh pr view $pr_num --repo $OWNER_REPO"
     pr_json=$(gh pr view "$pr_num" --repo "$OWNER_REPO" \
       --json headRefName,title,state,isDraft 2>/dev/null) \
-      || { echo "  ⚠ not found — skipping"; kv_append skipped "$pr_num"; continue; }
+      || { debug_log "PR #$pr_num NOT FOUND — skipping"; echo "  ⚠ not found — skipping"; kv_append skipped "$pr_num"; continue; }
 
     local branch title state is_draft
     branch=$(echo "$pr_json" | jq -r '.headRefName')
     title=$(echo "$pr_json" | jq -r '.title')
     state=$(echo "$pr_json" | jq -r '.state')
     is_draft=$(echo "$pr_json" | jq -r '.isDraft')
+    debug_log "PR #$pr_num metadata: title='$title' branch='$branch' state='$state' isDraft='$is_draft'"
 
     local state_label="$state"
     [ "$is_draft" = "true" ] && state_label="DRAFT"
@@ -3213,13 +3285,16 @@ setup_all() {
     kv_set "$pr_num" branch "$branch"
 
     if [ "$state" != "OPEN" ]; then
+      debug_log "PR #$pr_num state=$state — skipping"
       echo "  ⚠ PR is $state — skipping"
       kv_append skipped "$pr_num"
       continue
     fi
 
     local worktree_path
+    debug_log "Setting up worktree for PR #$pr_num branch=$branch"
     worktree_path="$(setup_worktree "$pr_num" "$repo_dir" "$branch")"
+    debug_log "Worktree created: $worktree_path"
     kv_set "$pr_num" worktree "$worktree_path"
 
     local log_file="$LOG_DIR/pr-$pr_num.log"
@@ -3256,16 +3331,20 @@ setup_all() {
     echo "  Fetching unresolved threads..."
     local threads_json threads_file triage_file thread_count residual_count
     progress_set "$pr_num" fetch_threads running "review threads"
+    debug_log "Fetching unresolved threads for PR #$pr_num via GraphQL"
     threads_json="$(get_unresolved_threads "$OWNER_REPO" "$pr_num")"
     thread_count="$(echo "$threads_json" | jq 'length' 2>/dev/null || echo 0)"
     thread_count="${thread_count:-0}"
+    debug_log "PR #$pr_num: got $thread_count unresolved thread(s)"
     threads_file="$LOG_DIR/pr-$pr_num-threads.json"
     triage_file="$LOG_DIR/pr-$pr_num-triage.json"
 
     echo "$threads_json" > "$threads_file"
+    debug_log_file_contents "threads_json" "$threads_file"
     progress_set "$pr_num" fetch_threads done "$thread_count unresolved thread(s)"
 
     if [ "$thread_count" -eq 0 ]; then
+      debug_log "PR #$pr_num: no unresolved threads — skipping"
       echo "  ✓ No unresolved threads"
       progress_set "$pr_num" filter_threads skipped "no unresolved threads"
       progress_mark_remaining "$pr_num" skipped "no unresolved threads"
@@ -3274,7 +3353,9 @@ setup_all() {
     fi
 
     # Merge base branch before fixing (resolve conflicts first)
+    debug_log "PR #$pr_num: merging base branch into worktree"
     if ! merge_base_branch "$pr_num" "$worktree_path" "$log_file"; then
+      debug_log "PR #$pr_num: MERGE BASE FAILED — skipping"
       echo "  ⚠ Could not merge base branch — skipping PR"
       progress_mark_remaining "$pr_num" failed "merge base failed"
       echo "FAIL" > "$LOG_DIR/pr-$pr_num.status"
@@ -3282,11 +3363,16 @@ setup_all() {
       continue
     fi
 
+    debug_log "PR #$pr_num: merge base succeeded"
     resolve_ai_backend
+    debug_log "PR #$pr_num: AI_BACKEND resolved to $AI_BACKEND"
 
     progress_set "$pr_num" filter_threads running "deterministic triage"
+    debug_log "PR #$pr_num: running deterministic triage"
     triage_threads "$worktree_path" "$threads_file" "$triage_file"
+    debug_log_file_contents "triage_result" "$triage_file"
     residual_count="$(jq '.needs_llm | length' < "$triage_file")"
+    debug_log "PR #$pr_num: triage complete — residual_count=$residual_count"
 
     kv_set "$pr_num" threads_file "$threads_file"
     kv_set "$pr_num" triage_file "$triage_file"
@@ -3488,6 +3574,7 @@ process_pr() {
 
 process_pr_sequential() {
   local pr_num="$1"
+  debug_log_separator "process_pr_sequential() — PR #$pr_num"
   local title worktree_path threads_file triage_file log_file hook validate_runner
   title="$(kv_get "$pr_num" title)"
   worktree_path="$(kv_get "$pr_num" worktree)"
@@ -3496,6 +3583,7 @@ process_pr_sequential() {
   hook="$(kv_get global autofix_hook)"
   validate_runner="$(kv_get global validate_runner)"
   log_file="$LOG_DIR/pr-$pr_num.log"
+  debug_log "PR #$pr_num: worktree=$worktree_path hook=$hook validate_runner=$validate_runner"
 
   date +%s > "$LOG_DIR/pr-${pr_num}.started"
 
@@ -3507,34 +3595,45 @@ process_pr_sequential() {
   echo ""
 
   # 1. Write deterministic responses
+  debug_log "PR #$pr_num STEP 1: write_deterministic_responses"
   local deterministic_responses="$LOG_DIR/pr-$pr_num-deterministic-responses.json"
   write_deterministic_responses "$triage_file" "$deterministic_responses"
+  debug_log_file_contents "deterministic_responses" "$deterministic_responses"
   echo "  deterministic responses written"
 
   # 2. Run deterministic pre-gate phase
+  debug_log "PR #$pr_num STEP 2: run_pre_gate_phase"
   echo "  Running deterministic validation..."
   run_pre_gate_phase "$pr_num" "$worktree_path" "$triage_file" "$hook" "$validate_runner" "$log_file"
   local validation_file="$LOG_DIR/pr-$pr_num-validation.json"
   local gate_context="$LOG_DIR/pr-$pr_num-gate-context.json"
+  debug_log_file_contents "validation_result" "$validation_file"
+  debug_log_file_contents "gate_context" "$gate_context"
   echo "  Validation : $(jq -r '.summary' < "$validation_file")"
   echo "  Gate score : $(jq -r '.total_score' < "$gate_context")"
 
   # 3. Run gate model only after score threshold is met
+  debug_log "PR #$pr_num STEP 3: gate decision"
   local gate_out="$LOG_DIR/pr-$pr_num-gate.json"
   local selected_file="$LOG_DIR/pr-$pr_num-selected.txt"
   local should_run_gate
   should_run_gate="$(jq -r '.should_run_gate // false' < "$gate_context" 2>/dev/null || echo false)"
+  debug_log "PR #$pr_num: should_run_gate=$should_run_gate"
   : > "$selected_file"
 
   if [ "$should_run_gate" = "true" ]; then
     progress_set "$pr_num" gate running "$GATE_MODEL"
+    debug_log "PR #$pr_num: RUNNING gate model ($GATE_MODEL)"
     echo "  Running gate model ($GATE_MODEL)..."
     run_gate_model "$OWNER_REPO" "$pr_num" "$triage_file" "$validation_file" "$gate_context" "$gate_out" "$log_file"
     jq -r '.threads_to_fix[]?' < "$gate_out" > "$selected_file" || true
+    debug_log_file_contents "gate_output" "$gate_out"
+    debug_log "PR #$pr_num: gate selected threads: $(cat "$selected_file" 2>/dev/null | tr '\n' ' ')"
   else
     local total_score
     local gate_skipped="$LOG_DIR/pr-$pr_num-gate-skipped.json"
     total_score="$(jq -r '.total_score // 0' < "$gate_context" 2>/dev/null || echo 0)"
+    debug_log "PR #$pr_num: gate SKIPPED — total_score=$total_score < 1"
     jq -n \
       --arg reason "deterministic score below threshold ($total_score < 1)" \
       '{needs_advanced_model: false, reason: $reason, threads_to_fix: []}' > "$gate_out"
@@ -3554,8 +3653,10 @@ process_pr_sequential() {
 
   local needs_advanced
   needs_advanced="$(jq -r '.needs_advanced_model' < "$gate_out" 2>/dev/null || echo "true")"
+  debug_log "PR #$pr_num: needs_advanced=$needs_advanced"
 
   # 4. If gate says yes -> run fix model
+  debug_log "PR #$pr_num STEP 4: fix model decision"
   if [ "$needs_advanced" = "true" ]; then
     if [ ! -s "$selected_file" ] && [ "$(jq '.needs_llm | length' < "$triage_file")" -gt 0 ]; then
       jq -r '.needs_llm[]?.thread_id' < "$triage_file" > "$selected_file"
@@ -3563,10 +3664,12 @@ process_pr_sequential() {
 
     local sel_count
     sel_count="$(wc -l < "$selected_file" | tr -d ' ')"
+    debug_log "PR #$pr_num: gate=YES sel_count=$sel_count validation_failed=$(jq -r '.tests_failed' < "$validation_file")"
     echo "  Gate: YES — $sel_count thread(s) selected; validation_failed=$(jq -r '.tests_failed' < "$validation_file")"
     progress_set "$pr_num" gate done "$sel_count thread(s) selected"
 
     if [ "$DRY_RUN" = true ]; then
+      debug_log "PR #$pr_num: DRY_RUN — skipping fix model"
       echo "  [dry-run] would run advanced model on:"
       if [ -s "$selected_file" ]; then
         sed 's/^/    /' "$selected_file"
@@ -3575,18 +3678,23 @@ process_pr_sequential() {
       fi
       progress_set "$pr_num" fix skipped "dry-run"
     else
+      debug_log "PR #$pr_num: LAUNCHING fix model ($FIX_MODEL) in worktree=$worktree_path"
+      debug_log_file_contents "fix_prompt" "$LOG_DIR/fix-$pr_num.txt"
       echo "  Launching fix model ($FIX_MODEL)..."
       progress_set "$pr_num" fix running "$FIX_MODEL"
       if ! run_fix_model "$OWNER_REPO" "$pr_num" "$worktree_path" "$threads_file" "$selected_file" "$validation_file" "$log_file"; then
+        debug_log "PR #$pr_num: FIX MODEL FAILED"
         progress_set "$pr_num" fix failed "$FIX_MODEL failed"
         echo "  Fix model failed (continuing)"
       else
+        debug_log "PR #$pr_num: fix model completed successfully"
         progress_set "$pr_num" fix done "$FIX_MODEL finished"
       fi
     fi
   else
     local reason
     reason="$(jq -r '.reason // "n/a"' < "$gate_out" 2>/dev/null)"
+    debug_log "PR #$pr_num: gate=NO — reason=$reason"
     echo "  Gate: NO — advanced model not needed ($reason)"
     [ "$should_run_gate" = "true" ] && progress_set "$pr_num" gate done "$reason"
     progress_set "$pr_num" fix skipped "not needed"
@@ -3603,10 +3711,14 @@ process_pr_sequential() {
   fi
 
   # 5. Merge deterministic + LLM + gate-skipped responses
+  debug_log "PR #$pr_num STEP 5: merging responses"
   local combined="$LOG_DIR/pr-$pr_num-thread-responses.json"
   local model_responses="$worktree_path/thread-responses.json"
   local gate_skipped="$LOG_DIR/pr-$pr_num-gate-skipped.json"
   local resp_files=("$deterministic_responses")
+  debug_log "PR #$pr_num: model_responses exists=$([ -f "$model_responses" ] && echo yes || echo no)"
+  debug_log "PR #$pr_num: gate_skipped exists=$([ -f "$gate_skipped" ] && echo yes || echo no)"
+  [ -f "$model_responses" ] && debug_log_file_contents "model_responses" "$model_responses"
   [ -f "$model_responses" ] && jq -e '.' "$model_responses" >/dev/null 2>&1 && resp_files+=("$model_responses")
   [ -f "$gate_skipped" ] && jq -e '.' "$gate_skipped" >/dev/null 2>&1 && resp_files+=("$gate_skipped")
 
@@ -3622,27 +3734,34 @@ process_pr_sequential() {
     jq -s 'add' "$combined" "$uncovered" > "$combined.tmp"
     mv "$combined.tmp" "$combined"
   fi
+  debug_log_file_contents "combined_responses" "$combined"
 
   # 6. Reply and resolve
+  debug_log "PR #$pr_num STEP 6: reply and resolve (NO_RESOLVE=$NO_RESOLVE)"
   if [ "$NO_RESOLVE" = false ]; then
     progress_set "$pr_num" reply running "posting replies"
     echo "  Replying & resolving threads..."
     local resolve_result
     resolve_result="$(reply_and_resolve_from_responses "$combined")"
+    debug_log "PR #$pr_num: resolve_result=$resolve_result"
     echo "  $resolve_result"
     progress_set "$pr_num" reply done "replies posted"
   else
+    debug_log "PR #$pr_num: NO_RESOLVE — skipping"
     echo "  (--no-resolve: skipping thread resolution)"
     progress_set "$pr_num" reply skipped "disabled by flag"
   fi
 
   # 7. Remove thread-responses.json from git (prevents future merge conflicts)
+  debug_log "PR #$pr_num STEP 7: cleanup artifact"
   cleanup_thread_responses_artifact "$pr_num" "$worktree_path"
 
   # 8. Post-fix summary
+  debug_log "PR #$pr_num STEP 8: post_fix_summary"
   post_fix_summary "$pr_num" "$triage_file" "$combined" "$log_file"
 
   # 9. Request Copilot re-review
+  debug_log "PR #$pr_num STEP 9: copilot re-review"
   if [ "$DRY_RUN" = false ]; then
     progress_set "$pr_num" rereview running "requesting review"
     echo "  Requesting Copilot re-review..."
@@ -3653,8 +3772,10 @@ process_pr_sequential() {
   fi
 
   # 10. Post-fix review cycle
+  debug_log "PR #$pr_num STEP 10: post_fix_review_cycle"
   local fixed_count
   fixed_count="$(jq '[.[] | select(.action == "fixed" or .action == "already_fixed")] | length' < "$combined" 2>/dev/null || echo "0")"
+  debug_log "PR #$pr_num: fixed_count=$fixed_count NO_POST_FIX=$NO_POST_FIX REVIEW_WAIT_SECS=$REVIEW_WAIT_SECS"
   if [ "$NO_POST_FIX" = true ] || [ "$DRY_RUN" = true ]; then
     progress_set "$pr_num" postfix skipped "disabled"
   else
@@ -3666,6 +3787,7 @@ process_pr_sequential() {
   fi
 
   # 11. Write status
+  debug_log "PR #$pr_num STEP 11: COMPLETE ✓"
   echo "  ✓ PR #$pr_num complete"
   echo "OK" > "$LOG_DIR/pr-$pr_num.status"
 }
@@ -3741,6 +3863,7 @@ sem_destroy() { exec 3>&- 2>/dev/null || true; rm -f "$SEMAPHORE" 2>/dev/null ||
 # ── main ─────────────────────────────────────────────────────────────────────
 
 main() {
+  debug_log_separator "main() ENTRY — args: $*"
   load_persisted_defaults
 
   if [ "$#" -eq 0 ]; then
@@ -3755,7 +3878,16 @@ main() {
   fi
 
   LOG_DIR="$(mktemp -d /tmp/gh-crfix-XXXXXX)"
+  debug_log "LOG_DIR=$LOG_DIR"
+  debug_log "Parsed flags: OWNER_REPO=$OWNER_REPO PR_NUMBERS=$PR_NUMBERS CONCURRENCY=$CONCURRENCY"
+  debug_log "AI_BACKEND=$AI_BACKEND GATE_MODEL=$GATE_MODEL FIX_MODEL=$FIX_MODEL"
+  debug_log "DRY_RUN=$DRY_RUN SETUP_ONLY=$SETUP_ONLY NO_RESOLVE=$NO_RESOLVE NO_POST_FIX=$NO_POST_FIX"
+  debug_log "INCLUDE_OUTDATED=$INCLUDE_OUTDATED NO_AUTOFIX=$NO_AUTOFIX NO_VALIDATE=$NO_VALIDATE"
+  debug_log "RESOLVE_SKIPPED=$RESOLVE_SKIPPED MAX_THREADS=$MAX_THREADS"
+  debug_log "SCORE_NEEDS_LLM=$SCORE_NEEDS_LLM SCORE_PR_COMMENT=$SCORE_PR_COMMENT SCORE_TEST_FAILURE=$SCORE_TEST_FAILURE"
+
   verify_prereqs
+  debug_log "verify_prereqs passed"
 
   echo "Repo       : $OWNER_REPO"
   local repo_dir
@@ -3864,6 +3996,8 @@ main() {
     s="$(cat "$LOG_DIR/pr-${pr_num}.status" 2>/dev/null || echo "FAIL")"
     if [ "$s" = "OK" ]; then ok=$((ok + 1)); else fail=$((fail + 1)); fi
   done
+
+  debug_log_separator "FINAL SUMMARY: total=$total ok=$ok skipped=$skipped fail=$fail LOG_DIR=$LOG_DIR"
 
   echo ""
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
