@@ -3846,8 +3846,10 @@ process_pr() {
     if [ "$NO_RESOLVE" = false ]; then
       progress_set "$pr_num" reply running "posting replies"
       echo "[resolve] replying/resolving"
-      echo "[resolve] $(reply_and_resolve_from_responses "$combined" "$log_file")"
-      progress_set "$pr_num" reply done "replies posted"
+      local _resolve_result
+      _resolve_result="$(reply_and_resolve_from_responses "$combined" "$log_file")"
+      echo "[resolve] $_resolve_result"
+      progress_set "$pr_num" reply done "$_resolve_result"
     else
       echo "[resolve] skipped by flag"
       progress_set "$pr_num" reply skipped "disabled by flag"
@@ -4080,7 +4082,7 @@ process_pr_sequential() {
     local resolve_result
     resolve_result="$(reply_and_resolve_from_responses "$combined" "$log_file")"
     echo "  $resolve_result"
-    progress_set "$pr_num" reply done "replies posted"
+    progress_set "$pr_num" reply done "$resolve_result"
   else
     echo "  (--no-resolve: skipping thread resolution)"
     progress_set "$pr_num" reply skipped "disabled by flag"
@@ -4134,8 +4136,27 @@ print_results() {
       echo "━━━ PR #$pr_num ✓ ━━━ [$title]"
     else
       echo "━━━ PR #$pr_num ⚠ ━━━ [$title]"
+      local step
+      for step in $(progress_steps); do
+        if [ "$(progress_get_status "$pr_num" "$step")" = "failed" ]; then
+          local fail_note
+          fail_note="$(progress_get_note "$pr_num" "$step")"
+          echo "  ✗ $(progress_label "$step")${fail_note:+: $fail_note}"
+          break
+        fi
+      done
     fi
-    cat "$log_file" 2>/dev/null || true
+
+    local note
+    note="$(progress_get_note "$pr_num" filter_threads)"
+    [ -n "$note" ] && echo "  • triage  : $note"
+    note="$(progress_get_note "$pr_num" gate)"
+    [ -n "$note" ] && echo "  • gate    : $note"
+    note="$(progress_get_note "$pr_num" fix)"
+    [ -n "$note" ] && echo "  • fix     : $note"
+    note="$(progress_get_note "$pr_num" reply)"
+    [ -n "$note" ] && echo "  • resolve : $note"
+    echo "  • log     : $log_file"
   done
 }
 
