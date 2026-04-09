@@ -21,6 +21,7 @@ setup() {
   for branch in pr-branch-1 pr-branch-2 pr-branch-3; do
     git checkout -q -b "$branch"
     touch "$branch-file"
+    touch "file.ts"
     git add .
     git commit -q -m "commit on $branch"
     git checkout -q master 2>/dev/null || git checkout -q main

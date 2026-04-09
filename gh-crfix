@@ -3486,9 +3486,9 @@ setup_all() {
   local pids=""
   for pr_num in $PR_NUMBERS; do
     (
+      trap 'sem_release' EXIT
       sem_acquire
       setup_pr "$repo_dir" "$pr_num"
-      sem_release
     ) &
     pids="${pids:+$pids }$!"
   done
@@ -3556,7 +3556,6 @@ setup_all() {
       kv_append skipped "$pr_num"
       continue
     fi
-
 
     echo "  Threads total      : $thread_count"
     echo "  Worktree           : $worktree_path"
@@ -4136,6 +4135,7 @@ main() {
     return 0
   fi
 
+  [ "$AI_BACKEND" = "auto" ] && resolve_ai_backend
   echo "AI backend : $AI_BACKEND"
 
   echo ""
