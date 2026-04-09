@@ -931,7 +931,7 @@ setup_worktree_serialized() {
       fi
       sleep 0.1
     done
-    printf '%s\n' "$BASHPID" > "$lock_dir/pid"
+    printf '%s\n' "${BASHPID:-$$}" > "$lock_dir/pid"
     trap 'rm -rf "$lock_dir" 2>/dev/null || true' EXIT INT TERM
     setup_worktree "$pr_num" "$repo_dir" "$branch"
   )
@@ -3509,6 +3509,11 @@ setup_pr() {
 
     local worktree_path
     worktree_path="$(setup_worktree_serialized "$pr_num" "$repo_dir" "$branch")"
+    if [ -z "$worktree_path" ]; then
+      kv_set "$pr_num" setup_reason "worktree setup failed (empty path)"
+      progress_mark_remaining "$pr_num" failed "worktree setup failed"
+      return 0
+    fi
     kv_set "$pr_num" worktree "$worktree_path"
 
     local dirty_status
