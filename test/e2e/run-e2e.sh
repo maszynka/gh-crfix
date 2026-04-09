@@ -15,7 +15,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 GHCRFIX="$SCRIPT_DIR/../../gh-crfix"
 FIXTURE_REPO="${FIXTURE_REPO:-maszynka/gh-crfix-e2e-fixtures}"
-FIXTURE_DIR="${FIXTURE_DIR:-$SCRIPT_DIR/../../fixture-repo}"
+# Resolve FIXTURE_DIR to an absolute path so cd stays consistent throughout
+_raw_fixture="${FIXTURE_DIR:-$SCRIPT_DIR/../../fixture-repo}"
+FIXTURE_DIR="$(cd "$_raw_fixture" 2>/dev/null && pwd || echo "$_raw_fixture")"
 E2E_BRANCH="e2e-test-$(date +%s)-$$"
 PR_NUMBER=""
 MAIN_SHA_BEFORE=""  # saved so cleanup can restore main
@@ -40,12 +42,20 @@ cleanup() {
   fi
   git -C "$FIXTURE_DIR" push origin --delete "$E2E_BRANCH" 2>/dev/null || true
 
-  # Restore main to pre-test state (undo the conflict commit we pushed)
+  # Restore main to pre-test state by reverting any commits we added
   if [ -n "${MAIN_SHA_BEFORE:-}" ]; then
-    echo "Restoring main to $MAIN_SHA_BEFORE..."
+    echo "Restoring main (reverting conflict commit)..."
     git -C "$FIXTURE_DIR" fetch origin main 2>/dev/null || true
-    git -C "$FIXTURE_DIR" push origin "${MAIN_SHA_BEFORE}:refs/heads/main" --force 2>/dev/null \
-      || echo "  (could not restore main — may need manual cleanup)"
+    # Discard any working-tree drift before switching branches
+    git -C "$FIXTURE_DIR" reset --hard HEAD 2>/dev/null || true
+    git -C "$FIXTURE_DIR" checkout main 2>/dev/null || true
+    git -C "$FIXTURE_DIR" reset --hard origin/main 2>/dev/null || true
+    CURRENT_MAIN="$(git -C "$FIXTURE_DIR" rev-parse HEAD 2>/dev/null || echo "")"
+    if [ -n "$CURRENT_MAIN" ] && [ "$CURRENT_MAIN" != "$MAIN_SHA_BEFORE" ]; then
+      git -C "$FIXTURE_DIR" revert "$CURRENT_MAIN" --no-edit 2>/dev/null \
+        && git -C "$FIXTURE_DIR" push origin main 2>/dev/null \
+        || echo "  (revert failed — manual cleanup may be needed: git -C $FIXTURE_DIR revert HEAD)"
+    fi
   fi
 
   # Remove any stale gh-crfix worktrees inside the fixture repo
@@ -81,13 +91,26 @@ echo "Main is at $MAIN_SHA_BEFORE"
 git checkout -b "$E2E_BRANCH"
 
 # Bug 1: typo in parameter name  (format_name in utils.py)
-sed -i 's/first_name/frist_name/g' src/utils.py
+python3 - <<'PYEOF'
+f = 'src/utils.py'
+c = open(f).read().replace('first_name', 'frist_name')
+open(f, 'w').write(c)
+PYEOF
 
-# Bug 2: unused import added     (utils.py)
-sed -i '3a import sys' src/utils.py
+# Bug 2: unused import added     (utils.py) — insert after "import os" (line 3)
+python3 - <<'PYEOF'
+f = 'src/utils.py'
+lines = open(f).readlines()
+lines.insert(3, 'import sys\n')
+open(f, 'w').writelines(lines)
+PYEOF
 
 # Bug 3: wrong comparison operator  (validator.js — isPositiveNumber)
-sed -i 's/value > 0/value >= 0/' src/validator.js
+python3 - <<'PYEOF'
+f = 'src/validator.js'
+c = open(f).read().replace('value > 0', 'value >= 0', 1)
+open(f, 'w').write(c)
+PYEOF
 
 # Bug 4: new file added on this branch — main will add a conflicting version
 cat > src/config.py << 'PYEOF'
@@ -129,27 +152,31 @@ gh api "repos/$FIXTURE_REPO/pulls/$PR_NUMBER/reviews" \
   --input - <<EOF
 {
   "commit_id": "$COMMIT_OID",
-  "event": "REQUEST_CHANGES",
+  "event": "COMMENT",
   "body": "Several issues to fix before this can merge.",
   "comments": [
     {
       "path": "src/utils.py",
       "line": 15,
-      "body": "Typo: \`frist_name\` should be \`first_name\`. Fix the parameter name and the f-string."
+      "side": "RIGHT",
+      "body": "The parameter is named \`frist_name\` but should be \`first_name\` — this breaks the f-string interpolation and any callers using the function. Please rename it everywhere in the function signature and body."
     },
     {
       "path": "src/utils.py",
       "line": 4,
-      "body": "Unused import: \`sys\` is imported but never used. Please remove it."
+      "side": "RIGHT",
+      "body": "The \`sys\` module is imported on line 4 but never referenced anywhere in this file. Please remove it to keep the module imports clean."
     },
     {
       "path": "src/validator.js",
       "line": 11,
+      "side": "RIGHT",
       "body": "\`isPositiveNumber(0)\` now incorrectly returns true. Zero is not positive — use strict \`>\` instead of \`>=\`."
     },
     {
       "path": "src/config.py",
       "line": 2,
+      "side": "RIGHT",
       "body": "DEFAULT_TIMEOUT should be 60 seconds to match the production default, not 30."
     }
   ]
@@ -191,7 +218,10 @@ echo ""
 
 echo "=== Step 6: Running gh crfix ==="
 cd "$FIXTURE_DIR"
-bash "$GHCRFIX" "https://github.com/$FIXTURE_REPO/pull/$PR_NUMBER" \
+# GH_CRFIX_DIR tells gh crfix exactly where the local checkout of the fixture
+# repo lives (avoids the auto-detection heuristic scanning the filesystem)
+GH_CRFIX_DIR="$FIXTURE_DIR" bash "$GHCRFIX" \
+  "https://github.com/$FIXTURE_REPO/pull/$PR_NUMBER" \
   --seq --no-tui --no-post-fix
 echo ""
 
@@ -201,7 +231,9 @@ echo "=== Step 7: Verifying ==="
 cd "$FIXTURE_DIR"
 git fetch origin "$E2E_BRANCH"
 git checkout "$E2E_BRANCH"
-git pull --rebase origin "$E2E_BRANCH"
+# Hard-reset to origin: the linked worktree may have committed to the same branch,
+# advancing HEAD while the main worktree's files stayed at the old version.
+git reset --hard "origin/$E2E_BRANCH"
 
 PASS=0; FAIL=0
 check() {
@@ -261,7 +293,7 @@ UNRESOLVED=$(gh api graphql -f query='
 
 # [7] Log files were created and contain useful content
 LAST_RUN_LOG="$HOME/.gh-crfix/last-run/run.log"
-([ -f "$LAST_RUN_LOG" ] && grep -q '\[process-pr\]' "$LAST_RUN_LOG") \
+([ -f "$LAST_RUN_LOG" ] && grep -qE '\[process-pr' "$LAST_RUN_LOG") \
   && check 7 "master log written to $LAST_RUN_LOG" pass \
   || check 7 "master log missing or empty at $LAST_RUN_LOG" fail
 
