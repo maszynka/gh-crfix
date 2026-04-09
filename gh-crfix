@@ -1941,7 +1941,7 @@ fix_committed_conflict_markers() {
     [ -z "$conflict_files" ] && return 0
 
     local count
-    count="$(echo "$conflict_files" | grep -c .)"
+    count="$(echo "$conflict_files" | wc -l | tr -d ' ')"
     echo "[conflict-markers] $count file(s) with committed conflict markers: $(echo "$conflict_files" | tr '\n' ' ')"
     progress_set "$pr_num" resolve_conflicts running "fixing $count committed conflict marker(s)"
 
