@@ -3659,12 +3659,14 @@ setup_all() {
 
     if [ "$setup_status" != "ready" ]; then
       echo "  ⚠ $setup_reason — skipping"
+      echo "  Log: $LOG_DIR/pr-$pr_num.log"
       kv_append skipped "$pr_num"
       continue
     fi
 
     echo "  Threads total      : $thread_count"
     echo "  Worktree           : $worktree_path"
+    echo "  Log                : $LOG_DIR/pr-$pr_num.log"
     [ "$(kv_get "$pr_num" has_case_collisions)" = "true" ] && \
       echo "  Case collisions    : detected (will normalize in worker)"
 
@@ -4155,9 +4157,8 @@ cleanup() {
     TUI_ACTIVE=false
   fi
   sem_destroy 2>/dev/null || true
-  if [ -n "$LOG_DIR" ] && [ -d "$LOG_DIR" ]; then
-    rm -rf "$LOG_DIR"
-  fi
+  # Log dir is intentionally NOT deleted — logs persist at $LOG_DIR for post-run inspection.
+  # A symlink ~/.gh-crfix/last-run always points to the most recent run.
 }
 
 cleanup_sigint() {
@@ -4208,6 +4209,10 @@ main() {
 
   LOG_DIR="$(mktemp -d /tmp/gh-crfix-XXXXXX)"
   MASTER_LOG="$LOG_DIR/run.log"
+  # Keep a symlink so the user can always find the last run's logs
+  local crfix_state_dir="$HOME/.gh-crfix"
+  mkdir -p "$crfix_state_dir"
+  ln -sfn "$LOG_DIR" "$crfix_state_dir/last-run" 2>/dev/null || true
   verify_prereqs
 
   echo "Repo       : $OWNER_REPO"
@@ -4256,10 +4261,13 @@ main() {
   for _ in $(kv_list skipped); do skipped=$((skipped + 1)); done
 
   if [ "$ready" -eq 0 ]; then
+    mlog "[done] nothing to process: ready=0 skipped=$skipped total=$total"
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "  Done — $total PR(s), nothing to process."
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  Logs  : $LOG_DIR"
+    echo "  (~/.gh-crfix/last-run → $LOG_DIR)"
     return 0
   fi
 
@@ -4330,10 +4338,13 @@ main() {
     if [ "$s" = "OK" ]; then ok=$((ok + 1)); else fail=$((fail + 1)); fi
   done
 
+  mlog "[done] total=$total ok=$ok skipped=$skipped fail=$fail"
   echo ""
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo "  Done — $total PR(s): $ok fixed, $skipped skipped, $fail failed"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  Logs  : $LOG_DIR"
+  echo "  (~/.gh-crfix/last-run → $LOG_DIR)"
 
   # Terminal bell + macOS notification
   printf '\a'
