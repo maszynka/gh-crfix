@@ -3486,9 +3486,9 @@ setup_all() {
   local pids=""
   for pr_num in $PR_NUMBERS; do
     (
+      trap 'sem_release' EXIT
       sem_acquire
       setup_pr "$repo_dir" "$pr_num"
-      sem_release
     ) &
     pids="${pids:+$pids }$!"
   done
