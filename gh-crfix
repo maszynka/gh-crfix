@@ -928,6 +928,11 @@ setup_worktree_serialized() {
           rm -rf "$lock_dir" 2>/dev/null || true
           continue
         fi
+      else
+        # No pid file — either a crash between mkdir and printf, or an
+        # interrupted run. Wait one tick; if still empty it's stale.
+        sleep 0.15
+        [ ! -f "$lock_dir/pid" ] && { rm -rf "$lock_dir" 2>/dev/null || true; continue; }
       fi
       sleep 0.1
     done
