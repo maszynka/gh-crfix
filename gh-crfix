@@ -937,10 +937,19 @@ setup_worktree_serialized() {
           continue
         fi
       else
-        # No pid file — either a crash between mkdir and printf, or an
-        # interrupted run. Wait one tick; if still empty it's stale.
-        sleep 0.15
-        [ ! -f "$lock_dir/pid" ] && { rm -rf "$lock_dir" 2>/dev/null || true; continue; }
+        # No pid file. Only evict if the lock dir itself is older than 5 s —
+        # the mkdir→printf window is measured in milliseconds even under load,
+        # so 5 s is safe while still recovering from crashes or interrupted runs.
+        local _now _mtime _age
+        _now="$(date +%s 2>/dev/null)" || _now=0
+        _mtime="$(stat -f %m "$lock_dir" 2>/dev/null \
+               || stat -c %Y "$lock_dir" 2>/dev/null \
+               || echo "$_now")"
+        _age=$(( _now - _mtime )) 2>/dev/null || _age=0
+        if [ "${_age:-0}" -ge 5 ] 2>/dev/null; then
+          rm -rf "$lock_dir" 2>/dev/null || true
+          continue
+        fi
       fi
       sleep 0.1
     done

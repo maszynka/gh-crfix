@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # E2E test for gh-crfix
 #
-# Creates a PR with intentional bugs + review comments in a fixture repo,
-# runs gh crfix to fix them, verifies the fixes were applied.
+# Creates a real PR with intentional bugs + review comments + a merge conflict,
+# runs gh crfix, then verifies the fixes were applied, threads resolved, and
+# conflict markers are gone.
 #
-# Requires: gh (authenticated), claude CLI, ANTHROPIC_API_KEY
+# Requires: gh (authenticated with E2E_GH_TOKEN), claude CLI, ANTHROPIC_API_KEY
+#
+# Usage (local):
+#   FIXTURE_DIR=/path/to/gh-crfix-e2e-fixtures bash test/e2e/run-e2e.sh
+# Usage (CI): invoked by .github/workflows/e2e.yml — all env vars set there.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -13,11 +18,12 @@ FIXTURE_REPO="${FIXTURE_REPO:-maszynka/gh-crfix-e2e-fixtures}"
 FIXTURE_DIR="${FIXTURE_DIR:-$SCRIPT_DIR/../../fixture-repo}"
 E2E_BRANCH="e2e-test-$(date +%s)-$$"
 PR_NUMBER=""
+MAIN_SHA_BEFORE=""  # saved so cleanup can restore main
 
 echo "=== gh-crfix E2E Test ==="
-echo "Script:  $GHCRFIX"
-echo "Fixture: $FIXTURE_REPO"
-echo "Branch:  $E2E_BRANCH"
+echo "Script : $GHCRFIX"
+echo "Fixture: $FIXTURE_REPO  ($FIXTURE_DIR)"
+echo "Branch : $E2E_BRANCH"
 echo ""
 
 # ── Cleanup (always runs) ────────────────────────────────────────────────────
@@ -26,50 +32,75 @@ cleanup() {
   local exit_code=$?
   echo ""
   echo "=== Cleanup ==="
+
+  # Close PR and delete test branch
   if [ -n "${PR_NUMBER:-}" ]; then
     echo "Closing PR #$PR_NUMBER..."
-    gh pr close "$PR_NUMBER" --repo "$FIXTURE_REPO" --delete-branch 2>/dev/null || true
+    gh pr close "$PR_NUMBER" --repo "$FIXTURE_REPO" 2>/dev/null || true
   fi
-  if [ -n "${E2E_BRANCH:-}" ]; then
-    git -C "$FIXTURE_DIR" push origin --delete "$E2E_BRANCH" 2>/dev/null || true
+  git -C "$FIXTURE_DIR" push origin --delete "$E2E_BRANCH" 2>/dev/null || true
+
+  # Restore main to pre-test state (undo the conflict commit we pushed)
+  if [ -n "${MAIN_SHA_BEFORE:-}" ]; then
+    echo "Restoring main to $MAIN_SHA_BEFORE..."
+    git -C "$FIXTURE_DIR" fetch origin main 2>/dev/null || true
+    git -C "$FIXTURE_DIR" push origin "${MAIN_SHA_BEFORE}:refs/heads/main" --force 2>/dev/null \
+      || echo "  (could not restore main — may need manual cleanup)"
   fi
+
+  # Remove any stale gh-crfix worktrees inside the fixture repo
+  git -C "$FIXTURE_DIR" worktree prune 2>/dev/null || true
+  rm -rf "$FIXTURE_DIR/.gh-crfix" 2>/dev/null || true
+
   echo "Cleanup done."
   exit $exit_code
 }
 trap cleanup EXIT
 
-# ── Preflight checks ─────────────────────────────────────────────────────────
+# ── Preflight ────────────────────────────────────────────────────────────────
 
 echo "=== Preflight ==="
-command -v gh >/dev/null || { echo "FAIL: gh CLI not found"; exit 1; }
+command -v gh     >/dev/null || { echo "FAIL: gh CLI not found";     exit 1; }
 command -v claude >/dev/null || { echo "FAIL: claude CLI not found"; exit 1; }
-command -v jq >/dev/null || { echo "FAIL: jq not found"; exit 1; }
-[ -x "$GHCRFIX" ] || { echo "FAIL: $GHCRFIX not found or not executable"; exit 1; }
+command -v jq     >/dev/null || { echo "FAIL: jq not found";         exit 1; }
+[ -x "$GHCRFIX" ] || { echo "FAIL: $GHCRFIX not executable"; exit 1; }
 [ -d "$FIXTURE_DIR/.git" ] || { echo "FAIL: $FIXTURE_DIR is not a git repo"; exit 1; }
 echo "All checks passed."
 echo ""
 
-# ── Step 1: Create branch with bugs ──────────────────────────────────────────
+# ── Step 1: Create PR branch with intentional bugs ──────────────────────────
 
 echo "=== Step 1: Creating buggy branch ==="
 cd "$FIXTURE_DIR"
+git fetch origin
 git checkout main
-git pull --rebase origin main
+git reset --hard origin/main
+MAIN_SHA_BEFORE="$(git rev-parse HEAD)"
+echo "Main is at $MAIN_SHA_BEFORE"
+
 git checkout -b "$E2E_BRANCH"
 
-# Bug 1: typo in variable name (Python)
+# Bug 1: typo in parameter name  (format_name in utils.py)
 sed -i 's/first_name/frist_name/g' src/utils.py
 
-# Bug 2: unused import (Python)
+# Bug 2: unused import added     (utils.py)
 sed -i '3a import sys' src/utils.py
 
-# Bug 3: wrong comparison operator (JS)
+# Bug 3: wrong comparison operator  (validator.js — isPositiveNumber)
 sed -i 's/value > 0/value >= 0/' src/validator.js
 
+# Bug 4: new file added on this branch — main will add a conflicting version
+cat > src/config.py << 'PYEOF'
+# Application configuration
+DEFAULT_TIMEOUT = 30
+MAX_RETRIES = 5
+DEBUG = False
+PYEOF
+
 git add -A
-git commit -m "chore: introduce test bugs for E2E"
+git commit -m "chore: introduce test bugs for E2E (${E2E_BRANCH})"
 git push -u origin "$E2E_BRANCH"
-echo "Branch pushed."
+echo "Branch pushed: $E2E_BRANCH"
 echo ""
 
 # ── Step 2: Open PR ──────────────────────────────────────────────────────────
@@ -81,20 +112,17 @@ PR_URL=$(gh pr create \
   --base main \
   --title "E2E test $(date +%Y-%m-%d-%H%M%S)" \
   --body "Automated E2E test for gh-crfix. Will be cleaned up automatically.")
-
-PR_NUMBER=$(echo "$PR_URL" | grep -oE '[0-9]+$')
+PR_NUMBER="${PR_URL##*/}"
 echo "PR created: #$PR_NUMBER ($PR_URL)"
 echo ""
 
-# ── Step 3: Add review comments ──────────────────────────────────────────────
+# ── Step 3: Add review comments ─────────────────────────────────────────────
 
 echo "=== Step 3: Adding review comments ==="
-
-# Wait a moment for GitHub to process the PR
-sleep 3
+sleep 3  # let GitHub process the PR
 
 COMMIT_OID=$(gh api "repos/$FIXTURE_REPO/pulls/$PR_NUMBER" --jq '.head.sha')
-echo "Head commit: $COMMIT_OID"
+echo "Head SHA: $COMMIT_OID"
 
 gh api "repos/$FIXTURE_REPO/pulls/$PR_NUMBER/reviews" \
   --method POST \
@@ -102,95 +130,124 @@ gh api "repos/$FIXTURE_REPO/pulls/$PR_NUMBER/reviews" \
 {
   "commit_id": "$COMMIT_OID",
   "event": "REQUEST_CHANGES",
-  "body": "Please fix these issues.",
+  "body": "Several issues to fix before this can merge.",
   "comments": [
     {
       "path": "src/utils.py",
       "line": 15,
-      "body": "Typo: \`frist_name\` should be \`first_name\`"
+      "body": "Typo: \`frist_name\` should be \`first_name\`. Fix the parameter name and the f-string."
     },
     {
       "path": "src/utils.py",
       "line": 4,
-      "body": "Unused import: \`sys\` is imported but never used. Remove it."
+      "body": "Unused import: \`sys\` is imported but never used. Please remove it."
     },
     {
       "path": "src/validator.js",
       "line": 11,
-      "body": "\`isPositiveNumber(0)\` returns \`true\` but zero is not positive. Use strict \`>\` not \`>=\`."
+      "body": "\`isPositiveNumber(0)\` now incorrectly returns true. Zero is not positive — use strict \`>\` instead of \`>=\`."
+    },
+    {
+      "path": "src/config.py",
+      "line": 2,
+      "body": "DEFAULT_TIMEOUT should be 60 seconds to match the production default, not 30."
     }
   ]
 }
 EOF
-
-echo "Review comments posted."
+echo "Review posted."
 echo ""
 
-# ── Step 4: Record pre-fix state ─────────────────────────────────────────────
+# ── Step 4: Advance main with a conflicting change ──────────────────────────
 
-echo "=== Step 4: Recording pre-fix state ==="
+echo "=== Step 4: Advancing main (creating merge conflict) ==="
+git checkout main
+git reset --hard origin/main
+
+# main adds src/config.py with different values — conflicts with the PR branch
+cat > src/config.py << 'PYEOF'
+# Application configuration (production defaults)
+DEFAULT_TIMEOUT = 60
+MAX_RETRIES = 3
+DEBUG = False
+ENVIRONMENT = "production"
+PYEOF
+
+git add src/config.py
+git commit -m "chore: add production config defaults (E2E conflict commit)"
+git push origin main
+echo "Main advanced — $(git rev-parse HEAD)"
+git checkout "$E2E_BRANCH"
+echo ""
+
+# ── Step 5: Record pre-fix state ────────────────────────────────────────────
+
+echo "=== Step 5: Recording pre-fix state ==="
 PRE_FIX_SHA="$COMMIT_OID"
 echo "Pre-fix SHA: $PRE_FIX_SHA"
 echo ""
 
-# ── Step 5: Run gh crfix ─────────────────────────────────────────────────────
+# ── Step 6: Run gh crfix ─────────────────────────────────────────────────────
 
-echo "=== Step 5: Running gh crfix ==="
+echo "=== Step 6: Running gh crfix ==="
 cd "$FIXTURE_DIR"
 bash "$GHCRFIX" "https://github.com/$FIXTURE_REPO/pull/$PR_NUMBER" \
   --seq --no-tui --no-post-fix
 echo ""
 
-# ── Step 6: Verify fixes ─────────────────────────────────────────────────────
+# ── Step 7: Verify ──────────────────────────────────────────────────────────
 
-echo "=== Step 6: Verifying fixes ==="
+echo "=== Step 7: Verifying ==="
 cd "$FIXTURE_DIR"
 git fetch origin "$E2E_BRANCH"
 git checkout "$E2E_BRANCH"
 git pull --rebase origin "$E2E_BRANCH"
 
-FAILURES=0
-TOTAL=5
+PASS=0; FAIL=0
+check() {
+  local num="$1" desc="$2" result="$3"
+  if [ "$result" = "pass" ]; then
+    echo "  PASS [$num] $desc"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL [$num] $desc"
+    FAIL=$((FAIL + 1))
+  fi
+}
 
-# Check 1: New commit was pushed
+# [1] New commit was pushed
 POST_FIX_SHA=$(gh api "repos/$FIXTURE_REPO/pulls/$PR_NUMBER" --jq '.head.sha')
-if [ "$PRE_FIX_SHA" != "$POST_FIX_SHA" ]; then
-  echo "PASS [1/5]: New commit pushed ($PRE_FIX_SHA -> $POST_FIX_SHA)"
-else
-  echo "FAIL [1/5]: No new commit was pushed"
-  FAILURES=$((FAILURES + 1))
-fi
+[ "$PRE_FIX_SHA" != "$POST_FIX_SHA" ] \
+  && check 1 "new commit pushed ($POST_FIX_SHA)" pass \
+  || check 1 "new commit pushed — SHA unchanged, no commit was made" fail
 
-# Check 2: Typo fixed
-if grep -q 'first_name' src/utils.py && ! grep -q 'frist_name' src/utils.py; then
-  echo "PASS [2/5]: Typo fixed (frist_name -> first_name)"
-else
-  echo "FAIL [2/5]: Typo not fixed"
-  FAILURES=$((FAILURES + 1))
-fi
+# [2] Typo fixed in utils.py
+(grep -q 'first_name' src/utils.py && ! grep -q 'frist_name' src/utils.py) \
+  && check 2 "typo fixed (frist_name → first_name)" pass \
+  || check 2 "typo still present or first_name missing" fail
 
-# Check 3: Unused import removed
-if ! grep -q '^import sys' src/utils.py; then
-  echo "PASS [3/5]: Unused import removed"
-else
-  echo "FAIL [3/5]: Unused import still present"
-  FAILURES=$((FAILURES + 1))
-fi
+# [3] Unused import removed
+! grep -qE '^import sys' src/utils.py \
+  && check 3 "unused import sys removed" pass \
+  || check 3 "unused 'import sys' still present" fail
 
-# Check 4: Comparison operator fixed
-if grep -q 'value > 0' src/validator.js && ! grep -q 'value >= 0' src/validator.js; then
-  echo "PASS [4/5]: Comparison operator fixed (>= -> >)"
-else
-  echo "FAIL [4/5]: Comparison operator not fixed"
-  FAILURES=$((FAILURES + 1))
-fi
+# [4] Comparison operator fixed
+(grep -q 'value > 0' src/validator.js && ! grep -q 'value >= 0' src/validator.js) \
+  && check 4 "comparison fixed (>= → >)" pass \
+  || check 4 "comparison operator not fixed" fail
 
-# Check 5: Review threads resolved
+# [5] No conflict markers in any file
+CONFLICT_FILES="$(grep -rls '<<<<<<' src/ 2>/dev/null || true)"
+[ -z "$CONFLICT_FILES" ] \
+  && check 5 "no conflict markers in src/" pass \
+  || check 5 "conflict markers still present in: $CONFLICT_FILES" fail
+
+# [6] Review threads resolved
 UNRESOLVED=$(gh api graphql -f query='
   query($owner: String!, $repo: String!, $pr: Int!) {
     repository(owner: $owner, name: $repo) {
       pullRequest(number: $pr) {
-        reviewThreads(first: 10) {
+        reviewThreads(first: 20) {
           nodes { isResolved }
         }
       }
@@ -198,25 +255,20 @@ UNRESOLVED=$(gh api graphql -f query='
   }
 ' -F owner="${FIXTURE_REPO%%/*}" -F repo="${FIXTURE_REPO##*/}" -F pr="$PR_NUMBER" \
   --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length')
+[ "$UNRESOLVED" -eq 0 ] \
+  && check 6 "all review threads resolved" pass \
+  || check 6 "$UNRESOLVED review thread(s) still unresolved" fail
 
-if [ "$UNRESOLVED" -eq 0 ]; then
-  echo "PASS [5/5]: All review threads resolved"
-else
-  RESOLVED=$((3 - UNRESOLVED))
-  if [ "$RESOLVED" -gt 0 ]; then
-    echo "PASS [5/5]: $RESOLVED/3 threads resolved ($UNRESOLVED remaining)"
-  else
-    echo "FAIL [5/5]: No review threads resolved ($UNRESOLVED unresolved)"
-    FAILURES=$((FAILURES + 1))
-  fi
-fi
+# [7] Log files were created and contain useful content
+LAST_RUN_LOG="$HOME/.gh-crfix/last-run/run.log"
+([ -f "$LAST_RUN_LOG" ] && grep -q '\[process-pr\]' "$LAST_RUN_LOG") \
+  && check 7 "master log written to $LAST_RUN_LOG" pass \
+  || check 7 "master log missing or empty at $LAST_RUN_LOG" fail
 
-# ── Result ────────────────────────────────────────────────────────────────────
+# ── Result ───────────────────────────────────────────────────────────────────
 
+TOTAL=$((PASS + FAIL))
 echo ""
-echo "=== E2E Results: $((TOTAL - FAILURES))/$TOTAL checks passed ==="
-if [ "$FAILURES" -gt 0 ]; then
-  echo "FAILED"
-  exit 1
-fi
+echo "=== E2E Result: $PASS/$TOTAL passed ==="
+[ "$FAIL" -gt 0 ] && { echo "FAILED"; exit 1; }
 echo "ALL PASSED"
