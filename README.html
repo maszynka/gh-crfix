@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>gh crfix — how it works</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface2: #1c2128;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --blue: #58a6ff;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --orange: #db6d28;
+    --red: #f85149;
+    --purple: #bc8cff;
+    --cyan: #39d3f5;
+    --pink: #f78166;
+    --accent: #1f6feb;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); line-height: 1.6; }
+
+  /* ── layout ── */
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 48px 24px; }
+  h1 { font-size: 2rem; font-weight: 700; margin-bottom: 6px; }
+  h2 { font-size: 1.2rem; font-weight: 600; margin-bottom: 16px; color: var(--blue); letter-spacing: .03em; }
+  h3 { font-size: .95rem; font-weight: 600; margin-bottom: 8px; }
+  p  { color: var(--muted); font-size: .9rem; }
+  section { margin-bottom: 64px; }
+  code { font-family: "SFMono-Regular", Consolas, monospace; font-size: .85em; background: var(--surface2); border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px; color: var(--cyan); }
+
+  /* ── hero ── */
+  .hero { text-align: center; padding: 60px 0 48px; }
+  .hero h1 { font-size: 2.8rem; }
+  .hero p { font-size: 1.05rem; margin-top: 10px; }
+  .badge { display: inline-flex; align-items: center; gap: 6px; background: var(--surface); border: 1px solid var(--border); border-radius: 20px; padding: 4px 14px; font-size: .8rem; margin: 6px 4px; color: var(--muted); }
+  .badge-green { border-color: var(--green); color: var(--green); }
+  .badge-blue  { border-color: var(--blue);  color: var(--blue);  }
+  .badge-purple{ border-color: var(--purple);color: var(--purple);}
+  .badges { margin-top: 16px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; display: inline-block; }
+
+  /* ── install box ── */
+  .install-box { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px 24px; margin-top: 28px; display: inline-block; text-align: left; }
+  .install-box pre { font-family: "SFMono-Regular", Consolas, monospace; font-size: .87rem; color: var(--green); line-height: 1.9; }
+  .install-box pre .comment { color: var(--muted); }
+  .install-box pre .cmd { color: var(--cyan); }
+
+  /* ── pipeline ── */
+  .pipeline { display: flex; flex-direction: column; gap: 0; }
+  .pipe-row { display: flex; align-items: stretch; gap: 0; }
+  .pipe-phase-label {
+    writing-mode: vertical-rl; text-orientation: mixed; transform: rotate(180deg);
+    font-size: .7rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--muted); background: var(--surface2); border: 1px solid var(--border);
+    border-right: none; border-radius: 8px 0 0 8px; padding: 12px 6px;
+    display: flex; align-items: center; justify-content: center; min-width: 32px;
+  }
+  .pipe-phase-label.phase1 { color: var(--blue); border-color: var(--blue); }
+  .pipe-phase-label.phase2 { color: var(--purple); border-color: var(--purple); }
+  .pipe-steps { display: flex; flex-wrap: wrap; gap: 8px; padding: 14px; background: var(--surface); border: 1px solid var(--border); border-radius: 0 8px 8px 0; flex: 1; align-items: center; }
+  .step {
+    display: flex; flex-direction: column; align-items: center;
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 14px; min-width: 120px; text-align: center;
+    font-size: .8rem; gap: 4px; position: relative;
+  }
+  .step .icon { font-size: 1.3rem; }
+  .step .label { font-weight: 600; color: var(--text); }
+  .step .sub   { color: var(--muted); font-size: .72rem; }
+  .step.blue   { border-color: var(--blue);   box-shadow: 0 0 0 1px var(--blue)20; }
+  .step.green  { border-color: var(--green);  box-shadow: 0 0 0 1px var(--green)20; }
+  .step.yellow { border-color: var(--yellow); box-shadow: 0 0 0 1px var(--yellow)20; }
+  .step.orange { border-color: var(--orange); box-shadow: 0 0 0 1px var(--orange)20; }
+  .step.purple { border-color: var(--purple); box-shadow: 0 0 0 1px var(--purple)20; }
+  .step.cyan   { border-color: var(--cyan);   box-shadow: 0 0 0 1px var(--cyan)20; }
+  .step.red    { border-color: var(--red);    box-shadow: 0 0 0 1px var(--red)20; }
+  .arrow { color: var(--muted); font-size: 1.2rem; align-self: center; flex-shrink: 0; }
+  .pipe-between { display: flex; justify-content: center; padding: 2px 0 2px 32px; }
+  .pipe-down { color: var(--muted); font-size: 1.1rem; padding: 2px 0; }
+
+  /* ── triage grid ── */
+  .triage-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  .triage-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  .triage-card h3 { font-size: .85rem; margin-bottom: 6px; }
+  .triage-card p  { font-size: .78rem; }
+  .tc-skip   { border-color: var(--muted);   }
+  .tc-auto   { border-color: var(--green);   }
+  .tc-fixed  { border-color: var(--blue);    }
+  .tc-llm    { border-color: var(--purple);  }
+  .tc-skip  h3 { color: var(--muted);  }
+  .tc-auto  h3 { color: var(--green);  }
+  .tc-fixed h3 { color: var(--blue);   }
+  .tc-llm   h3 { color: var(--purple); }
+  .triage-examples { font-size: .72rem; margin-top: 8px; color: var(--muted); border-top: 1px solid var(--border); padding-top: 8px; }
+  .triage-examples span { display: block; padding: 1px 0; }
+
+  /* ── score threshold ── */
+  .score-row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .score-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; flex: 1; min-width: 200px; }
+  .score-card h3 { font-size: .85rem; color: var(--yellow); margin-bottom: 8px; }
+  .score-item { display: flex; justify-content: space-between; font-size: .82rem; padding: 3px 0; border-bottom: 1px dashed var(--border); }
+  .score-item:last-child { border: none; }
+  .score-item .val { color: var(--cyan); font-family: monospace; }
+  .score-result { background: var(--surface2); border: 1px solid var(--green); border-radius: 8px; padding: 16px 20px; flex: 1; min-width: 200px; font-size: .85rem; }
+  .score-result .threshold { font-size: 1.4rem; font-weight: 700; color: var(--green); font-family: monospace; display: block; margin: 6px 0; }
+  .score-result p { color: var(--muted); font-size: .78rem; margin-top: 6px; }
+
+  /* ── gate flow ── */
+  .gate-flow { display: flex; align-items: center; gap: 0; flex-wrap: wrap; }
+  .gate-box { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px 18px; font-size: .82rem; }
+  .gate-box.active { border-color: var(--yellow); }
+  .gate-box h3 { margin-bottom: 4px; }
+  .gate-arrow { padding: 0 10px; color: var(--muted); font-size: 1.4rem; flex-shrink: 0; }
+  .gate-decision { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+  .gate-yes { background: var(--surface2); border: 1px solid var(--purple); border-radius: 6px; padding: 6px 14px; font-size: .78rem; color: var(--purple); }
+  .gate-no  { background: var(--surface2); border: 1px solid var(--green);  border-radius: 6px; padding: 6px 14px; font-size: .78rem; color: var(--green); }
+  .gate-diamond { width: 60px; height: 60px; background: var(--surface2); border: 2px solid var(--yellow); transform: rotate(45deg); display: flex; align-items: center; justify-content: center; border-radius: 4px; flex-shrink: 0; }
+  .gate-diamond span { transform: rotate(-45deg); font-size: .7rem; font-weight: 700; color: var(--yellow); text-align: center; line-height: 1.2; }
+
+  /* ── parallel diagram ── */
+  .parallel-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 24px; }
+  .par-title { font-size: .75rem; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); margin-bottom: 16px; }
+  .par-prlist { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+  .par-pr { background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; padding: 8px 14px; font-size: .8rem; }
+  .par-pr.active { border-color: var(--blue); color: var(--blue); }
+  .par-workers { display: flex; gap: 10px; flex-wrap: wrap; }
+  .par-worker { background: var(--surface2); border: 1px solid var(--purple); border-radius: 8px; padding: 12px 16px; font-size: .78rem; flex: 1; min-width: 160px; }
+  .par-worker h3 { color: var(--purple); font-size: .78rem; margin-bottom: 6px; }
+  .par-worker .steps { color: var(--muted); }
+  .par-worker .steps span { display: block; padding: 1px 0; }
+  .par-worker .steps span::before { content: "→ "; color: var(--border); }
+  .par-sem { background: var(--surface2); border: 1px dashed var(--yellow); border-radius: 8px; padding: 10px 16px; font-size: .78rem; color: var(--yellow); margin-top: 12px; }
+
+  /* ── terminal mockup ── */
+  .terminal { background: #010409; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; font-family: "SFMono-Regular", Consolas, monospace; font-size: .8rem; }
+  .term-titlebar { background: var(--surface2); padding: 8px 14px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--border); }
+  .term-dot { width: 12px; height: 12px; border-radius: 50%; }
+  .td-red  { background: #ff5f57; }
+  .td-yel  { background: #febc2e; }
+  .td-grn  { background: #28c840; }
+  .term-title { color: var(--muted); font-size: .75rem; margin-left: 6px; }
+  .term-body { padding: 16px 20px; line-height: 1.8; }
+  .t-prompt { color: var(--green); }
+  .t-cmd { color: var(--text); }
+  .t-muted { color: var(--muted); }
+  .t-blue  { color: var(--blue); }
+  .t-cyan  { color: var(--cyan); }
+  .t-green { color: var(--green); }
+  .t-yellow{ color: var(--yellow); }
+  .t-purple{ color: var(--purple); }
+  .t-orange{ color: var(--orange); }
+  .t-red   { color: var(--red); }
+  .t-sep   { color: #3a4452; }
+  .t-dim   { opacity: .55; }
+
+  /* ── flags table ── */
+  .flags-table { width: 100%; border-collapse: collapse; font-size: .82rem; }
+  .flags-table th { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); color: var(--muted); font-weight: 600; font-size: .75rem; text-transform: uppercase; letter-spacing: .07em; }
+  .flags-table td { padding: 7px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  .flags-table tr:last-child td { border: none; }
+  .flags-table tr:hover td { background: var(--surface2); }
+  .flags-table .flag { color: var(--cyan); font-family: monospace; }
+  .flags-table .default { color: var(--yellow); font-family: monospace; font-size: .78rem; }
+  .flags-table .desc { color: var(--muted); }
+
+  /* ── log section ── */
+  .log-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .log-file { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  .log-file h3 { font-size: .82rem; color: var(--blue); margin-bottom: 10px; font-family: monospace; }
+  .log-file pre { font-family: monospace; font-size: .75rem; color: var(--muted); line-height: 1.7; overflow-x: auto; }
+  .log-file pre .ts { color: var(--border); }
+  .log-file pre .key { color: var(--cyan); }
+  .log-file pre .val { color: var(--text); }
+
+  /* ── misc ── */
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px; }
+  .card h3 { font-size: .9rem; margin-bottom: 8px; }
+  .card ul { list-style: none; font-size: .82rem; color: var(--muted); }
+  .card ul li { padding: 3px 0; }
+  .card ul li::before { content: "• "; color: var(--blue); }
+  .divider { border: none; border-top: 1px solid var(--border); margin: 48px 0; }
+  .tag { display: inline-block; background: var(--surface2); border: 1px solid var(--border); border-radius: 4px; padding: 2px 8px; font-size: .72rem; color: var(--muted); font-family: monospace; margin: 2px; }
+
+  @media (max-width: 700px) {
+    .triage-grid { grid-template-columns: 1fr 1fr; }
+    .log-cols, .grid-2 { grid-template-columns: 1fr; }
+    .pipe-phase-label { display: none; }
+    .pipe-steps { border-radius: 8px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ── HERO ─────────────────────────────────────────────────────────── -->
+  <div class="hero">
+    <h1>gh <span style="color:var(--blue)">crfix</span></h1>
+    <p style="color:var(--muted);font-size:1.05rem">
+      Hybrid GitHub PR review fixer — deterministic triage + AI gate + AI fix
+    </p>
+    <div class="badges">
+      <span class="badge badge-green"><span class="dot"></span>bash script</span>
+      <span class="badge badge-blue"><span class="dot"></span>gh extension</span>
+      <span class="badge badge-purple"><span class="dot"></span>claude / codex</span>
+      <span class="badge"><span class="dot" style="background:var(--muted)"></span>parallel workers</span>
+    </div>
+    <div class="install-box">
+      <pre><span class="comment"># install</span>
+<span class="cmd">gh extension install maszynka/gh-crfix</span>
+
+<span class="comment"># run</span>
+<span class="cmd">gh crfix https://github.com/owner/repo/pull/123</span></pre>
+    </div>
+  </div>
+
+  <!-- ── OVERVIEW PIPELINE ─────────────────────────────────────────────── -->
+  <section>
+    <h2>▸ Pipeline overview</h2>
+
+    <div class="pipeline">
+      <!-- Phase 1 -->
+      <div class="pipe-row">
+        <div class="pipe-phase-label phase1">phase 1 — setup</div>
+        <div class="pipe-steps">
+          <div class="step blue">
+            <span class="icon">🔗</span>
+            <span class="label">Parse PR</span>
+            <span class="sub">number / range / URL</span>
+          </div>
+          <span class="arrow">→</span>
+          <div class="step blue">
+            <span class="icon">🌿</span>
+            <span class="label">Worktree</span>
+            <span class="sub">git worktree add</span>
+          </div>
+          <span class="arrow">→</span>
+          <div class="step blue">
+            <span class="icon">🔀</span>
+            <span class="label">Merge base</span>
+            <span class="sub">sync with main/master</span>
+          </div>
+          <span class="arrow">→</span>
+          <div class="step blue">
+            <span class="icon">📋</span>
+            <span class="label">Fetch threads</span>
+            <span class="sub">active + outdated</span>
+          </div>
+          <span class="arrow">→</span>
+          <div class="step green">
+            <span class="icon">✓</span>
+            <span class="label">Ready / skip</span>
+            <span class="sub">PR queued for Phase 2</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="pipe-between">
+        <span class="pipe-down" style="color:var(--purple)">↓ parallel workers ↓</span>
+      </div>
+
+      <!-- Phase 2 -->
+      <div class="pipe-row">
+        <div class="pipe-phase-label phase2">phase 2 — fix</div>
+        <div class="pipe-steps">
+          <div class="step purple">
+            <span class="icon">🔬</span>
+            <span class="label">Triage</span>
+            <span class="sub">deterministic classify</span>
+          </div>
+          <span class="arrow">→</span>
+          <div class="step orange">
+            <span class="icon">🤖</span>
+            <span class="label">Autofix hook</span>
+            <span class="sub">optional repo script</span>
+          </div>
+          <span class="arrow">→</span>
+          <div class="step yellow">
+            <span class="icon">🧪</span>
+            <span class="label">Validate</span>
+            <span class="sub">run tests / hook</span>
+          </div>
+          <span class="arrow">→</span>
+          <div class="step yellow">
+            <span class="icon">⚖️</span>
+            <span class="label">Gate score</span>
+            <span class="sub">threshold ≥ 1?</span>
+          </div>
+          <span class="arrow">→</span>
+          <div class="step cyan">
+            <span class="icon">🚪</span>
+            <span class="label">Gate model</span>
+            <span class="sub">small LLM decides</span>
+          </div>
+          <span class="arrow">→</span>
+          <div class="step purple">
+            <span class="icon">✨</span>
+            <span class="label">Fix model</span>
+            <span class="sub">advanced LLM fixes</span>
+          </div>
+          <span class="arrow">→</span>
+          <div class="step green">
+            <span class="icon">💬</span>
+            <span class="label">Reply &amp; resolve</span>
+            <span class="sub">post + resolve threads</span>
+          </div>
+          <span class="arrow">→</span>
+          <div class="step green">
+            <span class="icon">🔄</span>
+            <span class="label">Post-fix cycle</span>
+            <span class="sub">wait → re-check → merge</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── TRIAGE ─────────────────────────────────────────────────────────── -->
+  <section>
+    <h2>▸ Deterministic triage</h2>
+    <p style="margin-bottom:16px">Every thread is classified <strong style="color:var(--text)">before</strong> any LLM call. Only threads that cannot be handled deterministically reach the gate model.</p>
+    <div class="triage-grid">
+
+      <div class="triage-card tc-skip">
+        <h3>⊘ skip</h3>
+        <p>Thread needs no action and should not be resolved.</p>
+        <div class="triage-examples">
+          <span>"LGTM"</span>
+          <span>"Thanks!"</span>
+          <span>"Looks good to me"</span>
+          <span>question-only comments</span>
+        </div>
+      </div>
+
+      <div class="triage-card tc-auto">
+        <h3>⚙ auto (mechanical)</h3>
+        <p>Simple deterministic fix — no reasoning required.</p>
+        <div class="triage-examples">
+          <span>"nit: fix typo"</span>
+          <span>"unused import on line 5"</span>
+          <span>"eslint error here"</span>
+          <span>"update changelog"</span>
+        </div>
+      </div>
+
+      <div class="triage-card tc-fixed">
+        <h3>✓ already fixed</h3>
+        <p>The code change requested is already present in the branch.</p>
+        <div class="triage-examples">
+          <span>diff shows the fix was applied</span>
+          <span>comment predates the latest push</span>
+          <span>outdated thread on changed lines</span>
+        </div>
+      </div>
+
+      <div class="triage-card tc-llm">
+        <h3>🤖 needs LLM</h3>
+        <p>Complex semantic review — requires model reasoning.</p>
+        <div class="triage-examples">
+          <span>architectural feedback</span>
+          <span>logic / correctness issues</span>
+          <span>security concerns</span>
+          <span>style beyond simple nits</span>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ── GATE SCORE ─────────────────────────────────────────────────────── -->
+  <section>
+    <h2>▸ Gate score threshold</h2>
+    <p style="margin-bottom:16px">A numeric score determines whether the gate model runs at all. Each contributing factor adds its weight; the gate only fires when total ≥ 1.</p>
+    <div class="score-row">
+      <div class="score-card">
+        <h3>Score contributors</h3>
+        <div class="score-item">
+          <span>Residual <code>needs_llm</code> threads</span>
+          <span class="val">+1.0</span>
+        </div>
+        <div class="score-item">
+          <span>PR-level comment present</span>
+          <span class="val">+0.4</span>
+        </div>
+        <div class="score-item">
+          <span>Deterministic validation failed</span>
+          <span class="val">+1.0</span>
+        </div>
+        <div style="margin-top:10px;font-size:.75rem;color:var(--muted)">All weights tunable via flags or env vars.</div>
+      </div>
+
+      <div class="score-result">
+        <h3 style="color:var(--yellow);font-size:.85rem;font-weight:600">Threshold</h3>
+        <span class="threshold">total ≥ 1</span>
+        <p>Below threshold → gate + fix models are skipped entirely. All deterministic responses are still posted.</p>
+        <p style="margin-top:6px">Tune with <code>--score-needs-llm</code> <code>--score-test-failure</code> <code>--score-pr-comment</code></p>
+      </div>
+
+      <div class="score-card" style="border-color:var(--orange)">
+        <h3 style="color:var(--orange)">Example: skip gate</h3>
+        <div class="score-item"><span>needs_llm threads</span><span class="val">0</span></div>
+        <div class="score-item"><span>PR-level comment</span><span class="val">0</span></div>
+        <div class="score-item"><span>tests passed</span><span class="val">0</span></div>
+        <div class="score-item" style="border:none;margin-top:6px;font-weight:700">
+          <span style="color:var(--text)">Total</span>
+          <span style="color:var(--green)">0 → skip gate ✓</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── GATE FLOW ──────────────────────────────────────────────────────── -->
+  <section>
+    <h2>▸ Gate model → Fix model flow</h2>
+    <div class="gate-flow">
+      <div class="gate-box">
+        <h3 style="color:var(--purple);font-size:.82rem">needs_llm threads</h3>
+        <p>residual after triage</p>
+      </div>
+      <span class="gate-arrow">→</span>
+      <div class="gate-box active">
+        <h3 style="color:var(--yellow);font-size:.82rem">Gate model</h3>
+        <p><span style="font-family:monospace;font-size:.75rem;color:var(--cyan)">--gate-model sonnet</span></p>
+        <p style="margin-top:4px">reads diff + threads + CI failures, decides if advanced model is worth running</p>
+      </div>
+      <span class="gate-arrow">→</span>
+      <div style="display:flex;flex-direction:column;gap:12px;align-items:center">
+        <div class="gate-yes">
+          <strong>needs_advanced_model: true</strong><br>
+          <span style="opacity:.7">thread IDs selected</span>
+        </div>
+        <div class="gate-no">
+          <strong>needs_advanced_model: false</strong><br>
+          <span style="opacity:.7">post deterministic replies only</span>
+        </div>
+      </div>
+      <span class="gate-arrow">→</span>
+      <div class="gate-box" style="border-color:var(--purple)">
+        <h3 style="color:var(--purple);font-size:.82rem">Fix model</h3>
+        <p><span style="font-family:monospace;font-size:.75rem;color:var(--cyan)">--fix-model sonnet</span></p>
+        <p style="margin-top:4px">edits files, commits, pushes — full access inside worktree</p>
+      </div>
+    </div>
+    <p style="margin-top:12px;font-size:.8rem">CI failure logs from failing GitHub Actions checks are passed to <strong style="color:var(--text)">both</strong> the gate model and the fix model prompt.</p>
+  </section>
+
+  <!-- ── PARALLEL ───────────────────────────────────────────────────────── -->
+  <section>
+    <h2>▸ Parallel processing with FIFO semaphore</h2>
+    <div class="parallel-wrap">
+      <div class="par-title">Input: PR range 100–105 with -c 3</div>
+      <div class="par-prlist">
+        <div class="par-pr active">PR #100</div>
+        <div class="par-pr active">PR #101</div>
+        <div class="par-pr active">PR #102</div>
+        <div class="par-pr">PR #103 <span style="color:var(--muted);font-size:.7rem">waiting</span></div>
+        <div class="par-pr">PR #104 <span style="color:var(--muted);font-size:.7rem">waiting</span></div>
+        <div class="par-pr">PR #105 <span style="color:var(--muted);font-size:.7rem">waiting</span></div>
+      </div>
+      <div class="par-workers">
+        <div class="par-worker">
+          <h3>Worker 1 — PR #100</h3>
+          <div class="steps">
+            <span style="color:var(--green)">✓ merge base</span>
+            <span style="color:var(--green)">✓ triage (3 threads)</span>
+            <span style="color:var(--yellow)">⟳ running gate model…</span>
+          </div>
+        </div>
+        <div class="par-worker">
+          <h3>Worker 2 — PR #101</h3>
+          <div class="steps">
+            <span style="color:var(--green)">✓ merge base</span>
+            <span style="color:var(--green)">✓ triage → 0 needs_llm</span>
+            <span style="color:var(--blue)">→ gate skipped (score 0)</span>
+          </div>
+        </div>
+        <div class="par-worker">
+          <h3>Worker 3 — PR #102</h3>
+          <div class="steps">
+            <span style="color:var(--yellow)">⟳ merging base branch…</span>
+          </div>
+        </div>
+      </div>
+      <div class="par-sem">
+        ⚷ FIFO semaphore — max <strong>3</strong> concurrent workers; PR #103–105 block until a slot frees
+      </div>
+    </div>
+  </section>
+
+  <!-- ── TERMINAL ───────────────────────────────────────────────────────── -->
+  <section>
+    <h2>▸ Terminal output (--no-tui)</h2>
+    <div class="terminal">
+      <div class="term-titlebar">
+        <span class="term-dot td-red"></span>
+        <span class="term-dot td-yel"></span>
+        <span class="term-dot td-grn"></span>
+        <span class="term-title">zsh — turbo-monorepo</span>
+      </div>
+      <div class="term-body">
+        <div><span class="t-prompt">❯ </span><span class="t-cmd">gh crfix https://github.com/maszynka/cdstn-turbo/pull/136 --no-tui</span></div>
+        <div class="t-muted t-dim">Repo       : maszynka/cdstn-turbo</div>
+        <div class="t-muted t-dim">Local repo : /Users/you/projects/cdstn-turbo</div>
+        <div class="t-cyan t-dim">Master log : /tmp/gh-crfix-abc123/run.log</div>
+        <div class="t-muted t-dim">Gate model : sonnet</div>
+        <div class="t-muted t-dim">Fix model  : sonnet</div>
+        <br>
+        <div class="t-sep">━━━ PR #136 ━━━</div>
+        <div>  <span class="t-muted">Title  : </span><span class="t-text">fix: fix all builds and deploys</span></div>
+        <div>  <span class="t-muted">Threads: </span><span class="t-yellow">18</span><span class="t-muted"> (9 active, 9 outdated)</span></div>
+        <div>  <span class="t-muted">Log    : </span><span class="t-cyan">/tmp/gh-crfix-abc123/pr-136.log</span></div>
+        <br>
+        <div class="t-sep">━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</div>
+        <div>  <span class="t-purple">Processing 1 PR(s) with concurrency=3</span></div>
+        <div class="t-sep">━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</div>
+        <br>
+        <div class="t-sep">━━━ PR #136 ✓ ━━━ [fix: fix all builds...]</div>
+        <div>  <span class="t-muted">[triage] </span><span class="t-green">4 skip</span>  <span class="t-blue">2 auto</span>  <span class="t-muted">3 already-fixed</span>  <span class="t-purple">9 needs-llm</span></div>
+        <div>  <span class="t-muted">[gate]   </span><span class="t-yellow">score 1.4 → running sonnet gate…</span></div>
+        <div>  <span class="t-muted">[gate]   </span><span class="t-green">needs_advanced_model: true (7 threads selected)</span></div>
+        <div>  <span class="t-muted">[fix]    </span><span class="t-purple">running sonnet fix model…</span></div>
+        <div>  <span class="t-muted">[fix]    </span><span class="t-green">done — 4 files changed, 127 insertions, 31 deletions</span></div>
+        <div>  <span class="t-muted">[resolve]</span><span class="t-green"> 7 threads replied &amp; resolved</span></div>
+        <br>
+        <div class="t-sep">━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</div>
+        <div>  <span class="t-green">Done — 1 PR(s): 1 fixed, 0 skipped, 0 failed</span></div>
+        <div class="t-sep">━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── LOG FILES ─────────────────────────────────────────────────────── -->
+  <section>
+    <h2>▸ Debug log files</h2>
+    <p style="margin-bottom:16px">Every run writes to <code>~/.gh-crfix/last-run/</code>. Logs survive the run — never deleted.</p>
+    <div class="log-cols">
+      <div class="log-file">
+        <h3>run.log — master log</h3>
+        <pre>
+<span class="ts">[21:26:54]</span> <span class="key">=== gh crfix START</span><span class="val">: repo=maszynka/cdstn-turbo prs=136 ===</span>
+<span class="ts">[21:26:54]</span> <span class="key">[setup-pr]</span><span class="val"> PR #136: starting</span>
+<span class="ts">[21:26:55]</span> <span class="key">[setup-pr]</span><span class="val"> PR #136: title='fix: fix...'</span>
+<span class="ts">[21:26:56]</span> <span class="key">[threads]</span><span class="val">  PR #136: 18 unresolved</span>
+<span class="ts">[21:26:56]</span> <span class="key">[process-pr]</span><span class="val"> PR #136: START</span>
+<span class="ts">[21:27:12]</span> <span class="key">[triage]</span><span class="val">   4 skip / 2 auto / 3 fixed / 9 llm</span>
+<span class="ts">[21:27:45]</span> <span class="key">[gate]</span><span class="val">     score=1.4 → running</span>
+<span class="ts">[21:28:03]</span> <span class="key">[gate]</span><span class="val">     decision=true, 7 threads</span>
+<span class="ts">[21:29:40]</span> <span class="key">[fix]</span><span class="val">      model output: 127 lines</span>
+<span class="ts">[21:29:50]</span> <span class="key">=== gh crfix DONE</span><span class="val">: fixed=1 skipped=0 failed=0 ===</span>
+        </pre>
+      </div>
+      <div class="log-file">
+        <h3>pr-136.log — per-PR detail</h3>
+        <pre>
+<span class="ts">[21:27:45]</span> <span class="key">════ [gate] PROMPT ════</span>
+<span class="val">You are reviewing a pull request…
+Thread PRRT_kw…: apps/ops-dashboard/…
+  Comment: "This import doesn't exist…"</span>
+<span class="ts">[21:27:45]</span> <span class="key">════ END gate PROMPT ════</span>
+<span class="ts">[21:28:03]</span> <span class="key">════ [gate] RAW MODEL OUTPUT ════</span>
+<span class="val">&#123;
+  "needs_advanced_model": true,
+  "reason": "type assertion unsafe...",
+  "threads_to_fix": ["PRRT_kw…"]
+&#125;</span>
+<span class="ts">[21:28:03]</span> <span class="key">════ END gate output ════</span>
+<span class="ts">[21:28:03]</span> <span class="key">[gate]</span><span class="val"> decision: needs_advanced=true</span>
+<span class="ts">[21:29:40]</span> <span class="key">════ [fix] MODEL OUTPUT ════</span>
+<span class="val">I'll fix the type assertion and add the
+missing CHANGELOG entry…</span>
+        </pre>
+      </div>
+    </div>
+    <p style="margin-top:12px;font-size:.8rem">Quick inspection: <code>cat ~/.gh-crfix/last-run/run.log</code> &nbsp;·&nbsp; <code>cat ~/.gh-crfix/last-run/pr-136.log</code></p>
+  </section>
+
+  <!-- ── FLAGS ─────────────────────────────────────────────────────────── -->
+  <section>
+    <h2>▸ Key flags</h2>
+    <table class="flags-table">
+      <thead>
+        <tr><th>Flag</th><th>Default</th><th>Description</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="flag">-c N, --concurrency N</td><td class="default">3</td><td class="desc">Max parallel PR workers</td></tr>
+        <tr><td class="flag">--seq</td><td class="default">—</td><td class="desc">Sequential mode (same as -c 1), streams output live</td></tr>
+        <tr><td class="flag">--ai-backend</td><td class="default">auto</td><td class="desc"><code>auto</code> (prefers claude) · <code>claude</code> · <code>codex</code></td></tr>
+        <tr><td class="flag">--gate-model</td><td class="default">sonnet</td><td class="desc">Small model that decides whether advanced fix is needed</td></tr>
+        <tr><td class="flag">--fix-model</td><td class="default">sonnet</td><td class="desc">Advanced model that actually edits files and pushes</td></tr>
+        <tr><td class="flag">--no-tui</td><td class="default">—</td><td class="desc">Disable fullscreen TUI dashboard; plain line output</td></tr>
+        <tr><td class="flag">--dry-run</td><td class="default">—</td><td class="desc">No writes to GitHub, no AI run — safe preview mode</td></tr>
+        <tr><td class="flag">--exclude-outdated</td><td class="default">—</td><td class="desc">Skip outdated threads (default: include them)</td></tr>
+        <tr><td class="flag">--setup-only</td><td class="default">—</td><td class="desc">Only create worktrees and collect triage; no AI</td></tr>
+        <tr><td class="flag">--no-resolve</td><td class="default">—</td><td class="desc">Do not post replies or resolve threads on GitHub</td></tr>
+        <tr><td class="flag">--validate-hook PATH</td><td class="default">auto-detect</td><td class="desc">Repo-local test/validation script to run before gate</td></tr>
+        <tr><td class="flag">--autofix-hook PATH</td><td class="default">auto-detect</td><td class="desc">Repo-local deterministic autofix script before gate</td></tr>
+        <tr><td class="flag">--score-needs-llm N</td><td class="default">1</td><td class="desc">Score weight when residual LLM threads remain</td></tr>
+        <tr><td class="flag">--score-test-failure N</td><td class="default">1</td><td class="desc">Score weight when validation/tests fail</td></tr>
+        <tr><td class="flag">--score-pr-comment N</td><td class="default">0.4</td><td class="desc">Score weight when PR-level comment is present</td></tr>
+        <tr><td class="flag">--max-threads N</td><td class="default">100</td><td class="desc">Max threads fetched per PR</td></tr>
+        <tr><td class="flag">--resolve-skipped</td><td class="default">—</td><td class="desc">Also resolve threads classified as "skip"</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ── WORKTREE ───────────────────────────────────────────────────────── -->
+  <section>
+    <h2>▸ Isolated worktrees</h2>
+    <div class="grid-2">
+      <div class="card">
+        <h3 style="color:var(--blue)">What is a worktree?</h3>
+        <p>Each PR gets its own <code>git worktree</code> — a separate directory on disk checked out to the PR branch. The AI model edits files there without touching your working directory.</p>
+        <ul>
+          <li>Created at <code>.gh-crfix/worktrees/pr-N/</code></li>
+          <li>Serialized creation (FIFO lock prevents races)</li>
+          <li>Base branch merged in before processing</li>
+          <li>Case-collision paths auto-normalized on macOS</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3 style="color:var(--purple)">What the fix model can do</h3>
+        <p>Inside the worktree the model runs with full permissions:</p>
+        <ul>
+          <li>Read and edit any file in the worktree</li>
+          <li>Run shell commands (tests, lint, build)</li>
+          <li>Create <code>git commit</code> with fixes</li>
+          <li>Push to the PR branch</li>
+          <li>Write <code>thread-responses.json</code> with planned replies</li>
+        </ul>
+        <p style="margin-top:10px">Use <code>--dry-run</code> to preview without any mutations.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── PREREQS ───────────────────────────────────────────────────────── -->
+  <section>
+    <h2>▸ Prerequisites</h2>
+    <div class="grid-2">
+      <div class="card">
+        <h3>Required</h3>
+        <ul>
+          <li><code>gh</code> CLI — authenticated</li>
+          <li><code>jq</code></li>
+          <li><code>bash</code> 3.2+ (macOS system bash works)</li>
+          <li>One AI CLI: <code>claude</code> or <code>codex</code></li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Model names</h3>
+        <p>Available model names are loaded from a public registry updated hourly:</p>
+        <div style="margin-top:8px;font-family:monospace;font-size:.75rem;color:var(--cyan);word-break:break-all">
+          github.com/maszynka/gh-crfix/registry/models.json
+        </div>
+        <p style="margin-top:6px">Cached for 1 hour at <code>~/.cache/gh-crfix/models.json</code></p>
+      </div>
+    </div>
+  </section>
+
+  <hr class="divider">
+  <p style="text-align:center;font-size:.78rem;color:var(--muted)">
+    <a href="https://github.com/maszynka/gh-crfix" style="color:var(--blue);text-decoration:none">github.com/maszynka/gh-crfix</a>
+    &nbsp;·&nbsp; MIT License
+  </p>
+
+</div>
+</body>
+</html>
