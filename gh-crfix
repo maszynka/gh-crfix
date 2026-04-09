@@ -1038,15 +1038,9 @@ get_unresolved_threads() {
   local owner_repo="$1" pr_number="$2"
   local owner="${owner_repo%%/*}"
   local repo="${owner_repo##*/}"
-  local filter
 
-  if [ "$INCLUDE_OUTDATED" = true ]; then
-    filter='[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)]'
-  else
-    filter='[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false and .isOutdated == false)]'
-  fi
-
-  gh api graphql -f query='
+  # Shared GraphQL fragment used by both queries below
+  local gql_query='
     query($owner: String!, $repo: String!, $pr: Int!, $threads: Int!) {
       repository(owner: $owner, name: $repo) {
         pullRequest(number: $pr) {
@@ -1073,8 +1067,45 @@ get_unresolved_threads() {
         }
       }
     }
-  ' -F owner="$owner" -F repo="$repo" -F pr="$pr_number" -F threads="$MAX_THREADS" \
-    --jq "$filter"
+  '
+
+  if [ "$INCLUDE_OUTDATED" != true ]; then
+    # Simple case: only fetch non-outdated threads up to MAX_THREADS
+    gh api graphql -f query="$gql_query" \
+      -F owner="$owner" -F repo="$repo" -F pr="$pr_number" -F threads="$MAX_THREADS" \
+      --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false and .isOutdated == false)]'
+    return
+  fi
+
+  # When including outdated threads, prioritise non-outdated ones so that on
+  # PRs with a long review history we never spend the entire MAX_THREADS budget
+  # on outdated feedback and miss newer unresolved comments.
+  #
+  # Strategy:
+  #   1. Fetch up to MAX_THREADS threads and extract non-outdated unresolved ones.
+  #   2. Fill the remaining budget (MAX_THREADS - count_non_outdated) with
+  #      outdated unresolved ones from the same response.
+  #   3. Combine and return, non-outdated first.
+  #
+  # This keeps it to a single API call while guaranteeing that non-outdated
+  # threads always get priority within the cap.
+
+  local raw
+  raw="$(gh api graphql -f query="$gql_query" \
+    -F owner="$owner" -F repo="$repo" -F pr="$pr_number" -F threads="$MAX_THREADS" \
+    --jq '.data.repository.pullRequest.reviewThreads.nodes')"
+
+  local max_threads="$MAX_THREADS"
+  jq -n \
+    --argjson nodes "$raw" \
+    --argjson cap "$max_threads" \
+    '
+      ($nodes | map(select(.isResolved == false and .isOutdated == false))) as $current |
+      ($cap - ($current | length)) as $outdated_budget |
+      ($nodes | map(select(.isResolved == false and .isOutdated == true))
+              | if $outdated_budget > 0 then .[:$outdated_budget] else [] end) as $outdated |
+      $current + $outdated
+    '
 }
 
 reply_to_thread() {
