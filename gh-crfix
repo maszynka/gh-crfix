@@ -97,7 +97,7 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 # Write timestamped message to MASTER_LOG and optionally to a per-PR log file.
 # Uses || true so write failures never abort the script under set -euo pipefail.
 mlog() {
-  local msg="$1" extra_log="${2:-}"
+  local msg="${1:-}" extra_log="${2:-}"
   local ts
   ts="$(date '+%H:%M:%S')" || true
   [ -n "$MASTER_LOG" ] && printf '[%s] %s\n' "$ts" "$msg" >> "$MASTER_LOG" 2>/dev/null || true
@@ -106,22 +106,30 @@ mlog() {
 
 # mlog_file HEADER FILE [log_file]
 # Dump a file's content into MASTER_LOG (and optional per-PR log) with a header banner.
-# Capped at 500 lines to avoid bloating the log with huge prompt files.
+# Capped at 500 lines. Uses a single date call and one sed pass — no per-line subprocesses.
 mlog_file() {
-  local header="$1" file="$2" extra_log="${3:-}"
-  mlog "════ $header ════" "$extra_log"
-  if [ -f "$file" ]; then
-    local lc
-    lc="$(wc -l < "$file" | tr -d ' ')" || lc="?"
-    mlog "  (file: $file, lines: $lc)" "$extra_log"
-    head -500 "$file" 2>/dev/null | while IFS= read -r line || [ -n "$line" ]; do
-      mlog "  $line" "$extra_log"
-    done || true
-    [ "${lc:-0}" -gt 500 ] 2>/dev/null && mlog "  ... (truncated, $lc total lines)" "$extra_log" || true
-  else
-    mlog "  (file not found: $file)" "$extra_log"
-  fi
-  mlog "════ END $header ════" "$extra_log"
+  local header="${1:-}" file="${2:-}" extra_log="${3:-}"
+  [ -z "$MASTER_LOG" ] && [ -z "$extra_log" ] && return 0
+  local ts _tmp
+  ts="$(date '+%H:%M:%S')" || true
+  _tmp="$(mktemp 2>/dev/null)" || return 0
+  {
+    printf '[%s] ════ %s ════\n' "$ts" "$header"
+    if [ -f "$file" ]; then
+      local lc
+      lc="$(wc -l < "$file" | tr -d ' ')" || lc="?"
+      printf '[%s]   (file: %s, lines: %s)\n' "$ts" "$file" "$lc"
+      head -500 "$file" 2>/dev/null | sed 's/^/  /' || true
+      [ "${lc:-0}" -gt 500 ] 2>/dev/null && \
+        printf '[%s]   ... (truncated, %s total lines)\n' "$ts" "$lc" || true
+    else
+      printf '[%s]   (file not found: %s)\n' "$ts" "$file"
+    fi
+    printf '[%s] ════ END %s ════\n' "$ts" "$header"
+  } > "$_tmp" 2>/dev/null || true
+  [ -n "$MASTER_LOG" ] && cat "$_tmp" >> "$MASTER_LOG" 2>/dev/null || true
+  [ -n "$extra_log"  ] && cat "$_tmp" >> "$extra_log"  2>/dev/null || true
+  rm -f "$_tmp" 2>/dev/null || true
 }
 
 # ── model registry ──────────────────────────────────────────────────────────
