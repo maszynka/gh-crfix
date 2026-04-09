@@ -442,6 +442,7 @@ EOF
     fi
   "
   mock_command "osascript" 0
+  mock_command "claude" 0
 
   cd "$REPO_DIR"
   run bash "$SCRIPT_PATH" --seq --no-tui --dry-run "https://github.com/test-owner/test-repo/pull/1"
