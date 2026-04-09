@@ -1376,7 +1376,7 @@ fetch_failing_ci_checks() {
     if [ -n "$run_id" ] && [ "$run_id" != "null" ]; then
       log_output="$(gh run view "$run_id" -R "$owner_repo" --log-failed 2>/dev/null \
         | sed 's/\x1b\[[0-9;]*m//g' \
-        | awk -F'\t' '{if(NF>=3){out=$3; for(i=4;i<=NF;i++) out=out "\t" $i; sub(/^[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}[^[:space:]]*[[:space:]]+/,"",out); print out} else print}' \
+        | awk -F'\t' '{if(NF>=3){out=$3; for(i=4;i<=NF;i++) out=out "\t" $i; if(out ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}T/ || out ~ /^[0-9]+[[:space:]]/) sub(/^[^ ]+ /,"",out); print out} else print}' \
         | grep -v '^\s*$' \
         | grep -E '(^\s*[0-9]+:[0-9]+\s+error|^\s*error:|[❌]|##\[group\].*[❌]|Parsing error|##\[error\])' \
         | head -80 \
@@ -1972,10 +1972,7 @@ After all files are fixed: git commit -m 'fix: resolve committed conflict marker
 
     if [ "$llm_succeeded" = true ]; then
       local remaining
-      remaining="$(git -C "$worktree_path" grep -Il "^<<<<<<< " -- \
-        "*.ts" "*.tsx" "*.js" "*.jsx" "*.mjs" "*.cjs" "*.json" \
-        "*.py" "*.rb" "*.go" "*.java" "*.rs" \
-        "*.md" "*.mdx" "*.yaml" "*.yml" "*.css" "*.scss" "*.html" \
+      remaining="$(git -C "$worktree_path" grep -Il "^<<<<<<< " \
         2>/dev/null || true)"
       if [ -z "$remaining" ]; then
         echo "[conflict-markers] fixed all $count file(s)"
@@ -3598,7 +3595,8 @@ process_pr() {
     run_pre_gate_phase "$pr_num" "$worktree_path" "$triage_file" "$hook" "$validate_runner" "$log_file"
     local validation_file="$LOG_DIR/pr-$pr_num-validation.json"
     local gate_context="$LOG_DIR/pr-$pr_num-gate-context.json"
-    local ci_checks=""
+    local ci_checks
+    ci_checks="$(fetch_failing_ci_checks "$OWNER_REPO" "$worktree_path" 2>/dev/null || echo "[]")"
 
     # 3. Run gate model only after score threshold is met
     local gate_out="$LOG_DIR/pr-$pr_num-gate.json"
@@ -3608,7 +3606,6 @@ process_pr() {
     : > "$selected_file"
 
     if [ "$should_run_gate" = "true" ]; then
-      ci_checks="$(fetch_failing_ci_checks "$OWNER_REPO" "$worktree_path" 2>/dev/null || echo "[]")"
       progress_set "$pr_num" gate running "$GATE_MODEL"
       run_gate_model "$OWNER_REPO" "$pr_num" "$triage_file" "$validation_file" "$gate_context" "$gate_out" "$log_file" "$ci_checks"
       jq -r '.threads_to_fix[]?' < "$gate_out" > "$selected_file" || true
@@ -3821,7 +3818,8 @@ process_pr_sequential() {
   local gate_context="$LOG_DIR/pr-$pr_num-gate-context.json"
   echo "  Validation : $(jq -r '.summary' < "$validation_file")"
   echo "  Gate score : $(jq -r '.total_score' < "$gate_context")"
-  local ci_checks=""
+  local ci_checks
+  ci_checks="$(fetch_failing_ci_checks "$OWNER_REPO" "$worktree_path" 2>/dev/null || echo "[]")"
 
   # 3. Run gate model only after score threshold is met
   local gate_out="$LOG_DIR/pr-$pr_num-gate.json"
@@ -3831,7 +3829,6 @@ process_pr_sequential() {
   : > "$selected_file"
 
   if [ "$should_run_gate" = "true" ]; then
-    ci_checks="$(fetch_failing_ci_checks "$OWNER_REPO" "$worktree_path" 2>/dev/null || echo "[]")"
     progress_set "$pr_num" gate running "$GATE_MODEL"
     echo "  Running gate model ($GATE_MODEL)..."
     run_gate_model "$OWNER_REPO" "$pr_num" "$triage_file" "$validation_file" "$gate_context" "$gate_out" "$log_file" "$ci_checks"
