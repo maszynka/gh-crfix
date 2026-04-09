@@ -85,12 +85,44 @@ SCORE_NEEDS_LLM="${GH_CRFIX_SCORE_NEEDS_LLM:-1}"
 SCORE_PR_COMMENT="${GH_CRFIX_SCORE_PR_COMMENT:-0.4}"
 SCORE_TEST_FAILURE="${GH_CRFIX_SCORE_TEST_FAILURE:-1}"
 LOG_DIR=""
+MASTER_LOG=""
 SEMAPHORE=""
 BG_PIDS=""
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 die() { echo "ERROR: $*" >&2; exit 1; }
+
+# mlog MSG [log_file]
+# Write timestamped message to MASTER_LOG and optionally to a per-PR log file.
+# Uses || true so write failures never abort the script under set -euo pipefail.
+mlog() {
+  local msg="$1" extra_log="${2:-}"
+  local ts
+  ts="$(date '+%H:%M:%S')" || true
+  [ -n "$MASTER_LOG" ] && printf '[%s] %s\n' "$ts" "$msg" >> "$MASTER_LOG" 2>/dev/null || true
+  [ -n "$extra_log"  ] && printf '[%s] %s\n' "$ts" "$msg" >> "$extra_log"  2>/dev/null || true
+}
+
+# mlog_file HEADER FILE [log_file]
+# Dump a file's content into MASTER_LOG (and optional per-PR log) with a header banner.
+# Capped at 500 lines to avoid bloating the log with huge prompt files.
+mlog_file() {
+  local header="$1" file="$2" extra_log="${3:-}"
+  mlog "════ $header ════" "$extra_log"
+  if [ -f "$file" ]; then
+    local lc
+    lc="$(wc -l < "$file" | tr -d ' ')" || lc="?"
+    mlog "  (file: $file, lines: $lc)" "$extra_log"
+    head -500 "$file" 2>/dev/null | while IFS= read -r line || [ -n "$line" ]; do
+      mlog "  $line" "$extra_log"
+    done || true
+    [ "${lc:-0}" -gt 500 ] 2>/dev/null && mlog "  ... (truncated, $lc total lines)" "$extra_log" || true
+  else
+    mlog "  (file not found: $file)" "$extra_log"
+  fi
+  mlog "════ END $header ════" "$extra_log"
+}
 
 # ── model registry ──────────────────────────────────────────────────────────
 
@@ -1038,6 +1070,7 @@ get_unresolved_threads() {
   local owner_repo="$1" pr_number="$2"
   local owner="${owner_repo%%/*}"
   local repo="${owner_repo##*/}"
+  mlog "[threads] PR #$pr_number: fetching (INCLUDE_OUTDATED=$INCLUDE_OUTDATED MAX_THREADS=$MAX_THREADS)"
 
   # Shared GraphQL fragment used by both queries below
   local gql_query='
@@ -1070,10 +1103,16 @@ get_unresolved_threads() {
   '
 
   if [ "$INCLUDE_OUTDATED" != true ]; then
-    # Simple case: only fetch non-outdated threads up to MAX_THREADS
-    gh api graphql -f query="$gql_query" \
+    local simple_result
+    simple_result="$(gh api graphql -f query="$gql_query" \
       -F owner="$owner" -F repo="$repo" -F pr="$pr_number" -F threads="$MAX_THREADS" \
-      --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false and .isOutdated == false)]'
+      --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false and .isOutdated == false)]')"
+    local simple_count
+    simple_count="$(echo "$simple_result" | jq 'length' 2>/dev/null || echo '?')"
+    mlog "[threads] PR #$pr_number: $simple_count non-outdated unresolved"
+    echo "$simple_result" | jq -r '.[] | "  → \(.id) \(.path // "(PR-level)")"' 2>/dev/null \
+      | while IFS= read -r line; do mlog "[threads] $line"; done || true
+    echo "$simple_result"
     return
   fi
 
@@ -1096,7 +1135,8 @@ get_unresolved_threads() {
     --jq '.data.repository.pullRequest.reviewThreads.nodes')"
 
   local max_threads="$MAX_THREADS"
-  jq -n \
+  local result
+  result="$(jq -n \
     --argjson nodes "$raw" \
     --argjson cap "$max_threads" \
     '
@@ -1105,7 +1145,15 @@ get_unresolved_threads() {
       ($nodes | map(select(.isResolved == false and .isOutdated == true))
               | if $outdated_budget > 0 then .[:$outdated_budget] else [] end) as $outdated |
       $current + $outdated
-    '
+    ')"
+  local count non_ct out_ct
+  count="$(echo "$result"   | jq 'length'                                          2>/dev/null || echo '?')"
+  non_ct="$(echo "$result"  | jq '[.[] | select(.isOutdated==false)] | length'     2>/dev/null || echo '?')"
+  out_ct="$(echo "$result"  | jq '[.[] | select(.isOutdated==true)]  | length'     2>/dev/null || echo '?')"
+  mlog "[threads] PR #$pr_number: $count unresolved (active=$non_ct outdated=$out_ct)"
+  echo "$result" | jq -r '.[] | "  → \(.id) [\(if .isOutdated then "outdated" else "active" end)] \(.path // "(PR-level)")"' 2>/dev/null \
+    | while IFS= read -r line; do mlog "[threads] $line"; done || true
+  echo "$result"
 }
 
 reply_to_thread() {
@@ -1273,6 +1321,7 @@ triage_threads() {
 
   local count i
   count="$(jq 'length' < "$threads_file")"
+  mlog "[triage] classifying $count thread(s)"
   i=0
   while [ "$i" -lt "$count" ]; do
     local one
@@ -1290,6 +1339,14 @@ triage_threads() {
       needs_llm: [ .[] | select(.decision == "needs_llm") ]
     }
   ' "$tmp" > "$out_file"
+
+  mlog "[triage] skip=$(jq '.skip|length' < "$out_file") auto=$(jq '.auto|length' < "$out_file") already_fixed=$(jq '.already_likely_fixed|length' < "$out_file") needs_llm=$(jq '.needs_llm|length' < "$out_file")"
+  { jq -r '.needs_llm[] | "  needs_llm: \(.thread_id) \(.path // "(PR-level)") — \(.reason)"' < "$out_file" 2>/dev/null \
+      | while IFS= read -r line; do mlog "[triage] $line"; done; } || true
+  { jq -r '.skip[]          | "  skip:      \(.thread_id) — \(.reason)"'             < "$out_file" 2>/dev/null \
+      | while IFS= read -r line; do mlog "[triage] $line"; done; } || true
+  { jq -r '.already_likely_fixed[] | "  fixed:  \(.thread_id) — \(.reason)"'         < "$out_file" 2>/dev/null \
+      | while IFS= read -r line; do mlog "[triage] $line"; done; } || true
 }
 
 # ── gate scoring + gate model ───────────────────────────────────────────────
@@ -1394,9 +1451,16 @@ fetch_failing_ci_checks() {
     2>/dev/null | jq -s 'add // []')" || failing_checks="[]"
 
   if [ "$failing_checks" = "[]" ] || [ -z "$failing_checks" ]; then
+    mlog "[ci-checks] no failing CI checks"
     echo "[]"
     return 0
   fi
+
+  local failing_count
+  failing_count="$(echo "$failing_checks" | jq 'length' 2>/dev/null || echo '?')"
+  mlog "[ci-checks] $failing_count failing check(s):"
+  echo "$failing_checks" | jq -r '.[] | "  → \(.name) run_id=\(.run_id // "n/a")"' 2>/dev/null \
+    | while IFS= read -r line; do mlog "[ci-checks] $line"; done || true
 
   # For each failing check, fetch actual failure log output (up to 100 lines)
   local result="[]"
@@ -1406,6 +1470,7 @@ fetch_failing_ci_checks() {
     run_id="$(echo "$check" | jq -r '.run_id // empty')"
     log_output=""
     if [ -n "$run_id" ] && [ "$run_id" != "null" ]; then
+      mlog "[ci-checks] fetching log for '$name' (run=$run_id)"
       log_output="$(gh run view "$run_id" -R "$owner_repo" --log-failed 2>/dev/null \
         | sed 's/\x1b\[[0-9;]*m//g' \
         | awk -F'\t' '{if(NF>=3){out=$3; for(i=4;i<=NF;i++) out=out "\t" $i; if(out ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}T/ || out ~ /^[0-9]+[[:space:]]/) sub(/^[^ ]+ /,"",out); print out} else print}' \
@@ -1413,6 +1478,12 @@ fetch_failing_ci_checks() {
         | grep -E '(^\s*[0-9]+:[0-9]+\s+error|^\s*error:|[❌]|##\[group\].*[❌]|Parsing error|##\[error\])' \
         | head -80 \
         || true)"
+      local log_lines
+      log_lines="$(printf '%s' "$log_output" | wc -l | tr -d ' ')" || log_lines="?"
+      mlog "[ci-checks] '$name': $log_lines error line(s)"
+      printf '%s\n' "$log_output" | head -20 | while IFS= read -r line || [ -n "$line" ]; do
+        mlog "[ci-checks]   $line"
+      done || true
     fi
     result="$(echo "$result" | jq --arg name "$name" --arg log "$log_output" \
       '. + [{name: $name, log: $log}]')"
@@ -1520,9 +1591,12 @@ run_gate_model() {
   build_gate_prompt "$owner_repo" "$pr_num" "$triage_file" "$validation_file" "$score_file" "$ci_checks" > "$prompt_file"
   gate_schema > "$schema_file"
 
+  mlog "[gate] PR #$pr_num: model=$GATE_MODEL backend=$AI_BACKEND" "$log_file"
+  mlog_file "gate prompt (PR #$pr_num)" "$prompt_file" "$log_file"
+
   {
-    echo "[gate] model=$GATE_MODEL"
-    echo "[gate] backend=$AI_BACKEND"
+    echo "════════════════════════════════════════"
+    echo "[gate] START — model=$GATE_MODEL backend=$AI_BACKEND"
     [ -f "$score_file" ] && echo "[gate] score: $(cat "$score_file")"
     local raw_out="$LOG_DIR/gate-$pr_num.raw.txt"
     local cmd_failed=false
@@ -1544,8 +1618,12 @@ run_gate_model() {
         - < "$prompt_file" >/dev/null || cmd_failed=true
     fi
 
+    echo "════ [gate] RAW MODEL OUTPUT:"
+    cat "$raw_out" 2>/dev/null || echo "(empty)"
+    echo "════ [gate] END RAW MODEL OUTPUT"
+
     if [ "$cmd_failed" = true ]; then
-      echo "[gate] failed; fallback to needs_advanced_model=true"
+      echo "[gate] FAILED; fallback to needs_advanced_model=true"
       jq -n \
         --arg reason "gate model failed" \
         '{needs_advanced_model: true, reason: $reason, threads_to_fix: []}' > "$out_file"
@@ -1562,7 +1640,10 @@ run_gate_model() {
         }
     fi
     echo "[gate] result: $(cat "$out_file")"
+    echo "════════════════════════════════════════"
   } >> "$log_file" 2>&1
+
+  mlog "[gate] PR #$pr_num: needs_advanced=$(jq -r '.needs_advanced_model // "?"' < "$out_file" 2>/dev/null) reason=$(jq -r '.reason // "?"' < "$out_file" 2>/dev/null)" "$log_file"
 }
 
 # ── advanced fixer ───────────────────────────────────────────────────────────
@@ -1644,12 +1725,19 @@ run_fix_model() {
 
   build_fix_prompt "$owner_repo" "$pr_num" "$threads_file" "$selected_file" "$validation_file" "$ci_checks" > "$prompt_file"
 
+  local selected_count
+  selected_count="$(wc -l < "$selected_file" | tr -d ' ')" || selected_count="?"
+  mlog "[fix] PR #$pr_num: model=$FIX_MODEL backend=$AI_BACKEND selected=$selected_count thread(s)" "$log_file"
+  mlog_file "fix prompt (PR #$pr_num)" "$prompt_file" "$log_file"
+
   {
-    echo "[fix] model=$FIX_MODEL"
-    echo "[fix] backend=$AI_BACKEND"
-    echo "[fix] selected threads:"
+    echo "════════════════════════════════════════"
+    echo "[fix] START — model=$FIX_MODEL backend=$AI_BACKEND"
+    echo "[fix] worktree: $worktree_path"
+    echo "[fix] selected threads ($selected_count):"
     cat "$selected_file"
     echo ""
+    echo "════ [fix] MODEL OUTPUT ════"
 
     local cmd_failed=false
     if [ "$AI_BACKEND" = "claude" ]; then
@@ -1663,26 +1751,33 @@ run_fix_model() {
         - < "$prompt_file" || cmd_failed=true
     fi
 
+    echo "════ [fix] END MODEL OUTPUT ════"
     if [ "$cmd_failed" = true ]; then
       echo "[fix] FAILED"
+      echo "════════════════════════════════════════"
       return 1
     fi
-    echo "[fix] done"
+    echo "[fix] DONE"
+    echo "════════════════════════════════════════"
   } >> "$log_file" 2>&1
+
+  mlog "[fix] PR #$pr_num: done" "$log_file"
 }
 
 # ── reply / resolve ──────────────────────────────────────────────────────────
 
 reply_and_resolve_from_responses() {
-  local responses_file="$1"
+  local responses_file="$1" log_file="${2:-}"
   local resolved=0 replied=0 skipped=0
 
   [ -f "$responses_file" ] || return 0
   jq -e '.' "$responses_file" >/dev/null 2>&1 || return 0
 
-  local n i
+  local n
   n="$(jq 'length' < "$responses_file")"
-  i=0
+  mlog "[resolve] processing $n response(s)" "$log_file"
+
+  local i=0
   while [ "$i" -lt "$n" ]; do
     local tid action comment resolve_when_skipped
     tid="$(jq -r ".[$i].thread_id // empty" < "$responses_file")"
@@ -1693,21 +1788,26 @@ reply_and_resolve_from_responses() {
     [ -n "$tid" ] || { i=$((i + 1)); continue; }
 
     if [ -n "$comment" ]; then
+      mlog "[resolve] $tid: posting reply (action=$action)" "$log_file"
       reply_to_thread "$tid" "$comment" && replied=$((replied + 1))
     fi
 
     case "$action" in
       fixed|already_fixed)
+        mlog "[resolve] $tid: resolving (action=$action)" "$log_file"
         resolve_thread "$tid" && resolved=$((resolved + 1))
         ;;
       skipped)
         if [ "$RESOLVE_SKIPPED" = true ] || [ "$resolve_when_skipped" = true ]; then
+          mlog "[resolve] $tid: resolving (skipped+resolve_skipped)" "$log_file"
           resolve_thread "$tid" && resolved=$((resolved + 1))
         else
+          mlog "[resolve] $tid: leaving open (action=skipped)" "$log_file"
           skipped=$((skipped + 1))
         fi
         ;;
       *)
+        mlog "[resolve] $tid: leaving open (action=$action)" "$log_file"
         skipped=$((skipped + 1))
         ;;
     esac
@@ -1715,6 +1815,7 @@ reply_and_resolve_from_responses() {
     i=$((i + 1))
   done
 
+  mlog "[resolve] replied=$replied resolved=$resolved unresolved_skipped=$skipped" "$log_file"
   echo "replied=$replied resolved=$resolved unresolved_skipped=$skipped"
 }
 
@@ -3372,6 +3473,7 @@ setup_pr() {
   : > "$log_file"
   progress_init "$pr_num"
   kv_set "$pr_num" setup_status "skipped"
+  mlog "[setup-pr] PR #$pr_num: starting" "$log_file"
 
   {
     local pr_json
@@ -3397,6 +3499,7 @@ setup_pr() {
     kv_set "$pr_num" title "$title"
     kv_set "$pr_num" branch "$branch"
     kv_set "$pr_num" state_label "$state_label"
+    mlog "[setup-pr] PR #$pr_num: title='$title' branch='$branch' state='$state_label'" "$log_file"
 
     if [ "$state" != "OPEN" ]; then
       kv_set "$pr_num" setup_reason "PR is $state"
@@ -3449,6 +3552,7 @@ setup_pr() {
     kv_set "$pr_num" threads_file "$threads_file"
     kv_set "$pr_num" thread_count "$thread_count"
     progress_set "$pr_num" fetch_threads done "$thread_count unresolved thread(s)"
+    mlog "[setup-pr] PR #$pr_num: unresolved threads=$thread_count" "$log_file"
 
     if [ "$thread_count" -eq 0 ]; then
       kv_set "$pr_num" setup_reason "no unresolved threads"
@@ -3559,6 +3663,7 @@ setup_all() {
 
     echo "  Threads total      : $thread_count"
     echo "  Worktree           : $worktree_path"
+    echo "  Log                : $LOG_DIR/pr-$pr_num.log"
     [ "$(kv_get "$pr_num" has_case_collisions)" = "true" ] && \
       echo "  Case collisions    : detected (will normalize in worker)"
 
@@ -3583,6 +3688,7 @@ process_pr() {
   date +%s > "$LOG_DIR/pr-${pr_num}.started"
 
   {
+    mlog "[process-pr] PR #$pr_num: START title='$title'" "$log_file"
     echo "━━━ PR #$pr_num ━━━ [$title]"
     echo "worktree: $worktree_path"
     echo "gate model: $GATE_MODEL"
@@ -3730,7 +3836,7 @@ process_pr() {
     if [ "$NO_RESOLVE" = false ]; then
       progress_set "$pr_num" reply running "posting replies"
       echo "[resolve] replying/resolving"
-      echo "[resolve] $(reply_and_resolve_from_responses "$combined")"
+      echo "[resolve] $(reply_and_resolve_from_responses "$combined" "$log_file")"
       progress_set "$pr_num" reply done "replies posted"
     else
       echo "[resolve] skipped by flag"
@@ -3790,6 +3896,7 @@ process_pr_sequential() {
   triage_file="$LOG_DIR/pr-$pr_num-triage.json"
 
   date +%s > "$LOG_DIR/pr-${pr_num}.started"
+  mlog "[process-pr-seq] PR #$pr_num: START title='$title'" "$log_file"
 
   echo ""
   echo "━━━ PR #$pr_num ━━━  [$title]"
@@ -3961,7 +4068,7 @@ process_pr_sequential() {
     progress_set "$pr_num" reply running "posting replies"
     echo "  Replying & resolving threads..."
     local resolve_result
-    resolve_result="$(reply_and_resolve_from_responses "$combined")"
+    resolve_result="$(reply_and_resolve_from_responses "$combined" "$log_file")"
     echo "  $resolve_result"
     progress_set "$pr_num" reply done "replies posted"
   else
@@ -4036,9 +4143,6 @@ cleanup() {
     TUI_ACTIVE=false
   fi
   sem_destroy 2>/dev/null || true
-  if [ -n "$LOG_DIR" ] && [ -d "$LOG_DIR" ]; then
-    rm -rf "$LOG_DIR"
-  fi
 }
 
 cleanup_sigint() {
@@ -4088,12 +4192,17 @@ main() {
   fi
 
   LOG_DIR="$(mktemp -d /tmp/gh-crfix-XXXXXX)"
+  MASTER_LOG="$LOG_DIR/run.log"
+  mkdir -p "$HOME/.gh-crfix" 2>/dev/null || true
+  ln -sfn "$LOG_DIR" "$HOME/.gh-crfix/last-run" 2>/dev/null || true
   verify_prereqs
 
+  mlog "=== gh crfix START: repo=$OWNER_REPO prs=$PR_NUMBERS ==="
   echo "Repo       : $OWNER_REPO"
   local repo_dir
   repo_dir="$(find_local_repo "$OWNER_REPO")"
   echo "Local repo : $repo_dir"
+  echo "Master log : $MASTER_LOG"
   echo "Concurrency: $CONCURRENCY"
   echo "Prepare    : $(setup_phase_concurrency)"
   echo "Gate model : $GATE_MODEL"
@@ -4132,6 +4241,7 @@ main() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "  Done — $total PR(s), nothing to process."
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    mlog "=== gh crfix DONE: nothing to process ===" || true
     return 0
   fi
 
@@ -4204,6 +4314,7 @@ main() {
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo "  Done — $total PR(s): $ok fixed, $skipped skipped, $fail failed"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  mlog "=== gh crfix DONE: total=$total fixed=$ok skipped=$skipped failed=$fail ===" || true
 
   # Terminal bell + macOS notification
   printf '\a'
