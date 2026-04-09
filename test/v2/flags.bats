@@ -55,8 +55,21 @@ teardown() { teardown_common; }
   [ "$CONCURRENCY" -eq 1 ]
 }
 
-@test "parse_flags: --include-outdated sets INCLUDE_OUTDATED=true" {
+@test "parse_flags: --include-outdated still sets INCLUDE_OUTDATED=true (back-compat)" {
+  # Even when already true by default, the flag must explicitly set the value
+  # so that --exclude-outdated --include-outdated ordering works correctly
+  INCLUDE_OUTDATED=false  # simulate a prior --exclude-outdated
   parse_flags --include-outdated "https://github.com/o/r/pull/1"
+  [ "$INCLUDE_OUTDATED" = "true" ]
+}
+
+@test "parse_flags: --exclude-outdated sets INCLUDE_OUTDATED=false" {
+  parse_flags --exclude-outdated "https://github.com/o/r/pull/1"
+  [ "$INCLUDE_OUTDATED" = "false" ]
+}
+
+@test "parse_flags: --include-outdated overrides --exclude-outdated (flag precedence)" {
+  parse_flags --exclude-outdated --include-outdated "https://github.com/o/r/pull/1"
   [ "$INCLUDE_OUTDATED" = "true" ]
 }
 

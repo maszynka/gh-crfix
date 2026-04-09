@@ -75,7 +75,8 @@ gh crfix 123 --score-needs-llm .2 --score-pr-comment .4 --score-test-failure 1
 | `--no-post-fix` | | Skip post-fix review cycle |
 | `--setup-only` | | Only setup worktrees + triage |
 | `--no-resolve` | | Do not resolve GitHub threads |
-| `--include-outdated` | | Include outdated unresolved threads |
+| `--exclude-outdated` | | Skip outdated unresolved threads (opt-out of the default behaviour) |
+| `--include-outdated` | | _(deprecated, now the default)_ Include outdated threads; kept for backward compatibility |
 | `--gate-model MODEL` | sonnet | Small model for gate decision |
 | `--fix-model MODEL` | sonnet | Advanced model for fixing |
 | `--validate-hook PATH` | | Deterministic validation script |
