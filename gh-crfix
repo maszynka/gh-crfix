@@ -4135,6 +4135,7 @@ main() {
     return 0
   fi
 
+  [ "$AI_BACKEND" = "auto" ] && resolve_ai_backend
   echo "AI backend : $AI_BACKEND"
 
   echo ""
