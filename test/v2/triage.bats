@@ -225,3 +225,140 @@ EOF
 
   [ "$decision" = "auto" ]
 }
+
+# ── E2E seed comment regression tests ────────────────────────────────────────
+# These comments are the exact wording used in the E2E test to seed review
+# threads. They must classify as needs_llm — if is_simple_mechanical() ever
+# starts matching them, the E2E test will silently skip the LLM fix step.
+
+@test "classify_one_thread: e2e typo comment classifies as needs_llm" {
+  mkdir -p "$TEST_TMPDIR/worktree/src"
+  touch "$TEST_TMPDIR/worktree/src/utils.py"
+
+  local thread_json
+  thread_json=$(cat <<'EOF'
+{
+  "id": "PRRT_e2e1",
+  "isResolved": false,
+  "isOutdated": false,
+  "path": "src/utils.py",
+  "line": 15,
+  "comments": {
+    "nodes": [
+      {
+        "id": "C_e2e1",
+        "body": "The parameter is named `frist_name` but should be `first_name` — this breaks the f-string interpolation and any callers using the function. Please rename it everywhere in the function signature and body.",
+        "path": "src/utils.py",
+        "line": 15,
+        "originalLine": 15,
+        "author": {"login": "reviewer"},
+        "createdAt": "2025-01-01T00:00:00Z"
+      }
+    ]
+  }
+}
+EOF
+  )
+
+  result="$(classify_one_thread "$TEST_TMPDIR/worktree" "$thread_json")"
+  [ "$(echo "$result" | jq -r '.decision')" = "needs_llm" ]
+}
+
+@test "classify_one_thread: e2e unused-import comment classifies as needs_llm" {
+  mkdir -p "$TEST_TMPDIR/worktree/src"
+  touch "$TEST_TMPDIR/worktree/src/utils.py"
+
+  local thread_json
+  thread_json=$(cat <<'EOF'
+{
+  "id": "PRRT_e2e2",
+  "isResolved": false,
+  "isOutdated": false,
+  "path": "src/utils.py",
+  "line": 4,
+  "comments": {
+    "nodes": [
+      {
+        "id": "C_e2e2",
+        "body": "The `sys` module is imported on line 4 but never referenced anywhere in this file. Please remove it to keep the module imports clean.",
+        "path": "src/utils.py",
+        "line": 4,
+        "originalLine": 4,
+        "author": {"login": "reviewer"},
+        "createdAt": "2025-01-01T00:00:00Z"
+      }
+    ]
+  }
+}
+EOF
+  )
+
+  result="$(classify_one_thread "$TEST_TMPDIR/worktree" "$thread_json")"
+  [ "$(echo "$result" | jq -r '.decision')" = "needs_llm" ]
+}
+
+@test "classify_one_thread: e2e comparison-operator comment classifies as needs_llm" {
+  mkdir -p "$TEST_TMPDIR/worktree/src"
+  touch "$TEST_TMPDIR/worktree/src/validator.js"
+
+  local thread_json
+  thread_json=$(cat <<'EOF'
+{
+  "id": "PRRT_e2e3",
+  "isResolved": false,
+  "isOutdated": false,
+  "path": "src/validator.js",
+  "line": 11,
+  "comments": {
+    "nodes": [
+      {
+        "id": "C_e2e3",
+        "body": "`isPositiveNumber(0)` now incorrectly returns true. Zero is not positive — use strict `>` instead of `>=`.",
+        "path": "src/validator.js",
+        "line": 11,
+        "originalLine": 11,
+        "author": {"login": "reviewer"},
+        "createdAt": "2025-01-01T00:00:00Z"
+      }
+    ]
+  }
+}
+EOF
+  )
+
+  result="$(classify_one_thread "$TEST_TMPDIR/worktree" "$thread_json")"
+  [ "$(echo "$result" | jq -r '.decision')" = "needs_llm" ]
+}
+
+@test "classify_one_thread: e2e config-value comment classifies as needs_llm" {
+  mkdir -p "$TEST_TMPDIR/worktree/src"
+  touch "$TEST_TMPDIR/worktree/src/config.py"
+
+  local thread_json
+  thread_json=$(cat <<'EOF'
+{
+  "id": "PRRT_e2e4",
+  "isResolved": false,
+  "isOutdated": false,
+  "path": "src/config.py",
+  "line": 2,
+  "comments": {
+    "nodes": [
+      {
+        "id": "C_e2e4",
+        "body": "DEFAULT_TIMEOUT should be 60 seconds to match the production default, not 30.",
+        "path": "src/config.py",
+        "line": 2,
+        "originalLine": 2,
+        "author": {"login": "reviewer"},
+        "createdAt": "2025-01-01T00:00:00Z"
+      }
+    ]
+  }
+}
+EOF
+  )
+
+  result="$(classify_one_thread "$TEST_TMPDIR/worktree" "$thread_json")"
+  [ "$(echo "$result" | jq -r '.decision')" = "needs_llm" ]
+}
