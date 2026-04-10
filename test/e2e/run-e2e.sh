@@ -20,7 +20,8 @@ _raw_fixture="${FIXTURE_DIR:-$SCRIPT_DIR/../../fixture-repo}"
 FIXTURE_DIR="$(cd "$_raw_fixture" 2>/dev/null && pwd || echo "$_raw_fixture")"
 E2E_BRANCH="e2e-test-$(date +%s)-$$"
 PR_NUMBER=""
-MAIN_SHA_BEFORE=""  # saved so cleanup can restore main
+MAIN_SHA_BEFORE=""    # HEAD of main before any test mutations
+MAIN_SHA_CONFLICT=""  # SHA of the conflict commit pushed in Step 4 (reverted in cleanup)
 
 echo "=== gh-crfix E2E Test ==="
 echo "Script : $GHCRFIX"
@@ -42,20 +43,17 @@ cleanup() {
   fi
   git -C "$FIXTURE_DIR" push origin --delete "$E2E_BRANCH" 2>/dev/null || true
 
-  # Restore main to pre-test state by reverting any commits we added
-  if [ -n "${MAIN_SHA_BEFORE:-}" ]; then
-    echo "Restoring main (reverting conflict commit)..."
+  # Restore main to pre-test state by reverting exactly the commit we pushed in Step 4
+  if [ -n "${MAIN_SHA_CONFLICT:-}" ]; then
+    echo "Restoring main (reverting conflict commit $MAIN_SHA_CONFLICT)..."
     git -C "$FIXTURE_DIR" fetch origin main 2>/dev/null || true
     # Discard any working-tree drift before switching branches
     git -C "$FIXTURE_DIR" reset --hard HEAD 2>/dev/null || true
     git -C "$FIXTURE_DIR" checkout main 2>/dev/null || true
     git -C "$FIXTURE_DIR" reset --hard origin/main 2>/dev/null || true
-    CURRENT_MAIN="$(git -C "$FIXTURE_DIR" rev-parse HEAD 2>/dev/null || echo "")"
-    if [ -n "$CURRENT_MAIN" ] && [ "$CURRENT_MAIN" != "$MAIN_SHA_BEFORE" ]; then
-      git -C "$FIXTURE_DIR" revert "$CURRENT_MAIN" --no-edit 2>/dev/null \
-        && git -C "$FIXTURE_DIR" push origin main 2>/dev/null \
-        || echo "  (revert failed — manual cleanup may be needed: git -C $FIXTURE_DIR revert HEAD)"
-    fi
+    git -C "$FIXTURE_DIR" revert "$MAIN_SHA_CONFLICT" --no-edit 2>/dev/null \
+      && git -C "$FIXTURE_DIR" push origin main 2>/dev/null \
+      || echo "  (revert failed — manual cleanup may be needed: git -C $FIXTURE_DIR revert $MAIN_SHA_CONFLICT)"
   fi
 
   # Remove any stale gh-crfix worktrees inside the fixture repo
@@ -70,9 +68,10 @@ trap cleanup EXIT
 # ── Preflight ────────────────────────────────────────────────────────────────
 
 echo "=== Preflight ==="
-command -v gh     >/dev/null || { echo "FAIL: gh CLI not found";     exit 1; }
-command -v claude >/dev/null || { echo "FAIL: claude CLI not found"; exit 1; }
-command -v jq     >/dev/null || { echo "FAIL: jq not found";         exit 1; }
+command -v gh      >/dev/null || { echo "FAIL: gh CLI not found";      exit 1; }
+command -v claude  >/dev/null || { echo "FAIL: claude CLI not found";  exit 1; }
+command -v jq      >/dev/null || { echo "FAIL: jq not found";          exit 1; }
+command -v python3 >/dev/null || { echo "FAIL: python3 not found";     exit 1; }
 [ -x "$GHCRFIX" ] || { echo "FAIL: $GHCRFIX not executable"; exit 1; }
 [ -d "$FIXTURE_DIR/.git" ] || { echo "FAIL: $FIXTURE_DIR is not a git repo"; exit 1; }
 echo "All checks passed."
@@ -92,24 +91,25 @@ git checkout -b "$E2E_BRANCH"
 
 # Bug 1: typo in parameter name  (format_name in utils.py)
 python3 - <<'PYEOF'
-f = 'src/utils.py'
-c = open(f).read().replace('first_name', 'frist_name')
-open(f, 'w').write(c)
+from pathlib import Path
+p = Path('src/utils.py')
+p.write_text(p.read_text().replace('first_name', 'frist_name'))
 PYEOF
 
 # Bug 2: unused import added     (utils.py) — insert after "import os" (line 3)
 python3 - <<'PYEOF'
-f = 'src/utils.py'
-lines = open(f).readlines()
+from pathlib import Path
+p = Path('src/utils.py')
+lines = p.read_text().splitlines(keepends=True)
 lines.insert(3, 'import sys\n')
-open(f, 'w').writelines(lines)
+p.write_text(''.join(lines))
 PYEOF
 
 # Bug 3: wrong comparison operator  (validator.js — isPositiveNumber)
 python3 - <<'PYEOF'
-f = 'src/validator.js'
-c = open(f).read().replace('value > 0', 'value >= 0', 1)
-open(f, 'w').write(c)
+from pathlib import Path
+p = Path('src/validator.js')
+p.write_text(p.read_text().replace('value > 0', 'value >= 0', 1))
 PYEOF
 
 # Bug 4: new file added on this branch — main will add a conflicting version
@@ -202,8 +202,9 @@ PYEOF
 
 git add src/config.py
 git commit -m "chore: add production config defaults (E2E conflict commit)"
+MAIN_SHA_CONFLICT="$(git rev-parse HEAD)"
 git push origin main
-echo "Main advanced — $(git rev-parse HEAD)"
+echo "Main advanced — $MAIN_SHA_CONFLICT"
 git checkout "$E2E_BRANCH"
 echo ""
 

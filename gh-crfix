@@ -3714,7 +3714,7 @@ process_pr() {
   # Signal start
   date +%s > "$LOG_DIR/pr-${pr_num}.started"
 
-  {
+  (
     mlog "[process-pr] PR #$pr_num: START title='$title'" "$log_file"
     echo "━━━ PR #$pr_num ━━━ [$title]"
     echo "worktree: $worktree_path"
@@ -3904,7 +3904,7 @@ process_pr() {
     # 11. Write status
     echo "[done]"
     echo "OK" > "$LOG_DIR/pr-$pr_num.status"
-  } >> "$log_file" 2>&1 || {
+  ) >> "$log_file" 2>&1 || {
     progress_mark_remaining "$pr_num" failed "stopped after error"
     echo "FAIL" > "$LOG_DIR/pr-$pr_num.status"
     return 0
