@@ -1,3 +1,4 @@
 test/test_helper/bats-support/
 test/test_helper/bats-assert/
 .gh-crfix/
+bin/
