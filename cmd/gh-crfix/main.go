@@ -7,9 +7,11 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/maszynka/gh-crfix/internal/ai"
 	"github.com/maszynka/gh-crfix/internal/config"
 	"github.com/maszynka/gh-crfix/internal/input"
 	"github.com/maszynka/gh-crfix/internal/model"
+	"github.com/maszynka/gh-crfix/internal/workflow"
 )
 
 const version = "0.1.0-go"
@@ -19,7 +21,6 @@ func main() {
 }
 
 func run(args []string) int {
-	// No args → show usage
 	if len(args) == 0 {
 		usage()
 		return 0
@@ -34,10 +35,8 @@ func run(args []string) int {
 		return 0
 	}
 
-	// Strip known flags to find the positional PR spec.
 	prSpec, flags := splitArgsAndFlags(args)
 
-	// --version embedded anywhere
 	for _, f := range flags {
 		if f == "--version" || f == "-v" {
 			fmt.Printf("gh-crfix %s (Go port)\n", version)
@@ -45,7 +44,6 @@ func run(args []string) int {
 		}
 	}
 
-	// Load persisted config.
 	cfgPath := defaultConfigPath()
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
@@ -53,14 +51,11 @@ func run(args []string) int {
 		cfg = config.Defaults()
 	}
 
-	// Apply flag overrides to config.
 	applyFlags(flags, &cfg)
 
-	// Determine backend family for model validation.
-	gateFamily := model.Family(cfg.GateModel)
-	fixFamily := model.Family(cfg.FixModel)
-	_ = gateFamily
-	_ = fixFamily
+	// Validate model names (informational only).
+	_ = model.Family(cfg.GateModel)
+	_ = model.Family(cfg.FixModel)
 
 	// Parse PR spec.
 	var ownerRepo string
@@ -69,7 +64,6 @@ func run(args []string) int {
 	if strings.Contains(prSpec, "github.com/") {
 		ownerRepo, prNums, err = input.ParseURL(prSpec)
 	} else {
-		// Bare numbers: need the current repo. Ask the gh CLI.
 		ownerRepo, err = currentRepo()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: not in a GitHub repo and no URL given (%v)\n", err)
@@ -92,20 +86,47 @@ func run(args []string) int {
 	fmt.Printf("  scores      : needs_llm=%.3f  pr_comment=%.3f  test_failure=%.3f\n",
 		cfg.ScoreNeedsLLM, cfg.ScorePRComment, cfg.ScoreTestFailure)
 	fmt.Println()
-	fmt.Println("  ⚠  Full PR workflow (worktree setup, triage run, gate, AI fix)")
-	fmt.Println("     is not yet wired up in the Go port.")
-	fmt.Println("     Implemented so far: input parsing, config, model registry,")
-	fmt.Println("     triage classifier, gate scoring, KV store.")
 
-	return 0
+	// Build base options from config.
+	baseOpts := workflow.OptionsFromConfig(cfg, ownerRepo, 0)
+	baseOpts.RepoRoot = os.Getenv("GH_CRFIX_DIR")
+	applyWorkflowFlags(flags, &baseOpts)
+
+	// Detect backend if auto.
+	if baseOpts.AIBackend == ai.BackendAuto {
+		baseOpts.AIBackend = ai.Detect()
+		switch baseOpts.AIBackend {
+		case ai.BackendClaude:
+			fmt.Println("  backend auto-detected: claude")
+		case ai.BackendCodex:
+			fmt.Println("  backend auto-detected: codex")
+		default:
+			fmt.Fprintln(os.Stderr, "warning: no AI backend found (install claude or codex)")
+		}
+	}
+	fmt.Println()
+
+	exitCode := 0
+	for _, prNum := range prNums {
+		opts := baseOpts
+		opts.PRNum = prNum
+		opts.Repo = ownerRepo
+
+		fmt.Printf("── PR #%d ──────────────────────────────────────────────\n", prNum)
+		if err := workflow.ProcessPR(opts); err != nil {
+			fmt.Fprintf(os.Stderr, "  error: %v\n", err)
+			exitCode = 1
+		}
+		fmt.Println()
+	}
+	return exitCode
 }
 
-// splitArgsAndFlags separates the first positional argument (PR spec) from flags.
+// splitArgsAndFlags separates the first positional argument from flags.
 func splitArgsAndFlags(args []string) (prSpec string, flags []string) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if strings.HasPrefix(a, "-") {
-			// Flags with values: consume the next token too.
 			switch a {
 			case "-c", "--concurrency", "--ai-backend",
 				"--gate-model", "--fix-model",
@@ -158,7 +179,60 @@ func applyFlags(flags []string, cfg *config.Config) {
 	}
 }
 
-// currentRepo calls `gh repo view` to find the owner/repo for the current directory.
+// applyWorkflowFlags overlays CLI flags on workflow options.
+func applyWorkflowFlags(flags []string, opts *workflow.Options) {
+	for i := 0; i < len(flags); i++ {
+		switch flags[i] {
+		case "--ai-backend":
+			if i+1 < len(flags) {
+				i++
+				opts.AIBackend = ai.ParseBackend(flags[i])
+			}
+		case "--gate-model":
+			if i+1 < len(flags) {
+				i++
+				opts.GateModel = flags[i]
+			}
+		case "--fix-model":
+			if i+1 < len(flags) {
+				i++
+				opts.FixModel = flags[i]
+			}
+		case "--max-threads":
+			if i+1 < len(flags) {
+				i++
+				var n int
+				fmt.Sscanf(flags[i], "%d", &n)
+				if n > 0 {
+					opts.MaxThreads = n
+				}
+			}
+		case "--autofix-hook":
+			if i+1 < len(flags) {
+				i++
+				opts.AutofixHook = flags[i]
+			}
+		case "--validate-hook":
+			if i+1 < len(flags) {
+				i++
+				opts.ValidateHook = flags[i]
+			}
+		case "--dry-run":
+			opts.DryRun = true
+		case "--no-resolve":
+			opts.ResolveSkipped = false
+		case "--resolve-skipped":
+			opts.ResolveSkipped = true
+		case "--no-post-fix":
+			opts.NoPostFix = true
+		case "--exclude-outdated":
+			opts.IncludeOutdated = false
+		case "--verbose":
+			opts.Verbose = true
+		}
+	}
+}
+
 func currentRepo() (string, error) {
 	out, err := exec.Command("gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner").Output()
 	if err != nil {
@@ -167,7 +241,6 @@ func currentRepo() (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// defaultConfigPath returns the path to the persisted defaults file.
 func defaultConfigPath() string {
 	base := os.Getenv("XDG_CONFIG_HOME")
 	if base == "" {
@@ -193,11 +266,22 @@ Flags:
   --ai-backend BACKEND     auto|claude|codex
   --gate-model MODEL       small gate model (default: sonnet)
   --fix-model  MODEL       advanced fix model (default: sonnet)
+  --max-threads N          max threads fetched per PR (default: 100)
+  --validate-hook PATH     repo-local validation script
+  --autofix-hook PATH      repo-local autofix script
+  --dry-run                no GitHub writes, no AI run
+  --exclude-outdated       skip outdated threads
+  --resolve-skipped        resolve skipped threads too
+  --no-post-fix            skip post-fix summary comment
   --score-needs-llm N      gate score weight [0,1]
   --score-pr-comment N     gate score weight [0,1]
   --score-test-failure N   gate score weight [0,1]
+  --verbose                verbose output
   --version, -v            show version
   --help, -h               show this help
+
+Env:
+  GH_CRFIX_DIR             local repo path (defaults to current git root)
 
 Config: %s
 `, version, defaultConfigPath())

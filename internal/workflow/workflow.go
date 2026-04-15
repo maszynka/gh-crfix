@@ -1,0 +1,505 @@
+// Package workflow orchestrates the full gh-crfix PR processing pipeline.
+package workflow
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+
+	"github.com/maszynka/gh-crfix/internal/ai"
+	"github.com/maszynka/gh-crfix/internal/config"
+	"github.com/maszynka/gh-crfix/internal/gate"
+	ghapi "github.com/maszynka/gh-crfix/internal/github"
+	"github.com/maszynka/gh-crfix/internal/triage"
+	"github.com/maszynka/gh-crfix/internal/validate"
+	"github.com/maszynka/gh-crfix/internal/worktree"
+)
+
+// ThreadResponse is written by the fix model (and by deterministic logic)
+// to describe what was done for each thread.
+type ThreadResponse struct {
+	ThreadID          string `json:"thread_id"`
+	Action            string `json:"action"`             // fixed | skipped | already_fixed
+	Comment           string `json:"comment"`
+	ResolveWhenSkipped bool  `json:"resolve_when_skipped,omitempty"`
+}
+
+// Options configures a single PR processing run.
+type Options struct {
+	Repo            string
+	PRNum           int
+	RepoRoot        string // local git clone root; empty = auto-detect from cwd
+	AIBackend       ai.Backend
+	GateModel       string
+	FixModel        string
+	MaxThreads      int
+	IncludeOutdated bool
+	ValidateHook    string
+	AutofixHook     string
+	DryRun          bool
+	ResolveSkipped  bool
+	NoPostFix       bool
+	Weights         gate.ScoreWeights
+	Verbose         bool
+}
+
+// OptionsFromConfig builds Options from a Config and overrides.
+func OptionsFromConfig(cfg config.Config, repo string, prNum int) Options {
+	return Options{
+		Repo:            repo,
+		PRNum:           prNum,
+		AIBackend:       ai.ParseBackend(cfg.AIBackend),
+		GateModel:       cfg.GateModel,
+		FixModel:        cfg.FixModel,
+		MaxThreads:      100,
+		IncludeOutdated: true,
+		Weights: gate.ScoreWeights{
+			NeedsLLM:    cfg.ScoreNeedsLLM,
+			PRComment:   cfg.ScorePRComment,
+			TestFailure: cfg.ScoreTestFailure,
+		},
+	}
+}
+
+// ProcessPR runs the full gh-crfix pipeline for a single PR.
+func ProcessPR(opts Options) error {
+	log := func(format string, a ...interface{}) {
+		fmt.Printf("  [PR #%d] "+format+"\n", append([]interface{}{opts.PRNum}, a...)...)
+	}
+
+	// ── 1. Fetch PR metadata ──────────────────────────────────────────────
+	log("fetching PR metadata...")
+	pr, err := ghapi.FetchPR(opts.Repo, opts.PRNum)
+	if err != nil {
+		return fmt.Errorf("fetch PR: %w", err)
+	}
+	if pr.State != "OPEN" {
+		return fmt.Errorf("PR #%d is not open (state=%s)", opts.PRNum, pr.State)
+	}
+	log("branch=%s  title=%q", pr.HeadRefName, pr.Title)
+
+	// ── 2. Set up worktree ────────────────────────────────────────────────
+	repoRoot := opts.RepoRoot
+	if repoRoot == "" {
+		var rerr error
+		repoRoot, rerr = worktree.RepoRoot(".")
+		if rerr != nil {
+			return fmt.Errorf("not in a git repo; set GH_CRFIX_DIR or cd into your clone: %w", rerr)
+		}
+	}
+	log("setting up worktree...")
+	wtPath, err := worktree.Setup(repoRoot, pr.HeadRefName, opts.PRNum)
+	if err != nil {
+		return fmt.Errorf("worktree setup: %w", err)
+	}
+
+	// ── 3. Merge base branch ──────────────────────────────────────────────
+	log("merging base branch %q...", pr.BaseRefName)
+	if mergeErr := worktree.MergeBase(wtPath, pr.BaseRefName); mergeErr != nil {
+		log("warning: merge base failed: %v", mergeErr)
+	}
+
+	// ── 4. Fetch review threads ───────────────────────────────────────────
+	log("fetching review threads...")
+	rawThreads, err := ghapi.FetchThreads(opts.Repo, opts.PRNum, opts.MaxThreads)
+	if err != nil {
+		return fmt.Errorf("fetch threads: %w", err)
+	}
+	log("%d unresolved threads", len(rawThreads))
+
+	// ── 5. Triage threads ─────────────────────────────────────────────────
+	classifications := make([]triage.Classification, 0, len(rawThreads))
+	for _, rt := range rawThreads {
+		t := toTriageThread(rt)
+		c := triage.ClassifyThread(wtPath, t, opts.IncludeOutdated)
+		classifications = append(classifications, c)
+	}
+
+	var skipList, autoList, alreadyFixedList, needsLLMList []triage.Classification
+	for _, c := range classifications {
+		switch c.Decision {
+		case "skip":
+			skipList = append(skipList, c)
+		case "auto":
+			autoList = append(autoList, c)
+		case "already_likely_fixed":
+			alreadyFixedList = append(alreadyFixedList, c)
+		default:
+			needsLLMList = append(needsLLMList, c)
+		}
+	}
+	log("triage: skip=%d auto=%d already_fixed=%d needs_llm=%d",
+		len(skipList), len(autoList), len(alreadyFixedList), len(needsLLMList))
+
+	// ── 6. Build deterministic responses ──────────────────────────────────
+	var responses []ThreadResponse
+	for _, c := range skipList {
+		reason := fmt.Sprintf("Skipping: %s", c.Reason)
+		responses = append(responses, ThreadResponse{
+			ThreadID:          c.ThreadID,
+			Action:            "skipped",
+			Comment:           reason,
+			ResolveWhenSkipped: c.ResolveWhenSkipped,
+		})
+	}
+	for _, c := range alreadyFixedList {
+		responses = append(responses, ThreadResponse{
+			ThreadID: c.ThreadID,
+			Action:   "already_fixed",
+			Comment:  "This change appears to already be addressed in the current diff.",
+		})
+	}
+
+	// ── 7. Run autofix hook ───────────────────────────────────────────────
+	if opts.AutofixHook != "" || hasAutofixHook(wtPath) {
+		hookPath := opts.AutofixHook
+		if hookPath == "" {
+			hookPath = detectAutofixHook(wtPath)
+		}
+		if hookPath != "" {
+			log("running autofix hook...")
+			runHook(hookPath, wtPath)
+		}
+	}
+
+	// ── 8. Validation ─────────────────────────────────────────────────────
+	runner := validate.Detect(wtPath, opts.ValidateHook)
+	var validResult validate.Result
+	if runner.Kind != validate.RunnerNone {
+		log("running validation (%s)...", runner.Command)
+		validResult = validate.Run(wtPath, runner)
+		if validResult.TestsFailed {
+			log("validation: FAILED — %s", firstLine(validResult.Summary))
+		} else {
+			log("validation: passed")
+		}
+	}
+
+	// ── 9. Fetch failing CI checks ────────────────────────────────────────
+	var ciChecks []ghapi.CICheck
+	if pr.HeadSHA != "" {
+		log("fetching CI check results...")
+		ciChecks, _ = ghapi.FetchFailingChecks(opts.Repo, pr.HeadSHA)
+		if len(ciChecks) > 0 {
+			log("%d failing CI check(s)", len(ciChecks))
+		}
+	}
+
+	// ── 10. Gate scoring ──────────────────────────────────────────────────
+	// auto threads without an autofix hook are treated as needs_llm.
+	activeNeedsLLM := needsLLMList
+	if !hasAutofixHook(wtPath) && opts.AutofixHook == "" {
+		activeNeedsLLM = append(activeNeedsLLM, autoList...)
+	}
+
+	triageSummary := gate.TriageSummary{}
+	for _, c := range activeNeedsLLM {
+		triageSummary.NeedsLLM = append(triageSummary.NeedsLLM,
+			gate.TriageEntry{ThreadID: c.ThreadID, Reason: c.Reason})
+	}
+	// PR-level comments already counted in needsLLM
+	validationResult := gate.ValidationResult{TestsFailed: validResult.TestsFailed}
+	gateCtx := gate.BuildGateContext(triageSummary, validationResult, opts.Weights)
+
+	log("gate score=%.3f (threshold=%.1f) should_run=%v",
+		gateCtx.TotalScore, gateCtx.Threshold, gateCtx.ShouldRunGate)
+
+	// ── 11. Gate model ────────────────────────────────────────────────────
+	var gateOut ai.GateOutput
+	if gateCtx.ShouldRunGate && !opts.DryRun {
+		log("running gate model (%s)...", opts.GateModel)
+		prompt := buildGatePrompt(rawThreads, activeNeedsLLM, validResult, ciChecks, gateCtx)
+		gateOut, err = ai.RunGate(opts.AIBackend, opts.GateModel, prompt, gate.GateSchema())
+		if err != nil {
+			log("gate model error: %v", err)
+		} else {
+			log("gate: needs_advanced_model=%v threads_to_fix=%v", gateOut.NeedsAdvancedModel, gateOut.ThreadsToFix)
+		}
+	} else if !gateCtx.ShouldRunGate {
+		// Below threshold — generate responses for active threads as already ok.
+		for _, c := range activeNeedsLLM {
+			responses = append(responses, ThreadResponse{
+				ThreadID: c.ThreadID,
+				Action:   "skipped",
+				Comment:  "Score below threshold — no advanced review needed.",
+			})
+		}
+	}
+
+	// ── 12. Fix model ─────────────────────────────────────────────────────
+	if gateOut.NeedsAdvancedModel && !opts.DryRun {
+		log("running fix model (%s)...", opts.FixModel)
+		fixPrompt := buildFixPrompt(rawThreads, activeNeedsLLM, gateOut.ThreadsToFix, validResult, ciChecks)
+		if ferr := ai.RunFix(opts.AIBackend, opts.FixModel, fixPrompt, wtPath); ferr != nil {
+			log("fix model error: %v", ferr)
+		}
+		// Read thread-responses.json written by the fix model.
+		if fixResponses, rerr := readThreadResponses(wtPath); rerr == nil {
+			responses = append(responses, fixResponses...)
+		}
+		// Clean up thread-responses.json from git tracking.
+		cleanThreadResponses(wtPath)
+	}
+
+	// ── 13. Reply and resolve ─────────────────────────────────────────────
+	if !opts.DryRun {
+		replied, resolved, skipped := 0, 0, 0
+		for _, r := range responses {
+			if r.Comment != "" {
+				if rerr := ghapi.ReplyToThread(r.ThreadID, r.Comment); rerr != nil {
+					log("reply thread %s: %v", r.ThreadID, rerr)
+				} else {
+					replied++
+				}
+			}
+			switch r.Action {
+			case "fixed", "already_fixed":
+				if rerr := ghapi.ResolveThread(r.ThreadID); rerr != nil {
+					log("resolve thread %s: %v", r.ThreadID, rerr)
+				} else {
+					resolved++
+				}
+			case "skipped":
+				if opts.ResolveSkipped || r.ResolveWhenSkipped {
+					_ = ghapi.ResolveThread(r.ThreadID)
+					resolved++
+				} else {
+					skipped++
+				}
+			}
+		}
+		log("replied=%d resolved=%d skipped=%d", replied, resolved, skipped)
+
+		// Post summary comment.
+		if !opts.NoPostFix {
+			summary := buildSummaryComment(gateCtx, gateOut, len(responses), len(rawThreads))
+			if cerr := ghapi.PostComment(opts.Repo, opts.PRNum, summary); cerr != nil {
+				log("post comment: %v", cerr)
+			}
+		}
+	} else {
+		log("dry-run: would process %d responses", len(responses))
+	}
+
+	return nil
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+func toTriageThread(rt ghapi.Thread) triage.Thread {
+	t := triage.Thread{
+		ID:         rt.ID,
+		IsResolved: rt.IsResolved,
+		IsOutdated: rt.IsOutdated,
+		Path:       rt.Path,
+		Line:       rt.Line,
+	}
+	for _, c := range rt.Comments {
+		t.Comments = append(t.Comments, triage.Comment{
+			ID:           c.ID,
+			Body:         c.Body,
+			Path:         c.Path,
+			Line:         c.Line,
+			OriginalLine: c.OriginalLine,
+			Author:       c.Author,
+			CreatedAt:    c.CreatedAt,
+		})
+	}
+	return t
+}
+
+func buildGatePrompt(
+	threads []ghapi.Thread,
+	classes []triage.Classification,
+	vr validate.Result,
+	ci []ghapi.CICheck,
+	gctx gate.GateContext,
+) string {
+	var sb strings.Builder
+
+	sb.WriteString("## Gate Decision Request\n\n")
+	sb.WriteString("You are a senior code reviewer acting as a triage gate.\n")
+	sb.WriteString("Decide whether the residual review threads require an advanced model to fix.\n\n")
+
+	sb.WriteString("### Gate Score\n")
+	fmt.Fprintf(&sb, "- total_score: %.3f (threshold: %.1f)\n", gctx.TotalScore, gctx.Threshold)
+	fmt.Fprintf(&sb, "- needs_llm threads: %d\n", gctx.Components.NeedsLLM.Count)
+	fmt.Fprintf(&sb, "- pr_comment threads: %d\n", gctx.Components.PRComment.Count)
+	fmt.Fprintf(&sb, "- tests_failed: %v\n\n", gctx.Components.TestFailure.Failed)
+
+	if vr.Ran && !vr.Success {
+		sb.WriteString("### Validation Failure\n")
+		sb.WriteString("```\n")
+		sb.WriteString(vr.Summary)
+		sb.WriteString("\n```\n\n")
+	}
+
+	if len(ci) > 0 {
+		sb.WriteString("### Failing CI Checks\n")
+		for _, c := range ci {
+			fmt.Fprintf(&sb, "**%s**\n```\n%s\n```\n\n", c.Name, truncate(c.LogText, 500))
+		}
+	}
+
+	sb.WriteString("### Residual Review Threads\n")
+	byID := make(map[string]ghapi.Thread, len(threads))
+	for _, t := range threads {
+		byID[t.ID] = t
+	}
+	for _, c := range classes {
+		t := byID[c.ThreadID]
+		fmt.Fprintf(&sb, "\n**Thread %s** — `%s:%d` — reason: %s\n", c.ThreadID, c.Path, c.Line, c.Reason)
+		for _, cm := range t.Comments {
+			fmt.Fprintf(&sb, "> @%s: %s\n", cm.Author, cm.Body)
+		}
+	}
+
+	sb.WriteString("\n### Output Instructions\n")
+	sb.WriteString("Return a JSON object with:\n")
+	sb.WriteString("- `needs_advanced_model` (boolean): true if advanced model should fix threads\n")
+	sb.WriteString("- `reason` (string): brief explanation\n")
+	sb.WriteString("- `threads_to_fix` (array of thread IDs): which threads need fixing\n")
+
+	return sb.String()
+}
+
+func buildFixPrompt(
+	threads []ghapi.Thread,
+	classes []triage.Classification,
+	threadIDs []string,
+	vr validate.Result,
+	ci []ghapi.CICheck,
+) string {
+	var sb strings.Builder
+
+	sb.WriteString("## PR Review Fix Task\n\n")
+	sb.WriteString("You are a senior software engineer. Fix the issues identified in this PR review.\n\n")
+
+	sb.WriteString("### Instructions\n")
+	sb.WriteString("1. Read AGENTS.md and CLAUDE.md in this repo if they exist.\n")
+	sb.WriteString("2. Fix ALL of the threads listed below AND any CI/test failures.\n")
+	sb.WriteString("3. Make minimal, correct changes. Do not refactor unrelated code.\n")
+	sb.WriteString("4. After making all changes, create `thread-responses.json` in the repo root:\n")
+	sb.WriteString("   ```json\n")
+	sb.WriteString("   [\n")
+	sb.WriteString("     {\"thread_id\": \"PRRT_xxx\", \"action\": \"fixed\", \"comment\": \"explanation\"}\n")
+	sb.WriteString("   ]\n")
+	sb.WriteString("   ```\n")
+	sb.WriteString("   Valid actions: fixed | skipped | already_fixed\n")
+	sb.WriteString("5. Stage, commit, and push all changes.\n\n")
+
+	if len(ci) > 0 {
+		sb.WriteString("### Failing CI Checks (must fix)\n")
+		for _, c := range ci {
+			fmt.Fprintf(&sb, "**%s**\n```\n%s\n```\n\n", c.Name, truncate(c.LogText, 800))
+		}
+	}
+
+	if vr.Ran && !vr.Success {
+		sb.WriteString("### Test Failures (must fix)\n```\n")
+		sb.WriteString(vr.Summary)
+		sb.WriteString("\n```\n\n")
+	}
+
+	// Build set for quick lookup.
+	fixSet := make(map[string]bool, len(threadIDs))
+	for _, id := range threadIDs {
+		fixSet[id] = true
+	}
+
+	byID := make(map[string]ghapi.Thread, len(threads))
+	for _, t := range threads {
+		byID[t.ID] = t
+	}
+
+	sb.WriteString("### Threads to Fix\n")
+	for _, c := range classes {
+		if len(fixSet) > 0 && !fixSet[c.ThreadID] {
+			continue
+		}
+		t := byID[c.ThreadID]
+		fmt.Fprintf(&sb, "\n**Thread %s**\n", c.ThreadID)
+		fmt.Fprintf(&sb, "- File: `%s` line %d\n", c.Path, c.Line)
+		fmt.Fprintf(&sb, "- Reason: %s\n", c.Reason)
+		sb.WriteString("- Comments:\n")
+		for _, cm := range t.Comments {
+			fmt.Fprintf(&sb, "  - @%s (%s): %s\n", cm.Author, cm.CreatedAt, cm.Body)
+		}
+	}
+
+	return sb.String()
+}
+
+func buildSummaryComment(gctx gate.GateContext, gout ai.GateOutput, processed, total int) string {
+	var sb strings.Builder
+	sb.WriteString("### gh-crfix summary\n\n")
+	fmt.Fprintf(&sb, "- threads scanned: %d\n", total)
+	fmt.Fprintf(&sb, "- gate score: %.3f\n", gctx.TotalScore)
+	if gout.NeedsAdvancedModel {
+		fmt.Fprintf(&sb, "- fix model ran: yes (%d threads processed)\n", processed)
+		if gout.Reason != "" {
+			fmt.Fprintf(&sb, "- reason: %s\n", gout.Reason)
+		}
+	} else {
+		sb.WriteString("- fix model ran: no (score below threshold or gate decided)\n")
+	}
+	return sb.String()
+}
+
+func readThreadResponses(wtPath string) ([]ThreadResponse, error) {
+	data, err := os.ReadFile(filepath.Join(wtPath, "thread-responses.json"))
+	if err != nil {
+		return nil, err
+	}
+	var responses []ThreadResponse
+	if err := json.Unmarshal(data, &responses); err != nil {
+		return nil, err
+	}
+	return responses, nil
+}
+
+func cleanThreadResponses(wtPath string) {
+	_ = os.Remove(filepath.Join(wtPath, "thread-responses.json"))
+}
+
+func hasAutofixHook(wtPath string) bool {
+	return detectAutofixHook(wtPath) != ""
+}
+
+func detectAutofixHook(wtPath string) string {
+	for _, rel := range []string{
+		".gh-crfix/autofix.sh",
+		"scripts/gh-crfix-autofix.sh",
+	} {
+		p := filepath.Join(wtPath, rel)
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() && fi.Mode()&0o111 != 0 {
+			return p
+		}
+	}
+	return ""
+}
+
+func runHook(hookPath, dir string) {
+	cmd := exec.Command(hookPath)
+	cmd.Dir = dir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	_ = cmd.Run()
+}
+
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "\n...(truncated)"
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
