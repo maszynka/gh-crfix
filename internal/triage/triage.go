@@ -40,6 +40,11 @@ type Classification struct {
 	ResolveWhenSkipped bool
 }
 
+// ReasonPRLevelComment is the triage reason for threads that have no file path
+// (i.e. PR-level comments). Exported so that downstream packages (e.g. gate)
+// can match on it without hard-coding the string.
+const ReasonPRLevelComment = "PR-level comment (no file path)"
+
 var (
 	questionKeywordsRe = regexp.MustCompile(`(?i)(could you|can you|why|what about|do we need|is this intentional|question|clarify)`)
 	actionableRe       = regexp.MustCompile(`(?i)(rename|change|fix|remove|add|use|should|must|please|nit:|typo|format|lint)`)
@@ -121,7 +126,7 @@ func ClassifyThread(worktreePath string, t Thread, includeOutdated bool) Classif
 	// 2. empty path => PR-level comment
 	if path == "" {
 		base.Decision = "needs_llm"
-		base.Reason = "PR-level comment (no file path)"
+		base.Reason = ReasonPRLevelComment
 		return base
 	}
 
@@ -140,10 +145,15 @@ func ClassifyThread(worktreePath string, t Thread, includeOutdated bool) Classif
 		return base
 	}
 
-	// 5. file doesn't exist
-	if _, err := os.Stat(filepath.Join(worktreePath, path)); os.IsNotExist(err) {
+	// 5. file doesn't exist (or is inaccessible — skip either way to avoid
+	//    misclassifying threads on permission-denied or similar errors)
+	if _, err := os.Stat(filepath.Join(worktreePath, path)); err != nil {
 		base.Decision = "skip"
-		base.Reason = "file no longer exists in worktree"
+		if os.IsNotExist(err) {
+			base.Reason = "file no longer exists in worktree"
+		} else {
+			base.Reason = "unable to stat file in worktree"
+		}
 		return base
 	}
 

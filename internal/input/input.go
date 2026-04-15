@@ -43,8 +43,14 @@ func parsePRPart(s string) ([]int, error) {
 	switch {
 	case rangeRe.MatchString(s):
 		parts := strings.SplitN(s, "-", 2)
-		start, _ := strconv.Atoi(parts[0])
-		end, _ := strconv.Atoi(parts[1])
+		start, err1 := strconv.Atoi(parts[0])
+		end, err2 := strconv.Atoi(parts[1])
+		if err1 != nil || err2 != nil {
+			return nil, fmt.Errorf("cannot parse PR number(s) from: %q", s)
+		}
+		if start > end {
+			return nil, fmt.Errorf("invalid PR range %d-%d: start must be <= end", start, end)
+		}
 		var result []int
 		for i := start; i <= end; i++ {
 			result = append(result, i)

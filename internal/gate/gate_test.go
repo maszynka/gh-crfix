@@ -2,6 +2,8 @@ package gate
 
 import (
 	"testing"
+
+	triagepkg "github.com/maszynka/gh-crfix/internal/triage"
 )
 
 // ---------------------------------------------------------------------------
@@ -19,7 +21,7 @@ func TestBuildGateContext(t *testing.T) {
 		triage := TriageSummary{
 			NeedsLLM: []TriageEntry{
 				{ThreadID: "t1", Reason: "complex comment"},
-				{ThreadID: "t2", Reason: "PR-level comment (no file path)"},
+				{ThreadID: "t2", Reason: triagepkg.ReasonPRLevelComment},
 			},
 		}
 		validation := ValidationResult{TestsFailed: true}
@@ -78,7 +80,7 @@ func TestBuildGateContext(t *testing.T) {
 	t.Run("needs_llm entry with PR-level reason sets pr_comment.count", func(t *testing.T) {
 		triage := TriageSummary{
 			NeedsLLM: []TriageEntry{
-				{ThreadID: "t1", Reason: "PR-level comment (no file path)"},
+				{ThreadID: "t1", Reason: triagepkg.ReasonPRLevelComment},
 			},
 		}
 		validation := ValidationResult{TestsFailed: false}

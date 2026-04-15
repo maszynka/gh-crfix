@@ -34,6 +34,9 @@ func Defaults() Config {
 	}
 }
 
+// isValidScore reports whether v is in the range [0, 1].
+func isValidScore(v float64) bool { return v >= 0 && v <= 1 }
+
 // Load reads a config file at path. Unknown keys are ignored. If the file does
 // not exist or a key is missing, the default value is used.
 func Load(path string) (Config, error) {
@@ -51,7 +54,7 @@ func Load(path string) (Config, error) {
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := scanner.Text()
-		// skip blank lines and comments
+		// skip blank lines and full-line comments
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
@@ -59,8 +62,12 @@ func Load(path string) (Config, error) {
 		if idx < 0 {
 			continue
 		}
-		key := line[:idx]
-		value := line[idx+1:]
+		key := strings.TrimSpace(line[:idx])
+		value := strings.TrimSpace(line[idx+1:])
+		// strip inline comments
+		if ci := strings.IndexByte(value, '#'); ci >= 0 {
+			value = strings.TrimSpace(value[:ci])
+		}
 		switch key {
 		case "AI_BACKEND":
 			switch value {
@@ -82,17 +89,17 @@ func Load(path string) (Config, error) {
 			}
 		case "SCORE_NEEDS_LLM":
 			v, err := strconv.ParseFloat(value, 64)
-			if err == nil {
+			if err == nil && isValidScore(v) {
 				c.ScoreNeedsLLM = v
 			}
 		case "SCORE_PR_COMMENT":
 			v, err := strconv.ParseFloat(value, 64)
-			if err == nil {
+			if err == nil && isValidScore(v) {
 				c.ScorePRComment = v
 			}
 		case "SCORE_TEST_FAILURE":
 			v, err := strconv.ParseFloat(value, 64)
-			if err == nil {
+			if err == nil && isValidScore(v) {
 				c.ScoreTestFailure = v
 			}
 		// unknown keys: silently ignore
@@ -106,12 +113,13 @@ func Save(path string, c Config) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
+	// Use a unique temp file to avoid collisions with concurrent saves.
+	f, err := os.CreateTemp(filepath.Dir(path), ".gh-crfix-defaults-*.tmp")
 	if err != nil {
 		return err
 	}
-	// Clean up the tmp file if anything goes wrong after this point.
+	tmp := f.Name()
+	// Clean up the temp file if anything goes wrong after this point.
 	ok := false
 	defer func() {
 		if !ok {
@@ -119,14 +127,26 @@ func Save(path string, c Config) error {
 		}
 	}()
 
-	fmt.Fprintf(f, "# gh-crfix persisted defaults\n")
-	fmt.Fprintf(f, "AI_BACKEND=%s\n", c.AIBackend)
-	fmt.Fprintf(f, "GATE_MODEL=%s\n", c.GateModel)
-	fmt.Fprintf(f, "FIX_MODEL=%s\n", c.FixModel)
-	fmt.Fprintf(f, "CONCURRENCY=%d\n", c.Concurrency)
-	fmt.Fprintf(f, "SCORE_NEEDS_LLM=%.3f\n", c.ScoreNeedsLLM)
-	fmt.Fprintf(f, "SCORE_PR_COMMENT=%.3f\n", c.ScorePRComment)
-	fmt.Fprintf(f, "SCORE_TEST_FAILURE=%.3f\n", c.ScoreTestFailure)
+	// Track write errors via a closure so each fmt.Fprintf is checked.
+	var writeErr error
+	write := func(format string, a ...interface{}) {
+		if writeErr != nil {
+			return
+		}
+		_, writeErr = fmt.Fprintf(f, format, a...)
+	}
+	write("# gh-crfix persisted defaults\n")
+	write("AI_BACKEND=%s\n", c.AIBackend)
+	write("GATE_MODEL=%s\n", c.GateModel)
+	write("FIX_MODEL=%s\n", c.FixModel)
+	write("CONCURRENCY=%d\n", c.Concurrency)
+	write("SCORE_NEEDS_LLM=%.3f\n", c.ScoreNeedsLLM)
+	write("SCORE_PR_COMMENT=%.3f\n", c.ScorePRComment)
+	write("SCORE_TEST_FAILURE=%.3f\n", c.ScoreTestFailure)
+	if writeErr != nil {
+		f.Close()
+		return writeErr
+	}
 	if err := f.Close(); err != nil {
 		return err
 	}

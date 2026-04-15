@@ -135,6 +135,11 @@ func TestParseBare(t *testing.T) {
 			input:   "abc",
 			wantErr: true,
 		},
+		{
+			name:    "descending range returns error",
+			input:   "10-8",
+			wantErr: true,
+		},
 	}
 
 	for _, tc := range tests {

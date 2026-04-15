@@ -1,6 +1,8 @@
 // Package gate builds gate prompts and computes gate scores.
 package gate
 
+import triagepkg "github.com/maszynka/gh-crfix/internal/triage"
+
 // TriageEntry is a single entry in the triage summary.
 type TriageEntry struct {
 	ThreadID string `json:"thread_id"`
@@ -58,7 +60,7 @@ func BuildGateContext(triage TriageSummary, validation ValidationResult, weights
 	needsLLMCount := len(triage.NeedsLLM)
 	prCommentCount := 0
 	for _, e := range triage.NeedsLLM {
-		if e.Reason == "PR-level comment (no file path)" {
+		if e.Reason == triagepkg.ReasonPRLevelComment {
 			prCommentCount++
 		}
 	}

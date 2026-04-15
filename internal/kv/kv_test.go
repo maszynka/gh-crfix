@@ -115,3 +115,36 @@ func TestAppendAndList(t *testing.T) {
 		}
 	})
 }
+
+func TestSafeNames(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(dir)
+
+	t.Run("path traversal in Set namespace returns error", func(t *testing.T) {
+		err := s.Set("../../etc", "passwd", "bad")
+		if err == nil {
+			t.Error("Set with path-traversal namespace should return error")
+		}
+	})
+
+	t.Run("path traversal in Set key returns error", func(t *testing.T) {
+		err := s.Set("ns", "../escape", "bad")
+		if err == nil {
+			t.Error("Set with path-traversal key should return error")
+		}
+	})
+
+	t.Run("path traversal in List returns error", func(t *testing.T) {
+		_, err := s.List("../../x")
+		if err == nil {
+			t.Error("List with path-traversal name should return error")
+		}
+	})
+
+	t.Run("path traversal in Append returns error", func(t *testing.T) {
+		err := s.Append("../../x", "val")
+		if err == nil {
+			t.Error("Append with path-traversal name should return error")
+		}
+	})
+}

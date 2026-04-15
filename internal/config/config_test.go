@@ -165,6 +165,61 @@ CONCURRENCY=4
 			t.Errorf("Concurrency = %d, want 4", c.Concurrency)
 		}
 	})
+
+	t.Run("inline # comment in value is stripped", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "defaults")
+		content := "AI_BACKEND=claude # set by launcher\nCONCURRENCY=6 # max workers\n"
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load error: %v", err)
+		}
+		if c.AIBackend != "claude" {
+			t.Errorf("AIBackend = %q, want %q", c.AIBackend, "claude")
+		}
+		if c.Concurrency != 6 {
+			t.Errorf("Concurrency = %d, want 6", c.Concurrency)
+		}
+	})
+
+	t.Run("score out of bounds keeps default", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "defaults")
+		content := "SCORE_NEEDS_LLM=5\nSCORE_PR_COMMENT=-1\n"
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load error: %v", err)
+		}
+		def := Defaults()
+		if c.ScoreNeedsLLM != def.ScoreNeedsLLM {
+			t.Errorf("ScoreNeedsLLM = %v after out-of-bounds value, want default %v", c.ScoreNeedsLLM, def.ScoreNeedsLLM)
+		}
+		if c.ScorePRComment != def.ScorePRComment {
+			t.Errorf("ScorePRComment = %v after out-of-bounds value, want default %v", c.ScorePRComment, def.ScorePRComment)
+		}
+	})
+
+	t.Run("whitespace around key and value trimmed", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "defaults")
+		content := " CONCURRENCY = 9 \n"
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load error: %v", err)
+		}
+		if c.Concurrency != 9 {
+			t.Errorf("Concurrency = %d, want 9 (whitespace should be trimmed)", c.Concurrency)
+		}
+	})
 }
 
 func TestSaveAndLoad(t *testing.T) {
