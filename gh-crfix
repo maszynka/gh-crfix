@@ -8,7 +8,7 @@
 #   4) gate model decides whether advanced model is needed
 #   5) advanced model only for residual hard cases
 #   6) post-fix review cycle + merge base branch
-#   7) TUI dashboard for parallel mode
+#   7) optional TUI dashboard for parallel mode
 #
 # Usage:
 #   gh crfix 123
@@ -22,7 +22,8 @@
 #   -c N, --concurrency N        max parallel PR workers (default: 3)
 #   --ai-backend BACKEND         AI backend: auto|claude|codex (default: auto)
 #   --seq                        same as -c 1
-#   --no-tui                     disable TUI dashboard (plain output)
+#   --tui                        enable TUI dashboard in batch mode
+#   --no-tui                     force plain output (default for CLI args)
 #   --no-post-fix                skip post-fix review cycle
 #   --setup-only                 only setup worktrees + collect triage
 #   --no-resolve                 do not resolve GitHub threads
@@ -69,6 +70,7 @@ AI_BACKEND="${GH_CRFIX_AI_BACKEND:-auto}"
 SETUP_ONLY=false
 NO_RESOLVE=false
 NO_TUI=false
+FORCE_TUI=false
 NO_POST_FIX=false
 INCLUDE_OUTDATED=true
 GATE_MODEL="${GH_CRFIX_GATE_MODEL:-sonnet}"
@@ -88,6 +90,7 @@ LOG_DIR=""
 MASTER_LOG=""
 SEMAPHORE=""
 BG_PIDS=""
+LAUNCHED_FROM_LAUNCHER=false
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -465,7 +468,8 @@ Flags:
   -c N, --concurrency N        max parallel PR workers (default: 3)
   --ai-backend BACKEND         AI backend: auto|claude|codex (default: auto)
   --seq                        sequential mode (same as -c 1)
-  --no-tui                     disable TUI dashboard (plain output)
+  --tui                        enable fullscreen TUI dashboard in batch mode
+  --no-tui                     force plain output (default for CLI args)
   --no-post-fix                skip post-fix review cycle (wait + merge master)
   --setup-only                 only setup worktrees + collect triage
   --no-resolve                 do not resolve GitHub threads
@@ -543,7 +547,8 @@ parse_flags() {
         case "$AI_BACKEND" in auto|claude|codex) ;; *) die "--ai-backend must be one of: auto, claude, codex" ;; esac
         ;;
       --seq) CONCURRENCY=1 ;;
-      --no-tui) NO_TUI=true ;;
+      --tui) FORCE_TUI=true; NO_TUI=false ;;
+      --no-tui) NO_TUI=true; FORCE_TUI=false ;;
       --no-post-fix) NO_POST_FIX=true ;;
       --setup-only) SETUP_ONLY=true ;;
       --no-resolve) NO_RESOLVE=true ;;
@@ -846,13 +851,13 @@ run_validation() {
       echo "[validate] running hook: $runner_value"
       (
         cd "$worktree_path" &&
-        CI=1 GH_CRFIX_VALIDATION_OUT="$hook_json" "$runner_value"
+        GH_CRFIX_VALIDATION_OUT="$hook_json" run_noninteractive "$runner_value"
       ) > "$raw_file" 2>&1 || exit_code=$?
     else
       echo "[validate] running builtin tests: $runner_value"
       (
         cd "$worktree_path" &&
-        CI=1 bash -c "$runner_value"
+        run_noninteractive bash -c "$runner_value"
       ) > "$raw_file" 2>&1 || exit_code=$?
     fi
 
@@ -1028,9 +1033,9 @@ run_case_collision_model() {
 
     local cmd_failed=false
     if [ "$AI_BACKEND" = "claude" ]; then
-      (cd "$worktree_path" && claude -p --model "$FIX_MODEL" --dangerously-skip-permissions < "$prompt_file") || cmd_failed=true
+      (cd "$worktree_path" && run_noninteractive claude -p --model "$FIX_MODEL" --dangerously-skip-permissions < "$prompt_file") || cmd_failed=true
     else
-      codex exec \
+      run_noninteractive codex exec \
         --cd "$worktree_path" \
         --model "$FIX_MODEL" \
         --dangerously-bypass-approvals-and-sandbox \
@@ -1623,14 +1628,14 @@ run_gate_model() {
     local raw_out="$LOG_DIR/gate-$pr_num.raw.txt"
     local cmd_failed=false
     if [ "$AI_BACKEND" = "claude" ]; then
-      claude -p \
+      run_noninteractive claude -p \
         --model "$GATE_MODEL" \
         --output-format json \
         --json-schema "$(cat "$schema_file")" \
         < "$prompt_file" \
         | jq -r '.structured_output // .result // empty' > "$raw_out" || cmd_failed=true
     else
-      codex exec \
+      run_noninteractive codex exec \
         --model "$GATE_MODEL" \
         --sandbox read-only \
         --skip-git-repo-check \
@@ -1763,9 +1768,9 @@ run_fix_model() {
 
     local cmd_failed=false
     if [ "$AI_BACKEND" = "claude" ]; then
-      (cd "$worktree_path" && claude -p --model "$FIX_MODEL" --dangerously-skip-permissions < "$prompt_file") || cmd_failed=true
+      (cd "$worktree_path" && run_noninteractive claude -p --model "$FIX_MODEL" --dangerously-skip-permissions < "$prompt_file") || cmd_failed=true
     else
-      codex exec \
+      run_noninteractive codex exec \
         --cd "$worktree_path" \
         --model "$FIX_MODEL" \
         --dangerously-bypass-approvals-and-sandbox \
@@ -2037,9 +2042,9 @@ After resolving: git add each file, git commit --no-edit, git push."
 
     local llm_succeeded=false
     if [ "$AI_BACKEND" = "claude" ]; then
-      (cd "$worktree_path" && claude --dangerously-skip-permissions -p "$prompt" < /dev/null 2>&1 | tail -10) && llm_succeeded=true
+      (cd "$worktree_path" && run_noninteractive claude --dangerously-skip-permissions -p "$prompt" < /dev/null) && llm_succeeded=true
     else
-      codex exec \
+      run_noninteractive codex exec \
         --cd "$worktree_path" \
         --model "$FIX_MODEL" \
         --dangerously-bypass-approvals-and-sandbox \
@@ -2115,9 +2120,9 @@ After all files are fixed: git commit -m 'fix: resolve committed conflict marker
 
     local llm_succeeded=false
     if [ "$AI_BACKEND" = "claude" ]; then
-      (cd "$worktree_path" && claude --dangerously-skip-permissions -p "$prompt" < /dev/null 2>&1) && llm_succeeded=true
+      (cd "$worktree_path" && run_noninteractive claude --dangerously-skip-permissions -p "$prompt" < /dev/null 2>&1) && llm_succeeded=true
     else
-      codex exec \
+      run_noninteractive codex exec \
         --cd "$worktree_path" \
         --model "$FIX_MODEL" \
         --dangerously-bypass-approvals-and-sandbox \
@@ -2308,6 +2313,26 @@ pr_at_index() {
     if [ "$i" -eq "$idx" ]; then echo "$pr"; return; fi
     i=$((i + 1))
   done
+}
+
+terminal_supports_tui() {
+  [ -t 0 ] && [ -t 1 ] && [ -r /dev/tty ]
+}
+
+should_use_tui() {
+  [ "$CONCURRENCY" -gt 1 ] || return 1
+  [ "$NO_TUI" = false ] || return 1
+  terminal_supports_tui || return 1
+
+  if [ "$FORCE_TUI" = true ] || [ "$LAUNCHED_FROM_LAUNCHER" = true ]; then
+    return 0
+  fi
+
+  return 1
+}
+
+run_noninteractive() {
+  CI=1 TERM=dumb NO_COLOR=1 CLICOLOR=0 FORCE_COLOR=0 "$@"
 }
 
 progress_steps() {
@@ -2999,6 +3024,7 @@ launcher_apply() {
   SCORE_NEEDS_LLM="$(normalize_score "$LAUNCH_SCORE_NEEDS_LLM")"
   SCORE_PR_COMMENT="$(normalize_score "$LAUNCH_SCORE_PR_COMMENT")"
   SCORE_TEST_FAILURE="$(normalize_score "$LAUNCH_SCORE_TEST_FAILURE")"
+  LAUNCHED_FROM_LAUNCHER=true
   parse_input "$LAUNCH_TARGET"
   save_persisted_defaults || { LAUNCH_ERROR="Could not save defaults to $(config_file)."; return 1; }
   return 0
@@ -4274,11 +4300,15 @@ main() {
 
   [ "$DRY_RUN" = true ] && echo "Mode       : DRY RUN"
 
+  local total=0
+  for _ in $PR_NUMBERS; do total=$((total + 1)); done
+  echo ""
+  echo "Preparing  : $total PR(s) (metadata, worktrees, unresolved threads)"
+
   # Phase 1: parallel prepare (metadata, worktrees, unresolved-thread discovery, skips)
   setup_all "$repo_dir"
 
-  local total=0 ready=0 skipped=0
-  for _ in $PR_NUMBERS; do total=$((total + 1)); done
+  local ready=0 skipped=0
 
   local ready_list="$(kv_list ready)"
   for _ in $ready_list; do ready=$((ready + 1)); done
@@ -4303,7 +4333,7 @@ main() {
 
   # Determine if TUI should be used
   local use_tui=false
-  if [ "$CONCURRENCY" -gt 1 ] && [ "$NO_TUI" = false ] && [ -t 1 ]; then
+  if should_use_tui; then
     use_tui=true
   fi
 
@@ -4320,6 +4350,8 @@ main() {
 
     for pr_num in $ready_list; do
       (
+        exec </dev/null
+        export CI=1 TERM=dumb NO_COLOR=1 CLICOLOR=0 FORCE_COLOR=0
         sem_acquire
         process_pr "$pr_num"
         sem_release

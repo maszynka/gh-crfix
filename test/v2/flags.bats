@@ -20,6 +20,12 @@ teardown() { teardown_common; }
   [ "$NO_TUI" = "true" ]
 }
 
+@test "parse_flags: --tui sets FORCE_TUI=true" {
+  parse_flags --tui "https://github.com/o/r/pull/1"
+  [ "$FORCE_TUI" = "true" ]
+  [ "$NO_TUI" = "false" ]
+}
+
 @test "parse_flags: --no-post-fix sets NO_POST_FIX=true" {
   parse_flags --no-post-fix "https://github.com/o/r/pull/1"
   [ "$NO_POST_FIX" = "true" ]
@@ -128,6 +134,39 @@ teardown() { teardown_common; }
 @test "parse_flags: default CONCURRENCY is 3" {
   parse_flags "https://github.com/o/r/pull/1"
   [ "$CONCURRENCY" -eq 3 ]
+}
+
+@test "should_use_tui: batch mode is plain by default" {
+  terminal_supports_tui() { return 0; }
+  CONCURRENCY=3
+  NO_TUI=false
+  FORCE_TUI=false
+  LAUNCHED_FROM_LAUNCHER=false
+
+  run should_use_tui
+  [ "$status" -eq 1 ]
+}
+
+@test "should_use_tui: launcher keeps fullscreen dashboard" {
+  terminal_supports_tui() { return 0; }
+  CONCURRENCY=3
+  NO_TUI=false
+  FORCE_TUI=false
+  LAUNCHED_FROM_LAUNCHER=true
+
+  run should_use_tui
+  [ "$status" -eq 0 ]
+}
+
+@test "should_use_tui: --tui opt-in enables dashboard for batch mode" {
+  terminal_supports_tui() { return 0; }
+  CONCURRENCY=3
+  NO_TUI=false
+  FORCE_TUI=true
+  LAUNCHED_FROM_LAUNCHER=false
+
+  run should_use_tui
+  [ "$status" -eq 0 ]
 }
 
 # ── combined flags ───────────────────────────────────────────────────────────

@@ -38,6 +38,12 @@ teardown() { teardown_common; }
   [ "$NO_TUI" = true ]
 }
 
+@test "parse_flags: --tui sets FORCE_TUI=true" {
+  parse_flags --tui "https://github.com/o/r/pull/1"
+  [ "$FORCE_TUI" = true ]
+  [ "$NO_TUI" = false ]
+}
+
 @test "parse_flags: --setup-only sets SETUP_ONLY=true" {
   parse_flags --setup-only "https://github.com/o/r/pull/1"
   [ "$SETUP_ONLY" = true ]
