@@ -53,7 +53,6 @@ func run(args []string) int {
 
 	applyFlags(flags, &cfg)
 
-	// Validate model names (informational only).
 	_ = model.Family(cfg.GateModel)
 	_ = model.Family(cfg.FixModel)
 
@@ -106,20 +105,22 @@ func run(args []string) int {
 	}
 	fmt.Println()
 
-	exitCode := 0
-	for _, prNum := range prNums {
-		opts := baseOpts
-		opts.PRNum = prNum
-		opts.Repo = ownerRepo
+	results := workflow.ProcessBatch(workflow.BatchOptions{
+		PRNums:      prNums,
+		Concurrency: cfg.Concurrency,
+		Base:        baseOpts,
+		Out:         os.Stdout,
+	})
 
-		fmt.Printf("── PR #%d ──────────────────────────────────────────────\n", prNum)
-		if err := workflow.ProcessPR(opts); err != nil {
-			fmt.Fprintf(os.Stderr, "  error: %v\n", err)
-			exitCode = 1
+	workflow.PrintResults(os.Stdout, results)
+
+	exit := 0
+	for _, r := range results {
+		if r.Status == "failed" {
+			exit = 1
 		}
-		fmt.Println()
 	}
-	return exitCode
+	return exit
 }
 
 // splitArgsAndFlags separates the first positional argument from flags.
@@ -131,7 +132,8 @@ func splitArgsAndFlags(args []string) (prSpec string, flags []string) {
 			case "-c", "--concurrency", "--ai-backend",
 				"--gate-model", "--fix-model",
 				"--score-needs-llm", "--score-pr-comment", "--score-test-failure",
-				"--max-threads", "--autofix-hook", "--validate-hook":
+				"--max-threads", "--autofix-hook", "--validate-hook",
+				"--review-wait":
 				flags = append(flags, a)
 				if i+1 < len(args) {
 					i++
@@ -217,16 +219,31 @@ func applyWorkflowFlags(flags []string, opts *workflow.Options) {
 				i++
 				opts.ValidateHook = flags[i]
 			}
+		case "--review-wait":
+			if i+1 < len(flags) {
+				i++
+				var n int
+				fmt.Sscanf(flags[i], "%d", &n)
+				if n >= 0 {
+					opts.ReviewWaitSecs = n
+				}
+			}
 		case "--dry-run":
 			opts.DryRun = true
 		case "--no-resolve":
-			opts.ResolveSkipped = false
+			opts.NoResolve = true
 		case "--resolve-skipped":
 			opts.ResolveSkipped = true
 		case "--no-post-fix":
 			opts.NoPostFix = true
+		case "--no-autofix":
+			opts.NoAutofix = true
+		case "--setup-only":
+			opts.SetupOnly = true
 		case "--exclude-outdated":
 			opts.IncludeOutdated = false
+		case "--include-outdated":
+			opts.IncludeOutdated = true
 		case "--verbose":
 			opts.Verbose = true
 		}
@@ -269,10 +286,15 @@ Flags:
   --max-threads N          max threads fetched per PR (default: 100)
   --validate-hook PATH     repo-local validation script
   --autofix-hook PATH      repo-local autofix script
+  --no-autofix             skip autofix hook
   --dry-run                no GitHub writes, no AI run
   --exclude-outdated       skip outdated threads
+  --include-outdated       include outdated threads (default)
   --resolve-skipped        resolve skipped threads too
-  --no-post-fix            skip post-fix summary comment
+  --no-resolve             do not reply or resolve
+  --no-post-fix            skip post-fix review cycle
+  --review-wait SECS       post-fix wait before re-check (default: 180)
+  --setup-only             set up worktrees and exit
   --score-needs-llm N      gate score weight [0,1]
   --score-pr-comment N     gate score weight [0,1]
   --score-test-failure N   gate score weight [0,1]

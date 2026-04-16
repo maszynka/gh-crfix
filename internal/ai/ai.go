@@ -136,6 +136,13 @@ func RunFix(backend Backend, model, prompt, dir string) error {
 	}
 }
 
+// RunPlain runs the fix model with filesystem access on a free-form prompt.
+// Unlike RunFix it does not expect thread-responses.json — used for case
+// collision normalization and committed conflict marker fixes.
+func RunPlain(backend Backend, model, prompt, dir string) error {
+	return RunFix(backend, model, prompt, dir)
+}
+
 func resolveBackend(b Backend) Backend {
 	if b != BackendAuto {
 		return b
