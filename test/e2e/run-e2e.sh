@@ -20,7 +20,8 @@ FIXTURE_REPO="${FIXTURE_REPO:-maszynka/gh-crfix-e2e-fixtures}"
 FIXTURE_DIR="${FIXTURE_DIR:-$SCRIPT_DIR/../../fixture-repo}"
 E2E_BRANCH="e2e-test-$(date +%s)-$$"
 PR_NUMBER=""
-MAIN_SHA_BEFORE=""  # saved so cleanup can restore main
+MAIN_SHA_BEFORE=""        # saved so cleanup can restore main
+CONFLICT_COMMIT_SHA=""    # SHA of the Step-4 conflict commit (to revert in cleanup)
 
 echo "=== gh-crfix E2E Test ==="
 echo "Script : $GHCRFIX"
@@ -42,12 +43,23 @@ cleanup() {
   fi
   git -C "$FIXTURE_DIR" push origin --delete "$E2E_BRANCH" 2>/dev/null || true
 
-  # Restore main to pre-test state (undo the conflict commit we pushed)
-  if [ -n "${MAIN_SHA_BEFORE:-}" ]; then
-    echo "Restoring main to $MAIN_SHA_BEFORE..."
-    git -C "$FIXTURE_DIR" fetch origin main 2>/dev/null || true
-    git -C "$FIXTURE_DIR" push origin "${MAIN_SHA_BEFORE}:refs/heads/main" --force 2>/dev/null \
-      || echo "  (could not restore main — may need manual cleanup)"
+  # Restore main to pre-test state. Branch protection usually blocks
+  # force-push to main, so fall back to a revert commit that undoes the
+  # conflict commit we pushed in Step 4.
+  if [ -n "${CONFLICT_COMMIT_SHA:-}" ]; then
+    echo "Reverting conflict commit $CONFLICT_COMMIT_SHA on main..."
+    (
+      cd "$FIXTURE_DIR"
+      git fetch origin main 2>/dev/null || true
+      git checkout main 2>/dev/null || true
+      git reset --hard origin/main 2>/dev/null || true
+      if git revert --no-edit "$CONFLICT_COMMIT_SHA" 2>/dev/null; then
+        git push origin main 2>/dev/null \
+          || echo "  (could not push revert — may need manual cleanup)"
+      else
+        echo "  (revert failed — conflict commit may not be on main)"
+      fi
+    )
   fi
 
   # Remove any stale gh-crfix worktrees inside the fixture repo
@@ -130,7 +142,7 @@ sleep 3  # let GitHub process the PR
 COMMIT_OID=$(gh api "repos/$FIXTURE_REPO/pulls/$PR_NUMBER" --jq '.head.sha')
 echo "Head SHA: $COMMIT_OID"
 
-gh api "repos/$FIXTURE_REPO/pulls/$PR_NUMBER/reviews" \
+REVIEW_RESPONSE=$(gh api "repos/$FIXTURE_REPO/pulls/$PR_NUMBER/reviews" \
   --method POST \
   --input - <<EOF
 {
@@ -161,7 +173,9 @@ gh api "repos/$FIXTURE_REPO/pulls/$PR_NUMBER/reviews" \
   ]
 }
 EOF
-echo "Review posted."
+)
+REVIEW_ID=$(echo "$REVIEW_RESPONSE" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+echo "Review posted (id=$REVIEW_ID)."
 echo ""
 
 # ── Step 4: Advance main with a conflicting change ──────────────────────────
@@ -180,9 +194,15 @@ ENVIRONMENT = "production"
 PYEOF
 
 git add src/config.py
-git commit -m "chore: add production config defaults (E2E conflict commit)"
-git push origin main
-echo "Main advanced — $(git rev-parse HEAD)"
+# If a prior run left this exact commit on main (force-push is blocked by
+# branch protection, so cleanup can only revert), reuse the pre-existing
+# conflict commit instead of failing with "nothing to commit".
+if ! git diff --cached --quiet; then
+  git commit -m "chore: add production config defaults (E2E conflict commit)"
+  git push origin main
+fi
+CONFLICT_COMMIT_SHA="$(git rev-parse HEAD)"
+echo "Main advanced — $CONFLICT_COMMIT_SHA"
 git checkout "$E2E_BRANCH"
 echo ""
 
@@ -253,22 +273,31 @@ CONFLICT_FILES="$(grep -rls '<<<<<<' src/ 2>/dev/null || true)"
   && check 5 "no conflict markers in src/" pass \
   || check 5 "conflict markers still present in: $CONFLICT_FILES" fail
 
-# [6] Review threads resolved
+# [6] Original review threads resolved.
+# Copilot (requested by gh crfix as a re-review) may add NEW threads after the
+# fix commit lands — those aren't what this test cares about. Count only
+# threads whose first comment was authored by us (the script runner).
+GH_USER=$(gh api user --jq .login)
 UNRESOLVED=$(gh api graphql -f query='
   query($owner: String!, $repo: String!, $pr: Int!) {
     repository(owner: $owner, name: $repo) {
       pullRequest(number: $pr) {
-        reviewThreads(first: 20) {
-          nodes { isResolved }
+        reviewThreads(first: 50) {
+          nodes {
+            isResolved
+            comments(first: 1) { nodes { author { login } } }
+          }
         }
       }
     }
   }
 ' -F owner="${FIXTURE_REPO%%/*}" -F repo="${FIXTURE_REPO##*/}" -F pr="$PR_NUMBER" \
-  --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length')
+  --jq '[.data.repository.pullRequest.reviewThreads.nodes[]
+         | select(.comments.nodes[0].author.login == "'"$GH_USER"'")
+         | select(.isResolved == false)] | length')
 [ "$UNRESOLVED" -eq 0 ] \
-  && check 6 "all review threads resolved" pass \
-  || check 6 "$UNRESOLVED review thread(s) still unresolved" fail
+  && check 6 "all original review threads resolved" pass \
+  || check 6 "$UNRESOLVED original review thread(s) still unresolved" fail
 
 # [7] Log files were created and contain useful content
 LAST_RUN_LOG="$HOME/.gh-crfix/last-run/run.log"
