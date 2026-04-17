@@ -13,7 +13,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-GHCRFIX="$SCRIPT_DIR/../../gh-crfix"
+# GHCRFIX can be either the legacy bash script or the Go binary.
+# Default: bash script at repo root; set GHCRFIX=/path/to/bin/gh-crfix for Go.
+GHCRFIX="${GHCRFIX:-$SCRIPT_DIR/../../gh-crfix}"
 FIXTURE_REPO="${FIXTURE_REPO:-maszynka/gh-crfix-e2e-fixtures}"
 FIXTURE_DIR="${FIXTURE_DIR:-$SCRIPT_DIR/../../fixture-repo}"
 E2E_BRANCH="e2e-test-$(date +%s)-$$"
@@ -80,14 +82,18 @@ echo "Main is at $MAIN_SHA_BEFORE"
 
 git checkout -b "$E2E_BRANCH"
 
+# Portable in-place sed (BSD / GNU compatible).
+sedi() { sed -i.bak "$@" && rm -f "${@: -1}.bak"; }
+
 # Bug 1: typo in parameter name  (format_name in utils.py)
-sed -i 's/first_name/frist_name/g' src/utils.py
+sedi 's/first_name/frist_name/g' src/utils.py
 
 # Bug 2: unused import added     (utils.py)
-sed -i '3a import sys' src/utils.py
+sedi '3a\
+import sys' src/utils.py
 
 # Bug 3: wrong comparison operator  (validator.js — isPositiveNumber)
-sed -i 's/value > 0/value >= 0/' src/validator.js
+sedi 's/value > 0/value >= 0/' src/validator.js
 
 # Bug 4: new file added on this branch — main will add a conflicting version
 cat > src/config.py << 'PYEOF'
@@ -129,7 +135,7 @@ gh api "repos/$FIXTURE_REPO/pulls/$PR_NUMBER/reviews" \
   --input - <<EOF
 {
   "commit_id": "$COMMIT_OID",
-  "event": "REQUEST_CHANGES",
+  "event": "COMMENT",
   "body": "Several issues to fix before this can merge.",
   "comments": [
     {
@@ -191,7 +197,8 @@ echo ""
 
 echo "=== Step 6: Running gh crfix ==="
 cd "$FIXTURE_DIR"
-bash "$GHCRFIX" "https://github.com/$FIXTURE_REPO/pull/$PR_NUMBER" \
+# Invoke via shebang so both the bash script and the Go binary work.
+"$GHCRFIX" "https://github.com/$FIXTURE_REPO/pull/$PR_NUMBER" \
   --seq --no-tui --no-post-fix
 echo ""
 
@@ -261,7 +268,8 @@ UNRESOLVED=$(gh api graphql -f query='
 
 # [7] Log files were created and contain useful content
 LAST_RUN_LOG="$HOME/.gh-crfix/last-run/run.log"
-([ -f "$LAST_RUN_LOG" ] && grep -q '\[process-pr\]' "$LAST_RUN_LOG") \
+# Accept either [process-pr] (bash) or [setup-pr] (Go port) per-PR entries.
+([ -f "$LAST_RUN_LOG" ] && grep -qE '\[(process|setup)-pr\]' "$LAST_RUN_LOG") \
   && check 7 "master log written to $LAST_RUN_LOG" pass \
   || check 7 "master log missing or empty at $LAST_RUN_LOG" fail
 
