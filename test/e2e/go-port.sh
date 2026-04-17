@@ -113,20 +113,27 @@ exit 1
 STUB
 chmod +x "$STUB_DIR/codex"
 
-# --- 6. Local git repo -------------------------------------------------------
-(
-  cd "$REPO_DIR"
-  git init -q -b main
-  git config user.email "e2e@test.local"
-  git config user.name "E2E Test"
-  echo "# e2e" > README.md
-  git add README.md
-  git commit -q -m "init"
-  git branch feat-test
-)
+# --- 6. Local git repo + bare origin -----------------------------------------
+# worktree.Setup calls `git fetch origin <branch>`, so we simulate a remote.
+ORIGIN_DIR="$SANDBOX/origin.git"
+git init -q -b main "$REPO_DIR"
+git -C "$REPO_DIR" config user.email "e2e@test.local"
+git -C "$REPO_DIR" config user.name "E2E Test"
+echo "# e2e" > "$REPO_DIR/README.md"
+git -C "$REPO_DIR" add README.md
+git -C "$REPO_DIR" commit -q -m "init"
+git init -q --bare -b main "$ORIGIN_DIR"
+git -C "$REPO_DIR" remote add origin "$ORIGIN_DIR"
+git -C "$REPO_DIR" push -q -u origin main
+git -C "$REPO_DIR" checkout -q -b feat-test
+git -C "$REPO_DIR" commit -q --allow-empty -m "feat"
+git -C "$REPO_DIR" push -q -u origin feat-test
+git -C "$REPO_DIR" checkout -q main
 
 # --- 7. Invoke the binary ----------------------------------------------------
 OUTPUT_FILE="$SANDBOX/output.txt"
+# Disable `set -e` around the command so we can capture a non-zero exit.
+set +e
 PATH="$STUB_DIR:$PATH" \
   HOME="$HOME_DIR" \
   GH_CRFIX_DIR="$REPO_DIR" \
@@ -138,6 +145,7 @@ PATH="$STUB_DIR:$PATH" \
     --dry-run --no-tui --no-notify --no-post-fix \
   > "$OUTPUT_FILE" 2>&1
 EXIT=$?
+set -e
 
 echo "--- gh-crfix output ---"
 cat "$OUTPUT_FILE"

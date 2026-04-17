@@ -3,7 +3,6 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -45,9 +44,16 @@ func TestE2E_DryRunHappyPath(t *testing.T) {
 	writeStubGh(t, stubDir)
 	writeStubClaude(t, stubDir)
 
-	// --- Fresh git repo as the worktree target ------------------------------
-	repoDir := t.TempDir()
-	runOrFail(t, repoDir, "git", "init", "-q", "-b", "main")
+	// --- Fresh git repo + bare "origin" as the worktree target -------------
+	// worktree.Setup does `git fetch origin <branch>` so we wire up a
+	// throwaway bare repo to act as origin.
+	repoParent := t.TempDir()
+	originDir := filepath.Join(repoParent, "origin.git")
+	repoDir := filepath.Join(repoParent, "local")
+	// Init local repo first (with a commit) then push to a bare origin we
+	// created alongside. Init order matters because `git clone` refuses an
+	// empty bare repo.
+	runOrFail(t, repoParent, "git", "init", "-q", "-b", "main", repoDir)
 	runOrFail(t, repoDir, "git", "config", "user.email", "e2e@test.local")
 	runOrFail(t, repoDir, "git", "config", "user.name", "E2E Test")
 	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("# test\n"), 0o644); err != nil {
@@ -55,8 +61,14 @@ func TestE2E_DryRunHappyPath(t *testing.T) {
 	}
 	runOrFail(t, repoDir, "git", "add", "README.md")
 	runOrFail(t, repoDir, "git", "commit", "-q", "-m", "init")
-	// Create the PR branch so worktree.Setup can check it out.
-	runOrFail(t, repoDir, "git", "branch", "feat-test")
+	runOrFail(t, repoParent, "git", "init", "-q", "--bare", "-b", "main", originDir)
+	runOrFail(t, repoDir, "git", "remote", "add", "origin", originDir)
+	runOrFail(t, repoDir, "git", "push", "-q", "-u", "origin", "main")
+	// Create the PR branch on origin so worktree.Setup can fetch + check it out.
+	runOrFail(t, repoDir, "git", "checkout", "-q", "-b", "feat-test")
+	runOrFail(t, repoDir, "git", "commit", "-q", "--allow-empty", "-m", "feat")
+	runOrFail(t, repoDir, "git", "push", "-q", "-u", "origin", "feat-test")
+	runOrFail(t, repoDir, "git", "checkout", "-q", "main")
 
 	// --- Isolated home for config / notifications ----------------------------
 	home := t.TempDir()
@@ -254,6 +266,3 @@ exit 1
 	}
 }
 
-// Silence unused-import complaints across Go versions without locking us into
-// one stdlib.
-var _ = fmt.Sprintf
