@@ -107,7 +107,7 @@ func TestRunHook_ReturnsErrorOnFailure(t *testing.T) {
 	if err := writeExecHook(hook, "#!/bin/sh\nexit 7\n"); err != nil {
 		t.Fatalf("write hook: %v", err)
 	}
-	if err := runHook(hook, dir); err == nil {
+	if err := runHook(context.Background(), hook, dir); err == nil {
 		t.Fatalf("runHook returned nil; want error for non-zero exit")
 	}
 }
@@ -119,7 +119,7 @@ func TestRunHook_NilOnSuccess(t *testing.T) {
 	if err := writeExecHook(hook, "#!/bin/sh\nexit 0\n"); err != nil {
 		t.Fatalf("write hook: %v", err)
 	}
-	if err := runHook(hook, dir); err != nil {
+	if err := runHook(context.Background(), hook, dir); err != nil {
 		t.Fatalf("runHook returned %v; want nil", err)
 	}
 }
@@ -128,7 +128,7 @@ func TestRunHook_NilOnSuccess(t *testing.T) {
 // the script path doesn't exist (exec will fail to spawn).
 func TestRunHook_ReturnsErrorWhenHookMissing(t *testing.T) {
 	dir := t.TempDir()
-	if err := runHook(dir+"/does-not-exist.sh", dir); err == nil {
+	if err := runHook(context.Background(), dir+"/does-not-exist.sh", dir); err == nil {
 		t.Fatalf("runHook returned nil; want error when binary missing")
 	}
 }

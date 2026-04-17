@@ -201,17 +201,50 @@ func TestPostFixReviewCycle_DefaultWait(t *testing.T) {
 	requestCopilotReviewFn = func(context.Context, string, int) error { return nil }
 
 	opts := branchBaseOpts(t)
-	// ReviewWaitSecs == 0 → should default to 180.
+	// ReviewWaitSecs == 0 is an explicit "skip the wait" override — the new
+	// semantics (matches bash: zero means don't sleep) must NOT rewrite to
+	// the default. Only a negative value falls back.
 	opts.ReviewWaitSecs = 0
 
 	postFixReviewCycle(context.Background(), opts, t.TempDir(), 0, noopLog)
 
 	sleepMu.Lock()
 	defer sleepMu.Unlock()
-	if len(sleepCalls) != 1 {
-		t.Fatalf("sleepFn called %d times; want 1", len(sleepCalls))
+	if len(sleepCalls) != 0 {
+		t.Fatalf("sleepFn called %d times; want 0 for explicit zero wait", len(sleepCalls))
 	}
-	if sleepCalls[0] != 180*time.Second {
-		t.Fatalf("sleepFn duration=%v want 180s (default)", sleepCalls[0])
+}
+
+// TestPostFixReviewCycle_NegativeWaitFallsBack verifies the backward-compat
+// fallback: a nonsensical negative value still gets rewritten to the bash
+// default 90s rather than sleeping a silly duration.
+func TestPostFixReviewCycle_NegativeWaitFallsBack(t *testing.T) {
+	installSeams(t)
+
+	var sleepMu sync.Mutex
+	var sleepCalls []time.Duration
+	sleepFn = func(d time.Duration) {
+		sleepMu.Lock()
+		defer sleepMu.Unlock()
+		sleepCalls = append(sleepCalls, d)
+	}
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) {
+		return nil, nil
+	}
+	fetchPRFn = func(context.Context, string, int) (ghapi.PRInfo, error) {
+		return ghapi.PRInfo{BaseRefName: "main"}, nil
+	}
+	postCommentFn = func(context.Context, string, int, string) error { return nil }
+	requestCopilotReviewFn = func(context.Context, string, int) error { return nil }
+
+	opts := branchBaseOpts(t)
+	opts.ReviewWaitSecs = -1
+
+	postFixReviewCycle(context.Background(), opts, t.TempDir(), 0, noopLog)
+
+	sleepMu.Lock()
+	defer sleepMu.Unlock()
+	if len(sleepCalls) != 1 || sleepCalls[0] != 90*time.Second {
+		t.Fatalf("sleepFn calls=%v want [90s]", sleepCalls)
 	}
 }

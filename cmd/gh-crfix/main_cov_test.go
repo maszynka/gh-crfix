@@ -515,7 +515,7 @@ func TestSplitArgsAndFlags_Mixed(t *testing.T) {
 		"-c", "4",
 		"--no-tui",
 	}
-	prSpec, flags := splitArgsAndFlags(args)
+	prSpec, flags, _ := splitArgsAndFlags(args)
 	if prSpec != "https://github.com/a/b/pull/1" {
 		t.Errorf("prSpec=%q, want the URL", prSpec)
 	}

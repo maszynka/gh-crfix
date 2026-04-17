@@ -107,7 +107,8 @@ func OptionsFromConfig(cfg config.Config, repo string, prNum int) Options {
 		FixModel:        cfg.FixModel,
 		MaxThreads:      100,
 		IncludeOutdated: true,
-		ReviewWaitSecs:  180,
+		// 90s matches the bash `GH_CRFIX_REVIEW_WAIT` default and the README.
+		ReviewWaitSecs: 90,
 		Weights: gate.ScoreWeights{
 			NeedsLLM:    cfg.ScoreNeedsLLM,
 			PRComment:   cfg.ScorePRComment,
@@ -302,7 +303,7 @@ func ProcessPR(ctx context.Context, opts Options) Result {
 		if hookPath != "" {
 			log("running autofix hook...")
 			setStep(progress.StepAutofix, progress.Running, hookPath)
-			if herr := runHook(hookPath, wtPath); herr != nil {
+			if herr := runHook(context.Background(), hookPath, wtPath); herr != nil {
 				// Autofix is best-effort; surface the error but continue.
 				log("autofix hook failed: %v", herr)
 				setStep(progress.StepAutofix, progress.Failed, herr.Error())
@@ -455,12 +456,16 @@ func ProcessPR(ctx context.Context, opts Options) Result {
 		if fixResponses, rerr := readThreadResponses(wtPath); rerr == nil {
 			responses = append(responses, fixResponses...)
 		}
-	} else if gateCtx.ShouldRunGate && !shouldFix && !gateFailed {
+	} else if gateCtx.ShouldRunGate && !shouldFix && !gateFailed && !opts.DryRun {
 		setStep(progress.StepFix, progress.Skipped, "gate said not needed")
 		// Gate ran and said "not needed" — generate already-fixed responses so
 		// needs_llm threads still get resolved. Mirrors Bash gate-skipped path.
-		// NB: this branch MUST be guarded by !gateFailed so a crashed gate
-		// model cannot silently resolve real review threads as already_fixed.
+		// Guards:
+		//  - !gateFailed: a crashed gate model must not silently resolve real
+		//    review threads as "already_fixed".
+		//  - !opts.DryRun: in dry-run mode the gate model was intentionally
+		//    skipped, so gateOut is zero-value; emitting `already_fixed` here
+		//    would claim issues were addressed without running any AI.
 		for _, c := range activeNeedsLLM {
 			responses = append(responses, ThreadResponse{
 				ThreadID: c.ThreadID,
@@ -468,6 +473,8 @@ func ProcessPR(ctx context.Context, opts Options) Result {
 				Comment:  "Reviewed by automation — no code change needed: " + c.Reason + ".",
 			})
 		}
+	} else if opts.DryRun && gateCtx.ShouldRunGate {
+		setStep(progress.StepFix, progress.Skipped, "dry-run")
 	}
 
 	// ── 15. Uncovered-response fallback ───────────────────────────────────
@@ -635,12 +642,16 @@ func fixConflictMarkers(ctx context.Context, opts Options, wtPath string, log fu
 // ── Post-fix review cycle ───────────────────────────────────────────────────
 
 func postFixReviewCycle(ctx context.Context, opts Options, wtPath string, fixedCount int, log func(string, ...interface{})) {
+	// A negative value is a bug — fall back to the bash default. Explicit
+	// zero ("no wait") is a valid override and is honored here.
 	wait := opts.ReviewWaitSecs
-	if wait <= 0 {
-		wait = 180
+	if wait < 0 {
+		wait = 90
 	}
-	log("post-fix: waiting %ds...", wait)
-	sleepFn(time.Duration(wait) * time.Second)
+	if wait > 0 {
+		log("post-fix: waiting %ds...", wait)
+		sleepFn(time.Duration(wait) * time.Second)
+	}
 
 	newThreads, err := fetchThreadsFn(ctx, opts.Repo, opts.PRNum, opts.MaxThreads)
 	if err != nil {
@@ -861,10 +872,10 @@ func detectAutofixHook(wtPath string) string {
 }
 
 // runHook runs a shell hook in dir and propagates cmd.Run()'s error so the
-// caller can log or surface the failure. The hook's stdout/stderr are
-// streamed to the process's stdout/stderr as before.
-func runHook(hookPath, dir string) error {
-	cmd := exec.Command(hookPath)
+// caller can log or surface the failure. ctx is honored so Ctrl+C can stop
+// a hanging hook; hook stdout/stderr stream to the process's stdout/stderr.
+func runHook(ctx context.Context, hookPath, dir string) error {
+	cmd := exec.CommandContext(ctx, hookPath)
 	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	ghapi "github.com/maszynka/gh-crfix/internal/github"
@@ -223,15 +224,26 @@ func setupOnePR(
 	logPR("starting setup")
 	prog("fetching metadata...")
 
-	// 1. Fetch PR metadata.
+	// 1. Fetch PR metadata. A genuine "not found" becomes a clean skip; any
+	// other fetch error (auth/network/rate-limit/etc.) is a real failure
+	// and must surface as such, not be silently downgraded to a skip.
 	info, err := prf.FetchPR(opts.Repo, opts.PRNum)
 	if err != nil {
-		pr.Status = "skipped"
-		pr.Reason = "not found"
+		if looksLikeNotFound(err) {
+			pr.Status = "skipped"
+			pr.Reason = "not found"
+		} else {
+			pr.Status = "failed"
+			pr.Reason = fmt.Sprintf("fetch PR metadata failed: %v", firstLineOfErr(err))
+		}
 		logMaster("gh pr view failed: %v -- marking as %s (%s)", err, pr.Status, pr.Reason)
 		logPR("gh pr view failed: %v", err)
-		prog("skipped (%s)", pr.Reason)
-		setStep(progress.Skipped, pr.Reason)
+		prog("%s (%s)", pr.Status, pr.Reason)
+		if pr.Status == "skipped" {
+			setStep(progress.Skipped, pr.Reason)
+		} else {
+			setStep(progress.Failed, pr.Reason)
+		}
 		markStatus(false)
 		return pr
 	}
@@ -323,7 +335,22 @@ func setupOnePR(
 		}
 	}
 
-	// 5. Fetch unresolved review threads.
+	// 5. Short-circuit for --setup-only BEFORE hitting the thread API.
+	// The whole point of setup-only is to prepare worktrees without calling
+	// non-essential endpoints; requiring the thread API to be reachable here
+	// would make the flag fragile against GH outages / rate limits.
+	if opts.SetupOnly {
+		pr.Status = "skipped"
+		pr.Reason = "setup-only"
+		logMaster("setup-only: worktree ready at %s", wtPath)
+		logPR("setup-only: cd %s", wtPath)
+		prog("skipped (setup-only)")
+		setStep(progress.Done, "setup-only")
+		markStatus(true)
+		return pr
+	}
+
+	// 6. Fetch unresolved review threads.
 	threads, err := tf.FetchThreads(opts.Repo, opts.PRNum, opts.MaxThreads)
 	if err != nil {
 		pr.Status = "failed"
@@ -348,17 +375,6 @@ func setupOnePR(
 		return pr
 	}
 
-	if opts.SetupOnly {
-		pr.Status = "skipped"
-		pr.Reason = "setup-only"
-		logMaster("setup-only: worktree ready at %s", wtPath)
-		logPR("setup-only: cd %s", wtPath)
-		prog("skipped (setup-only)")
-		setStep(progress.Done, "setup-only")
-		markStatus(true)
-		return pr
-	}
-
 	pr.Status = "ready"
 	pr.Reason = "ready"
 	logMaster("ready -- %d thread(s), worktree=%s", pr.Threads, wtPath)
@@ -366,4 +382,27 @@ func setupOnePR(
 	prog("ready (%d thread(s))", pr.Threads)
 	setStep(progress.Done, fmt.Sprintf("%d thread(s)", pr.Threads))
 	return pr
+}
+
+
+// looksLikeNotFound returns true when err carries the text shape `gh` emits
+// for a missing PR / repo. Everything else must bubble up as a real failure
+// so operators can act on auth / rate-limit / network / unknown errors.
+func looksLikeNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "not found") ||
+		strings.Contains(s, "could not resolve") ||
+		strings.Contains(s, "no pull request")
+}
+
+// firstLineOfErr trims the error to its first line so the Reason string
+// stays compact in summaries.
+func firstLineOfErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	return firstLine(err.Error())
 }

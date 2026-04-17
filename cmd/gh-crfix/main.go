@@ -131,9 +131,15 @@ func run(ctx context.Context, args []string) int {
 		plan.opts.Weights.NeedsLLM, plan.opts.Weights.PRComment, plan.opts.Weights.TestFailure)
 	fmt.Println()
 
-	// Backend auto-detection (pretty-print when it resolves to a concrete one).
+	// Backend auto-detection. Model family wins over executable presence:
+	// if the user left the backend on "auto" but configured Codex models (or
+	// Claude models), respect that rather than routing e.g. gpt-5.4 to the
+	// claude CLI and watching the gate phase fail.
 	if plan.opts.AIBackend == ai.BackendAuto {
-		detected := ai.Detect()
+		detected := backendFromModelFamily(plan.opts.GateModel, plan.opts.FixModel)
+		if detected == ai.BackendAuto {
+			detected = ai.Detect()
+		}
 		plan.opts.AIBackend = detected
 		switch detected {
 		case ai.BackendClaude:
@@ -321,7 +327,11 @@ func runBatchPlain(ctx context.Context, plan runPlan) []workflow.Result {
 func resolveConfig(args []string, cfg config.Config) (runPlan, error) {
 	plan := runPlan{}
 
-	prSpec, flags := splitArgsAndFlags(args)
+	prSpec, flags, unknown := splitArgsAndFlags(args)
+	if len(unknown) > 0 {
+		return plan, fmt.Errorf("unknown flag(s): %s — run `gh crfix --help`",
+			strings.Join(unknown, " "))
+	}
 
 	// Precedence matches the bash script: flag > env > file > default.
 	// applyEnvToConfig fills in anything GH_CRFIX_* declares; applyFlags then
@@ -376,24 +386,21 @@ func resolveConfig(args []string, cfg config.Config) (runPlan, error) {
 		case "--score-needs-llm":
 			if i+1 < len(flags) {
 				i++
-				var v float64
-				if _, serr := fmt.Sscanf(flags[i], "%f", &v); serr == nil {
+				if v, ok := parseScoreFlag(flags[i]); ok {
 					opts.Weights.NeedsLLM = v
 				}
 			}
 		case "--score-pr-comment":
 			if i+1 < len(flags) {
 				i++
-				var v float64
-				if _, serr := fmt.Sscanf(flags[i], "%f", &v); serr == nil {
+				if v, ok := parseScoreFlag(flags[i]); ok {
 					opts.Weights.PRComment = v
 				}
 			}
 		case "--score-test-failure":
 			if i+1 < len(flags) {
 				i++
-				var v float64
-				if _, serr := fmt.Sscanf(flags[i], "%f", &v); serr == nil {
+				if v, ok := parseScoreFlag(flags[i]); ok {
 					opts.Weights.TestFailure = v
 				}
 			}
@@ -482,10 +489,11 @@ func isTerminal(f *os.File) bool {
 	return (fi.Mode() & os.ModeCharDevice) != 0
 }
 
-// splitArgsAndFlags separates the first positional argument from flags.
-// Flags that take a value are handled specially so the following value isn't
-// treated as a positional target.
-func splitArgsAndFlags(args []string) (prSpec string, flags []string) {
+// splitArgsAndFlags separates the first positional argument from flags. It
+// also returns any unknown-looking flag tokens so the caller can reject them
+// before mutating state. Typos like `--dryrun` (instead of `--dry-run`)
+// previously slid through silently and could skip safety guards at runtime.
+func splitArgsAndFlags(args []string) (prSpec string, flags, unknown []string) {
 	valueFlags := map[string]bool{
 		"-c": true, "--concurrency": true, "--ai-backend": true,
 		"--gate-model": true, "--fix-model": true,
@@ -493,9 +501,20 @@ func splitArgsAndFlags(args []string) (prSpec string, flags []string) {
 		"--max-threads": true, "--autofix-hook": true, "--validate-hook": true,
 		"--review-wait": true,
 	}
+	booleanFlags := map[string]bool{
+		"--dry-run": true, "--no-resolve": true, "--resolve-skipped": true,
+		"--no-post-fix": true, "--no-autofix": true, "--no-validate": true,
+		"--setup-only": true, "--exclude-outdated": true, "--include-outdated": true,
+		"--verbose": true, "--no-tui": true, "--no-notify": true,
+		"--version": true, "-v": true, "--help": true, "-h": true, "--seq": true,
+	}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if strings.HasPrefix(a, "-") {
+			if !valueFlags[a] && !booleanFlags[a] {
+				unknown = append(unknown, a)
+				continue
+			}
 			flags = append(flags, a)
 			if valueFlags[a] && i+1 < len(args) {
 				i++
@@ -701,6 +720,40 @@ func backendName(b ai.Backend) string {
 	default:
 		return "auto"
 	}
+}
+
+// backendFromModelFamily infers the backend from the configured models.
+// Returns BackendAuto when the models are ambiguous (e.g. one claude + one
+// openai, or an unknown family) so the caller can fall through to executable
+// detection. Both models must agree on a family for this to return a
+// concrete backend.
+// parseScoreFlag parses a score-weight string and enforces the documented
+// [0, 1] bound. Out-of-range or unparseable values are rejected (ok=false)
+// so bad CLI input never silently alters gate decisions at runtime.
+func parseScoreFlag(raw string) (float64, bool) {
+	var v float64
+	if _, err := fmt.Sscanf(raw, "%f", &v); err != nil {
+		return 0, false
+	}
+	if v < 0 || v > 1 {
+		return 0, false
+	}
+	return v, true
+}
+
+func backendFromModelFamily(gateModel, fixModel string) ai.Backend {
+	g := model.Family(gateModel)
+	f := model.Family(fixModel)
+	if g == "" || f == "" || g != f {
+		return ai.BackendAuto
+	}
+	switch g {
+	case "claude":
+		return ai.BackendClaude
+	case "codex":
+		return ai.BackendCodex
+	}
+	return ai.BackendAuto
 }
 
 func usage() {

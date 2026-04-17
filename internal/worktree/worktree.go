@@ -28,7 +28,10 @@ func Setup(ctx context.Context, repoRoot, branch string, prNum int) (string, err
 
 	// Check if worktree already exists.
 	if _, err := os.Stat(filepath.Join(wt, ".git")); err == nil {
-		// Worktree exists — reset to clean state.
+		// Worktree exists — refresh the remote ref before resetting, so
+		// cleanWorktree's `reset --hard origin/<branch>` doesn't pin us to
+		// a stale tip that the PR branch has since moved past.
+		_ = gitIn(ctx, repoRoot, "fetch", "--quiet", "origin", branch)
 		if err := cleanWorktree(ctx, wt, branch); err != nil {
 			return "", err
 		}

@@ -110,4 +110,7 @@ var errSetup = &setupErr{}
 
 type setupErr struct{}
 
-func (e *setupErr) Error() string { return "boom" }
+// Message shape mirrors gh's output for a missing PR so that
+// looksLikeNotFound() correctly routes this to "skipped / not found".
+// A generic error would (correctly) be surfaced as a failure instead.
+func (e *setupErr) Error() string { return "could not resolve to a Repository with the name" }

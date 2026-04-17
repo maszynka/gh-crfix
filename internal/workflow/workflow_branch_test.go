@@ -1034,8 +1034,8 @@ func TestOptionsFromConfig_MapsFields(t *testing.T) {
 	if opts.Weights.NeedsLLM != cfg.ScoreNeedsLLM {
 		t.Fatalf("weights.NeedsLLM mismatch")
 	}
-	if opts.ReviewWaitSecs != 180 {
-		t.Fatalf("ReviewWaitSecs=%d want 180", opts.ReviewWaitSecs)
+	if opts.ReviewWaitSecs != 90 {
+		t.Fatalf("ReviewWaitSecs=%d want 90 (bash parity)", opts.ReviewWaitSecs)
 	}
 	if opts.MaxThreads != 100 {
 		t.Fatalf("MaxThreads=%d want 100", opts.MaxThreads)

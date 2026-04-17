@@ -212,17 +212,32 @@ func detectPackageTestCmd(worktreePath string) string {
 		return ""
 	}
 
-	// Pick the right package manager.
-	for _, f := range []struct{ lock, cmd string }{
-		{"bun.lock", "bun test"},
-		{"bun.lockb", "bun test"},
-		{"pnpm-lock.yaml", "pnpm test"},
-		{"yarn.lock", "yarn test"},
-		{"package-lock.json", "npm test"},
+	// Pick the right package manager — but only return a command whose
+	// binary is actually on PATH. Otherwise `validate.Run` would turn a
+	// missing-binary error into TestsFailed=true, inflate the gate score,
+	// and trigger unnecessary AI processing. Matches the legacy bash
+	// `command -v` guard.
+	for _, f := range []struct {
+		lock, cmd, bin string
+	}{
+		{"bun.lock", "bun test", "bun"},
+		{"bun.lockb", "bun test", "bun"},
+		{"pnpm-lock.yaml", "pnpm test", "pnpm"},
+		{"yarn.lock", "yarn test", "yarn"},
+		{"package-lock.json", "npm test", "npm"},
 	} {
-		if _, err := os.Stat(filepath.Join(worktreePath, f.lock)); err == nil {
-			return f.cmd
+		if _, err := os.Stat(filepath.Join(worktreePath, f.lock)); err != nil {
+			continue
 		}
+		if _, lerr := exec.LookPath(f.bin); lerr != nil {
+			continue
+		}
+		return f.cmd
 	}
-	return fmt.Sprintf("npm test")
+	// No lockfile matched (or no matching binary). Fall back to `npm test`
+	// only if npm is actually available.
+	if _, err := exec.LookPath("npm"); err == nil {
+		return "npm test"
+	}
+	return ""
 }

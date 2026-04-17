@@ -89,6 +89,15 @@ func ProcessBatch(ctx context.Context, opts BatchOptions) []Result {
 			readyIdx = append(readyIdx, i)
 		} else {
 			// Skipped/failed PRs become Result directly — no ProcessPR run.
+			// Mark every remaining step terminal so the dashboard and summary
+			// don't leave them stuck at "queued".
+			if tracker != nil {
+				terminal := progress.Skipped
+				if p.Status == "failed" {
+					terminal = progress.Failed
+				}
+				_ = tracker.MarkRemaining(p.PRNum, terminal, p.Reason)
+			}
 			results[i] = resultFromPrepared(p)
 		}
 	}

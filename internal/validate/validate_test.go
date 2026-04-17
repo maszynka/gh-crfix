@@ -23,6 +23,19 @@ func writeExec(t *testing.T, path, content string) {
 	}
 }
 
+// pathWithFakeBin isolates $PATH to a fresh temp dir and seeds the given
+// binaries as no-op shell stubs. detectPackageTestCmd's PATH check now
+// rejects commands whose binary isn't on PATH, so tests that want a
+// specific runner must put it on PATH explicitly.
+func pathWithFakeBin(t *testing.T, bins ...string) {
+	t.Helper()
+	dir := t.TempDir()
+	for _, b := range bins {
+		writeExec(t, filepath.Join(dir, b), "#!/bin/sh\nexit 0\n")
+	}
+	t.Setenv("PATH", dir)
+}
+
 // writeFile writes without exec permission.
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
@@ -113,6 +126,7 @@ func TestDetect_ScriptsValidateSh(t *testing.T) {
 }
 
 func TestDetect_PackageJSONWithBunLock(t *testing.T) {
+	pathWithFakeBin(t, "bun")
 	wt := t.TempDir()
 	writeFile(t, filepath.Join(wt, "package.json"), `{"scripts":{"test":"echo ok"}}`)
 	writeFile(t, filepath.Join(wt, "bun.lock"), "")
@@ -127,6 +141,7 @@ func TestDetect_PackageJSONWithBunLock(t *testing.T) {
 }
 
 func TestDetect_PackageJSONWithPnpmLock(t *testing.T) {
+	pathWithFakeBin(t, "pnpm")
 	wt := t.TempDir()
 	writeFile(t, filepath.Join(wt, "package.json"), `{"scripts":{"test":"echo ok"}}`)
 	writeFile(t, filepath.Join(wt, "pnpm-lock.yaml"), "")
@@ -141,6 +156,7 @@ func TestDetect_PackageJSONWithPnpmLock(t *testing.T) {
 }
 
 func TestDetect_PackageJSONWithYarnLock(t *testing.T) {
+	pathWithFakeBin(t, "yarn")
 	wt := t.TempDir()
 	writeFile(t, filepath.Join(wt, "package.json"), `{"scripts":{"test":"echo ok"}}`)
 	writeFile(t, filepath.Join(wt, "yarn.lock"), "")
@@ -155,6 +171,7 @@ func TestDetect_PackageJSONWithYarnLock(t *testing.T) {
 }
 
 func TestDetect_PackageJSONWithNpmLock(t *testing.T) {
+	pathWithFakeBin(t, "npm")
 	wt := t.TempDir()
 	writeFile(t, filepath.Join(wt, "package.json"), `{"scripts":{"test":"echo ok"}}`)
 	writeFile(t, filepath.Join(wt, "package-lock.json"), "{}")
@@ -169,6 +186,7 @@ func TestDetect_PackageJSONWithNpmLock(t *testing.T) {
 }
 
 func TestDetect_PackageJSONNoLockfile_DefaultsToNpm(t *testing.T) {
+	pathWithFakeBin(t, "npm")
 	wt := t.TempDir()
 	writeFile(t, filepath.Join(wt, "package.json"), `{"scripts":{"test":"echo ok"}}`)
 
