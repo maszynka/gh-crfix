@@ -13,15 +13,17 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-GHCRFIX="$SCRIPT_DIR/../../gh-crfix"
+# GHCRFIX can be either the legacy bash script or the Go binary.
+# Default: bash script at repo root; set GHCRFIX=/path/to/bin/gh-crfix for Go.
+GHCRFIX="${GHCRFIX:-$SCRIPT_DIR/../../gh-crfix}"
 FIXTURE_REPO="${FIXTURE_REPO:-maszynka/gh-crfix-e2e-fixtures}"
 # Resolve FIXTURE_DIR to an absolute path so cd stays consistent throughout
 _raw_fixture="${FIXTURE_DIR:-$SCRIPT_DIR/../../fixture-repo}"
 FIXTURE_DIR="$(cd "$_raw_fixture" 2>/dev/null && pwd || echo "$_raw_fixture")"
 E2E_BRANCH="e2e-test-$(date +%s)-$$"
 PR_NUMBER=""
-MAIN_SHA_BEFORE=""    # HEAD of main before any test mutations
-MAIN_SHA_CONFLICT=""  # SHA of the conflict commit pushed in Step 4 (reverted in cleanup)
+MAIN_SHA_BEFORE=""        # saved so cleanup can restore main
+CONFLICT_COMMIT_SHA=""    # SHA of the Step-4 conflict commit (to revert in cleanup)
 
 echo "=== gh-crfix E2E Test ==="
 echo "Script : $GHCRFIX"
@@ -43,17 +45,23 @@ cleanup() {
   fi
   git -C "$FIXTURE_DIR" push origin --delete "$E2E_BRANCH" 2>/dev/null || true
 
-  # Restore main to pre-test state by reverting exactly the commit we pushed in Step 4
-  if [ -n "${MAIN_SHA_CONFLICT:-}" ]; then
-    echo "Restoring main (reverting conflict commit $MAIN_SHA_CONFLICT)..."
-    git -C "$FIXTURE_DIR" fetch origin main 2>/dev/null || true
-    # Discard any working-tree drift before switching branches
-    git -C "$FIXTURE_DIR" reset --hard HEAD 2>/dev/null || true
-    git -C "$FIXTURE_DIR" checkout main 2>/dev/null || true
-    git -C "$FIXTURE_DIR" reset --hard origin/main 2>/dev/null || true
-    git -C "$FIXTURE_DIR" revert "$MAIN_SHA_CONFLICT" --no-edit 2>/dev/null \
-      && git -C "$FIXTURE_DIR" push origin main 2>/dev/null \
-      || echo "  (revert failed — manual cleanup may be needed: git -C $FIXTURE_DIR revert $MAIN_SHA_CONFLICT)"
+  # Restore main to pre-test state. Branch protection usually blocks
+  # force-push to main, so fall back to a revert commit that undoes the
+  # conflict commit we pushed in Step 4.
+  if [ -n "${CONFLICT_COMMIT_SHA:-}" ]; then
+    echo "Reverting conflict commit $CONFLICT_COMMIT_SHA on main..."
+    (
+      cd "$FIXTURE_DIR"
+      git fetch origin main 2>/dev/null || true
+      git checkout main 2>/dev/null || true
+      git reset --hard origin/main 2>/dev/null || true
+      if git revert --no-edit "$CONFLICT_COMMIT_SHA" 2>/dev/null; then
+        git push origin main 2>/dev/null \
+          || echo "  (could not push revert — may need manual cleanup)"
+      else
+        echo "  (revert failed — conflict commit may not be on main)"
+      fi
+    )
   fi
 
   # Remove any stale gh-crfix worktrees inside the fixture repo
@@ -89,28 +97,18 @@ echo "Main is at $MAIN_SHA_BEFORE"
 
 git checkout -b "$E2E_BRANCH"
 
-# Bug 1: typo in parameter name  (format_name in utils.py)
-python3 - <<'PYEOF'
-from pathlib import Path
-p = Path('src/utils.py')
-p.write_text(p.read_text().replace('first_name', 'frist_name'))
-PYEOF
+# Portable in-place sed (BSD / GNU compatible).
+sedi() { sed -i.bak "$@" && rm -f "${@: -1}.bak"; }
 
-# Bug 2: unused import added     (utils.py) — insert after "import os" (line 3)
-python3 - <<'PYEOF'
-from pathlib import Path
-p = Path('src/utils.py')
-lines = p.read_text().splitlines(keepends=True)
-lines.insert(3, 'import sys\n')
-p.write_text(''.join(lines))
-PYEOF
+# Bug 1: typo in parameter name  (format_name in utils.py)
+sedi 's/first_name/frist_name/g' src/utils.py
+
+# Bug 2: unused import added     (utils.py)
+sedi '3a\
+import sys' src/utils.py
 
 # Bug 3: wrong comparison operator  (validator.js — isPositiveNumber)
-python3 - <<'PYEOF'
-from pathlib import Path
-p = Path('src/validator.js')
-p.write_text(p.read_text().replace('value > 0', 'value >= 0', 1))
-PYEOF
+sedi 's/value > 0/value >= 0/' src/validator.js
 
 # Bug 4: new file added on this branch — main will add a conflicting version
 cat > src/config.py << 'PYEOF'
@@ -147,7 +145,7 @@ sleep 3  # let GitHub process the PR
 COMMIT_OID=$(gh api "repos/$FIXTURE_REPO/pulls/$PR_NUMBER" --jq '.head.sha')
 echo "Head SHA: $COMMIT_OID"
 
-gh api "repos/$FIXTURE_REPO/pulls/$PR_NUMBER/reviews" \
+REVIEW_RESPONSE=$(gh api "repos/$FIXTURE_REPO/pulls/$PR_NUMBER/reviews" \
   --method POST \
   --input - <<EOF
 {
@@ -182,7 +180,9 @@ gh api "repos/$FIXTURE_REPO/pulls/$PR_NUMBER/reviews" \
   ]
 }
 EOF
-echo "Review posted."
+)
+REVIEW_ID=$(echo "$REVIEW_RESPONSE" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+echo "Review posted (id=$REVIEW_ID)."
 echo ""
 
 # ── Step 4: Advance main with a conflicting change ──────────────────────────
@@ -201,10 +201,15 @@ ENVIRONMENT = "production"
 PYEOF
 
 git add src/config.py
-git commit -m "chore: add production config defaults (E2E conflict commit)"
-MAIN_SHA_CONFLICT="$(git rev-parse HEAD)"
-git push origin main
-echo "Main advanced — $MAIN_SHA_CONFLICT"
+# If a prior run left this exact commit on main (force-push is blocked by
+# branch protection, so cleanup can only revert), reuse the pre-existing
+# conflict commit instead of failing with "nothing to commit".
+if ! git diff --cached --quiet; then
+  git commit -m "chore: add production config defaults (E2E conflict commit)"
+  git push origin main
+fi
+CONFLICT_COMMIT_SHA="$(git rev-parse HEAD)"
+echo "Main advanced — $CONFLICT_COMMIT_SHA"
 git checkout "$E2E_BRANCH"
 echo ""
 
@@ -219,10 +224,8 @@ echo ""
 
 echo "=== Step 6: Running gh crfix ==="
 cd "$FIXTURE_DIR"
-# GH_CRFIX_DIR tells gh crfix exactly where the local checkout of the fixture
-# repo lives (avoids the auto-detection heuristic scanning the filesystem)
-GH_CRFIX_DIR="$FIXTURE_DIR" bash "$GHCRFIX" \
-  "https://github.com/$FIXTURE_REPO/pull/$PR_NUMBER" \
+# Invoke via shebang so both the bash script and the Go binary work.
+"$GHCRFIX" "https://github.com/$FIXTURE_REPO/pull/$PR_NUMBER" \
   --seq --no-tui --no-post-fix
 echo ""
 
@@ -232,8 +235,10 @@ echo "=== Step 7: Verifying ==="
 cd "$FIXTURE_DIR"
 git fetch origin "$E2E_BRANCH"
 git checkout "$E2E_BRANCH"
-# Hard-reset to origin: the linked worktree may have committed to the same branch,
-# advancing HEAD while the main worktree's files stayed at the old version.
+# gh crfix made its edits inside a separate git worktree and pushed them;
+# the fixture dir's checkout is still at the PRE-fix SHA with local tree
+# state that diverges from the new remote tip. Hard-reset to the remote
+# tip so assertions grep the files gh crfix actually produced.
 git reset --hard "origin/$E2E_BRANCH"
 
 PASS=0; FAIL=0
@@ -275,26 +280,36 @@ CONFLICT_FILES="$(grep -rls '<<<<<<' src/ 2>/dev/null || true)"
   && check 5 "no conflict markers in src/" pass \
   || check 5 "conflict markers still present in: $CONFLICT_FILES" fail
 
-# [6] Review threads resolved
+# [6] Original review threads resolved.
+# Copilot (requested by gh crfix as a re-review) may add NEW threads after the
+# fix commit lands — those aren't what this test cares about. Count only
+# threads whose first comment was authored by us (the script runner).
+GH_USER=$(gh api user --jq .login)
 UNRESOLVED=$(gh api graphql -f query='
   query($owner: String!, $repo: String!, $pr: Int!) {
     repository(owner: $owner, name: $repo) {
       pullRequest(number: $pr) {
-        reviewThreads(first: 20) {
-          nodes { isResolved }
+        reviewThreads(first: 50) {
+          nodes {
+            isResolved
+            comments(first: 1) { nodes { author { login } } }
+          }
         }
       }
     }
   }
 ' -F owner="${FIXTURE_REPO%%/*}" -F repo="${FIXTURE_REPO##*/}" -F pr="$PR_NUMBER" \
-  --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length')
+  --jq '[.data.repository.pullRequest.reviewThreads.nodes[]
+         | select(.comments.nodes[0].author.login == "'"$GH_USER"'")
+         | select(.isResolved == false)] | length')
 [ "$UNRESOLVED" -eq 0 ] \
-  && check 6 "all review threads resolved" pass \
-  || check 6 "$UNRESOLVED review thread(s) still unresolved" fail
+  && check 6 "all original review threads resolved" pass \
+  || check 6 "$UNRESOLVED original review thread(s) still unresolved" fail
 
 # [7] Log files were created and contain useful content
 LAST_RUN_LOG="$HOME/.gh-crfix/last-run/run.log"
-([ -f "$LAST_RUN_LOG" ] && grep -qE '\[process-pr' "$LAST_RUN_LOG") \
+# Accept either [process-pr] (bash) or [setup-pr] (Go port) per-PR entries.
+([ -f "$LAST_RUN_LOG" ] && grep -qE '\[(process|setup)-pr\]' "$LAST_RUN_LOG") \
   && check 7 "master log written to $LAST_RUN_LOG" pass \
   || check 7 "master log missing or empty at $LAST_RUN_LOG" fail
 

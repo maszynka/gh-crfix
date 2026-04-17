@@ -215,6 +215,30 @@ Override the endpoint:
 export GH_CRFIX_MODEL_REGISTRY="https://your-domain.com/models.json"
 ```
 
+## Go port
+
+`cmd/gh-crfix` is the Go port of the bash CLI. It is **feature-complete against the bash implementation** except for the CI-hosted registry autoupdate (both ports still consume the live GitHub-hosted `registry/models.json`).
+
+Build and run in place of bash:
+
+```bash
+go build -o bin/gh-crfix ./cmd/gh-crfix
+./bin/gh-crfix https://github.com/owner/repo/pull/123
+```
+
+Flag parity is intentional — the same flags (including `-c`, `--dry-run`, `--no-resolve`, `--no-post-fix`, the gate score weights, etc.) work identically. Two Go-only additions:
+
+- `--no-tui` — disable the Bubble Tea dashboard even on a TTY.
+- `--no-notify` — suppress the best-effort completion notification (same behaviour as `GH_CRFIX_NO_NOTIFY=1`).
+
+Model registry override behaviour is documented in [`docs/registry.md`](docs/registry.md) and driven by the same `GH_CRFIX_MODEL_REGISTRY` env var used by bash.
+
+End-to-end tests for the Go port live in:
+
+- `cmd/gh-crfix/main_e2e_test.go` — `go test -tags=e2e ./cmd/gh-crfix/...`
+- `test/e2e/go-port.sh` — POSIX-sh mirror of the dry-run happy path, runs the built binary against stubbed `gh`/`claude`.
+- `test/e2e/go-port-scenarios.sh` — additional POSIX-sh scenarios (CLOSED PR, zero threads, `--setup-only`, gate-skip below threshold).
+
 ## Tests
 
 ```bash
@@ -226,6 +250,15 @@ bats test/
 
 # Run v2-specific tests
 bats test/v2/
+
+# Go unit tests
+go test ./...
+
+# Go end-to-end test (builds binary + stubs gh/claude on PATH)
+go test -tags=e2e ./cmd/gh-crfix/...
+
+# POSIX-sh end-to-end for the Go port
+sh test/e2e/go-port.sh
 ```
 
 ## File structure
