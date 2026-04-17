@@ -3,13 +3,16 @@ package workflow
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/maszynka/gh-crfix/internal/ai"
+	"github.com/maszynka/gh-crfix/internal/config"
 	"github.com/maszynka/gh-crfix/internal/gate"
 	ghapi "github.com/maszynka/gh-crfix/internal/github"
 	"github.com/maszynka/gh-crfix/internal/progress"
@@ -35,6 +38,7 @@ type seamBackup struct {
 	runGate              func(ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error)
 	runFix               func(ai.Backend, string, string, string) error
 	runPlain             func(ai.Backend, string, string, string) error
+	sleep                func(time.Duration)
 }
 
 func snapshotSeams() seamBackup {
@@ -55,6 +59,7 @@ func snapshotSeams() seamBackup {
 		runGate:              runGateFn,
 		runFix:               runFixFn,
 		runPlain:             runPlainFn,
+		sleep:                sleepFn,
 	}
 }
 
@@ -75,6 +80,7 @@ func restoreSeams(b seamBackup) {
 	runGateFn = b.runGate
 	runFixFn = b.runFix
 	runPlainFn = b.runPlain
+	sleepFn = b.sleep
 }
 
 // installSeams replaces every seam with safe defaults for branch tests
@@ -105,6 +111,7 @@ func installSeams(t *testing.T) {
 	}
 	runFixFn = func(ai.Backend, string, string, string) error { return nil }
 	runPlainFn = func(ai.Backend, string, string, string) error { return nil }
+	sleepFn = func(time.Duration) {}
 }
 
 // branchBaseOpts is a minimal Options that keeps ProcessPR out of trouble:
@@ -581,7 +588,615 @@ func TestReplyAndResolve_ResolveSkippedFlag(t *testing.T) {
 	}
 }
 
+// --- 15. Fix model writes thread-responses.json → responses rolled in --------
+
+func TestProcessPR_FixModelWritesResponses(t *testing.T) {
+	installSeams(t)
+
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
+		t.Fatalf("write a.go: %v", err)
+	}
+	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+
+	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+		return []ghapi.Thread{{
+			ID: "t1", Path: "a.go", Line: 1,
+			Comments: []ghapi.Comment{{Author: "alice", Body: "needs semantic review please"}},
+		}}, nil
+	}
+
+	// Gate says "run the advanced model".
+	runGateFn = func(ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
+		return ai.GateOutput{NeedsAdvancedModel: true, ThreadsToFix: []string{"t1"}}, nil
+	}
+
+	fixCalled := int32(0)
+	runFixFn = func(_ ai.Backend, _ string, _ string, workdir string) error {
+		atomic.AddInt32(&fixCalled, 1)
+		body := `[{"thread_id":"t1","action":"fixed","comment":"replaced the bug with a fix"}]`
+		return os.WriteFile(filepath.Join(workdir, "thread-responses.json"), []byte(body), 0o644)
+	}
+
+	var replyMu sync.Mutex
+	var replyBodies []string
+	var replyIDs []string
+	replyToThreadFn = func(id, body string) error {
+		replyMu.Lock()
+		replyIDs = append(replyIDs, id)
+		replyBodies = append(replyBodies, body)
+		replyMu.Unlock()
+		return nil
+	}
+	resolveCount := int32(0)
+	resolveThreadFn = func(string) error {
+		atomic.AddInt32(&resolveCount, 1)
+		return nil
+	}
+
+	opts := branchBaseOpts(t)
+	opts.Weights = gate.ScoreWeights{NeedsLLM: 1.0}
+
+	res := ProcessPR(opts)
+	if res.Status != "ok" {
+		t.Fatalf("status=%q (reason=%q) want ok", res.Status, res.Reason)
+	}
+	if atomic.LoadInt32(&fixCalled) != 1 {
+		t.Fatalf("runFix calls=%d want 1", fixCalled)
+	}
+	if !res.FixModelRan {
+		t.Fatalf("want FixModelRan=true")
+	}
+	if res.Replied == 0 {
+		t.Fatalf("want Replied > 0; got %d", res.Replied)
+	}
+	if res.Resolved == 0 {
+		t.Fatalf("want Resolved > 0; got %d", res.Resolved)
+	}
+
+	replyMu.Lock()
+	defer replyMu.Unlock()
+	found := false
+	for i, body := range replyBodies {
+		if replyIDs[i] == "t1" && strings.Contains(body, "replaced the bug") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected t1 reply with fix-model text; got ids=%v bodies=%v",
+			replyIDs, replyBodies)
+	}
+}
+
+// --- 16. ProcessPR detects autofix hook at .gh-crfix/autofix.sh -------------
+
+func TestProcessPR_AutofixHookDetectedAndRan(t *testing.T) {
+	installSeams(t)
+
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
+		t.Fatalf("write a.go: %v", err)
+	}
+
+	// Set up an executable autofix hook that writes a marker file we can
+	// check for afterwards.
+	hookDir := filepath.Join(wt, ".gh-crfix")
+	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+		t.Fatalf("mkdir .gh-crfix: %v", err)
+	}
+	marker := filepath.Join(wt, "autofix-ran.txt")
+	hookPath := filepath.Join(hookDir, "autofix.sh")
+	hookBody := "#!/bin/sh\ntouch " + marker + "\n"
+	if err := os.WriteFile(hookPath, []byte(hookBody), 0o755); err != nil {
+		t.Fatalf("write hook: %v", err)
+	}
+	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+
+	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+		return []ghapi.Thread{{
+			ID: "t1", Path: "a.go", Line: 1,
+			Comments: []ghapi.Comment{{Author: "alice", Body: "needs semantic review"}},
+		}}, nil
+	}
+
+	opts := branchBaseOpts(t)
+	// Use NoAutofix=false so the autofix branch actually runs.
+	opts.NoAutofix = false
+	// Gate should stay below threshold → keep the test focused on the autofix branch.
+	opts.Weights = gate.ScoreWeights{NeedsLLM: 0.5, TestFailure: 1.0}
+
+	res := ProcessPR(opts)
+	if res.Status != "ok" {
+		t.Fatalf("status=%q (reason=%q) want ok", res.Status, res.Reason)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("autofix hook marker %q not created: %v", marker, err)
+	}
+}
+
+// --- 17. Validation failure path — not plumbable without invasive changes.
+// SKIPPED: internal/validate uses a detected runner (package.json / hook
+// script on disk), not a seam, so we can't inject a "tests failed" result
+// without either running real tests or refactoring validate.Detect/Run into
+// package-level seams. Leaving this uncovered in workflow tests for now;
+// the individual validate.Result=TestsFailed branches are already exercised
+// in prompts_test.go through buildGatePrompt/buildFixPrompt.
+
+// --- 18. cleanupThreadResponsesArtifact: no artifact + real git repo ---------
+
+func TestCleanupThreadResponsesArtifact_NoOp(t *testing.T) {
+	// Create a real (empty) git repo so `git -C <wt>` calls don't explode
+	// with "not a git repository" and we still exercise every branch of the
+	// function (git rm fails → fallback rm; commit fails silently; push
+	// fails silently).
+	wt := t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := gitCmdInDir(wt, args...)
+		_ = cmd.Run()
+	}
+	runGit("init", "-q")
+	runGit("config", "user.email", "t@example.com")
+	runGit("config", "user.name", "test")
+
+	// Should return without panicking even with no artifact present.
+	cleanupThreadResponsesArtifact(wt)
+
+	// File should still be absent.
+	if _, err := os.Stat(filepath.Join(wt, "thread-responses.json")); !os.IsNotExist(err) {
+		t.Fatalf("thread-responses.json should not exist; err=%v", err)
+	}
+}
+
+// --- 19. ProcessPR: auto-detect repo root when RepoRoot is empty ------------
+
+func TestProcessPR_RepoRootAutoDetectError(t *testing.T) {
+	installSeams(t)
+	repoRootFn = func(string) (string, error) { return "", errors.New("no git") }
+
+	opts := branchBaseOpts(t)
+	opts.RepoRoot = "" // force auto-detect branch.
+
+	res := ProcessPR(opts)
+	if res.Status != "failed" {
+		t.Fatalf("status=%q want failed", res.Status)
+	}
+	if res.Err == nil {
+		t.Fatalf("want Err set")
+	}
+	if !strings.Contains(res.Err.Error(), "no git") {
+		t.Fatalf("want error to wrap 'no git'; got %v", res.Err)
+	}
+}
+
+// --- 20. ProcessPR: worktree setup error -----------------------------------
+
+func TestProcessPR_WorktreeSetupError(t *testing.T) {
+	installSeams(t)
+	setupWorktreeFn = func(string, string, int) (string, error) {
+		return "", errors.New("worktree add failed")
+	}
+
+	res := ProcessPR(branchBaseOpts(t))
+	if res.Status != "failed" {
+		t.Fatalf("status=%q want failed", res.Status)
+	}
+	if !strings.Contains(res.Err.Error(), "worktree add failed") {
+		t.Fatalf("want error containing 'worktree add failed'; got %v", res.Err)
+	}
+}
+
+// --- 21. ProcessPR: fetchThreads error -------------------------------------
+
+func TestProcessPR_FetchThreadsError(t *testing.T) {
+	installSeams(t)
+	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+		return nil, errors.New("gh api threads boom")
+	}
+
+	res := ProcessPR(branchBaseOpts(t))
+	if res.Status != "failed" {
+		t.Fatalf("status=%q want failed (reason=%q)", res.Status, res.Reason)
+	}
+	if !strings.Contains(res.Err.Error(), "gh api threads boom") {
+		t.Fatalf("want wrapped fetch error; got %v", res.Err)
+	}
+}
+
+// --- 22. ProcessPR: mergeBase error is logged but doesn't fail -------------
+
+func TestProcessPR_MergeBaseErrorContinues(t *testing.T) {
+	installSeams(t)
+
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
+		t.Fatalf("write a.go: %v", err)
+	}
+	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+
+	mergeBaseFn = func(string, string) error { return errors.New("merge conflict") }
+	// Keep below threshold so we don't also call gate.
+	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+		return []ghapi.Thread{{
+			ID: "t1", Path: "a.go", Line: 1,
+			Comments: []ghapi.Comment{{Author: "x", Body: "lgtm"}},
+		}}, nil
+	}
+
+	res := ProcessPR(branchBaseOpts(t))
+	if res.Status != "ok" {
+		t.Fatalf("status=%q want ok (reason=%q)", res.Status, res.Reason)
+	}
+}
+
+// --- 23. ProcessPR: fixConflictMarkers propagates and aborts ---------------
+
+func TestProcessPR_ConflictMarkersUnresolvable(t *testing.T) {
+	installSeams(t)
+
+	// Simulate: detectMarkersFn always reports markers → runPlainFn swallows,
+	// markers remain, so fixConflictMarkers returns an error → early exit.
+	detectMarkersFn = func(string) ([]string, error) {
+		return []string{"bad.go"}, nil
+	}
+	runPlainFn = func(ai.Backend, string, string, string) error { return nil }
+
+	res := ProcessPR(branchBaseOpts(t))
+	if res.Status == "ok" {
+		t.Fatalf("want non-ok status when conflict markers persist; got %+v", res)
+	}
+	if !strings.Contains(res.Reason, "committed conflict markers could not be auto-fixed") {
+		t.Fatalf("want conflict-marker error reason; got %q", res.Reason)
+	}
+}
+
+// --- 24. ProcessPR: runFix returns error → FixModelRan stays false ---------
+
+func TestProcessPR_FixModelError(t *testing.T) {
+	installSeams(t)
+
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
+		t.Fatalf("write a.go: %v", err)
+	}
+	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+
+	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+		return []ghapi.Thread{{
+			ID: "t1", Path: "a.go", Line: 1,
+			Comments: []ghapi.Comment{{Author: "alice", Body: "semantic thought needed"}},
+		}}, nil
+	}
+	runGateFn = func(ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
+		// Return empty ThreadsToFix → exercises the `len(selected) == 0 &&
+		// len(activeNeedsLLM) > 0` branch where ProcessPR populates from
+		// activeNeedsLLM.
+		return ai.GateOutput{NeedsAdvancedModel: true, ThreadsToFix: nil}, nil
+	}
+	fixErr := errors.New("claude exited 1")
+	var fixCalled int32
+	runFixFn = func(ai.Backend, string, string, string) error {
+		atomic.AddInt32(&fixCalled, 1)
+		return fixErr
+	}
+
+	opts := branchBaseOpts(t)
+	opts.Weights = gate.ScoreWeights{NeedsLLM: 1.0}
+
+	res := ProcessPR(opts)
+	if res.Status != "ok" {
+		t.Fatalf("status=%q want ok even after fix error (reason=%q)", res.Status, res.Reason)
+	}
+	if res.FixModelRan {
+		t.Fatalf("FixModelRan must stay false on fix-model error")
+	}
+	if atomic.LoadInt32(&fixCalled) != 1 {
+		t.Fatalf("fix called %d want 1", fixCalled)
+	}
+}
+
+// --- 25. ProcessPR: post-fix cycle is triggered when NoPostFix=false -------
+
+func TestProcessPR_PostFixCycleTriggered(t *testing.T) {
+	installSeams(t)
+
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
+		t.Fatalf("write a.go: %v", err)
+	}
+	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+
+	var fetchCount int32
+	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+		// First fetch = initial threads; second fetch = post-fix cycle.
+		n := atomic.AddInt32(&fetchCount, 1)
+		if n == 1 {
+			return []ghapi.Thread{{
+				ID: "t1", Path: "a.go", Line: 1,
+				Comments: []ghapi.Comment{{Author: "x", Body: "lgtm"}},
+			}}, nil
+		}
+		return nil, nil
+	}
+
+	var sleepCount int32
+	sleepFn = func(time.Duration) { atomic.AddInt32(&sleepCount, 1) }
+
+	opts := branchBaseOpts(t)
+	opts.NoPostFix = false // enable postFixReviewCycle
+	opts.ReviewWaitSecs = 1
+
+	res := ProcessPR(opts)
+	if res.Status != "ok" {
+		t.Fatalf("status=%q want ok (reason=%q)", res.Status, res.Reason)
+	}
+	if atomic.LoadInt32(&sleepCount) != 1 {
+		t.Fatalf("post-fix sleep should have been called once; got %d", sleepCount)
+	}
+	if atomic.LoadInt32(&fetchCount) < 2 {
+		t.Fatalf("fetch should have been called twice (initial + post-fix); got %d", fetchCount)
+	}
+}
+
+// --- 26. ProcessPR: dirty worktree triggers case collision handler ---------
+
+func TestProcessPR_DirtyWorktreeHandledByCollisions(t *testing.T) {
+	installSeams(t)
+
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
+		t.Fatalf("write a.go: %v", err)
+	}
+	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+
+	// Dirty first, clean after LLM resolves.
+	var dirtyCalls int32
+	dirtyStatusFn = func(string) (string, error) {
+		n := atomic.AddInt32(&dirtyCalls, 1)
+		if n == 1 {
+			return " M Foo.go", nil
+		}
+		return "", nil
+	}
+	var detectCalls int32
+	detectCaseCollisionsFn = func(string) ([][]string, error) {
+		n := atomic.AddInt32(&detectCalls, 1)
+		if n == 1 {
+			return [][]string{{"Foo.go", "foo.go"}}, nil
+		}
+		return nil, nil
+	}
+	var plainCalls int32
+	runPlainFn = func(ai.Backend, string, string, string) error {
+		atomic.AddInt32(&plainCalls, 1)
+		return nil
+	}
+
+	res := ProcessPR(branchBaseOpts(t))
+	if res.Status != "skipped" && res.Status != "ok" {
+		// With no threads returned the overall result is "skipped (no
+		// unresolved threads)". Either way, what we care about is that the
+		// collision handler ran.
+		t.Fatalf("unexpected status=%q", res.Status)
+	}
+	if atomic.LoadInt32(&plainCalls) == 0 {
+		t.Fatalf("runPlain (case-collision fix) should have been called")
+	}
+}
+
+// --- 27. ProcessPR: dirty worktree remaining after handler → reason set ----
+
+func TestProcessPR_DirtyWorktreePersistsReason(t *testing.T) {
+	installSeams(t)
+
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
+		t.Fatalf("write a.go: %v", err)
+	}
+	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+
+	dirtyStatusFn = func(string) (string, error) { return " M x.go", nil }
+	// No collisions → handler returns immediately, re-check still dirty.
+	detectCaseCollisionsFn = func(string) ([][]string, error) { return nil, nil }
+
+	res := ProcessPR(branchBaseOpts(t))
+	if !strings.Contains(res.Reason, "dirty") {
+		t.Fatalf("want reason mentioning 'dirty'; got %q", res.Reason)
+	}
+}
+
+// --- 28. OptionsFromConfig: maps Config fields onto Options ----------------
+
+func TestOptionsFromConfig_MapsFields(t *testing.T) {
+	cfg := config.Config{
+		AIBackend:        "claude",
+		GateModel:        "gate-m",
+		FixModel:         "fix-m",
+		ScoreNeedsLLM:    0.75,
+		ScorePRComment:   0.25,
+		ScoreTestFailure: 0.5,
+	}
+	opts := OptionsFromConfig(cfg, "owner/repo", 99)
+
+	if opts.Repo != "owner/repo" || opts.PRNum != 99 {
+		t.Fatalf("Repo/PRNum mismatch: %+v", opts)
+	}
+	if opts.GateModel != cfg.GateModel {
+		t.Fatalf("GateModel=%q want %q", opts.GateModel, cfg.GateModel)
+	}
+	if opts.FixModel != cfg.FixModel {
+		t.Fatalf("FixModel=%q want %q", opts.FixModel, cfg.FixModel)
+	}
+	if opts.Weights.NeedsLLM != cfg.ScoreNeedsLLM {
+		t.Fatalf("weights.NeedsLLM mismatch")
+	}
+	if opts.ReviewWaitSecs != 180 {
+		t.Fatalf("ReviewWaitSecs=%d want 180", opts.ReviewWaitSecs)
+	}
+	if opts.MaxThreads != 100 {
+		t.Fatalf("MaxThreads=%d want 100", opts.MaxThreads)
+	}
+	if !opts.IncludeOutdated {
+		t.Fatalf("IncludeOutdated should default true")
+	}
+}
+
+// --- 29. readThreadResponses: missing file + malformed JSON error paths ----
+
+func TestReadThreadResponses_ErrorPaths(t *testing.T) {
+	wt := t.TempDir()
+	// Missing → ReadFile error.
+	if _, err := readThreadResponses(wt); err == nil {
+		t.Fatalf("want error on missing thread-responses.json")
+	}
+	// Malformed → unmarshal error.
+	if werr := os.WriteFile(filepath.Join(wt, "thread-responses.json"), []byte("not-json"), 0o644); werr != nil {
+		t.Fatalf("write bad json: %v", werr)
+	}
+	if _, err := readThreadResponses(wt); err == nil {
+		t.Fatalf("want error on malformed json")
+	}
+}
+
+// --- 30. ProcessPR: gate model errors → logged, fix not run --------------
+
+func TestProcessPR_GateModelError(t *testing.T) {
+	installSeams(t)
+
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
+		t.Fatalf("write a.go: %v", err)
+	}
+	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+
+	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+		return []ghapi.Thread{{
+			ID: "t1", Path: "a.go", Line: 1,
+			Comments: []ghapi.Comment{{Author: "alice", Body: "needs semantic review"}},
+		}}, nil
+	}
+	runGateFn = func(ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
+		return ai.GateOutput{}, errors.New("gate crashed")
+	}
+	var fixCalled int32
+	runFixFn = func(ai.Backend, string, string, string) error {
+		atomic.AddInt32(&fixCalled, 1)
+		return nil
+	}
+
+	opts := branchBaseOpts(t)
+	opts.Weights = gate.ScoreWeights{NeedsLLM: 1.0}
+	res := ProcessPR(opts)
+	if res.Status != "ok" {
+		t.Fatalf("status=%q want ok (gate error shouldn't fail the run)", res.Status)
+	}
+	if atomic.LoadInt32(&fixCalled) != 0 {
+		t.Fatalf("fix must not run when gate returned an error; got %d", fixCalled)
+	}
+}
+
+// --- 31. ProcessPR: HeadSHA present → fetchFailingChecks is invoked -------
+
+func TestProcessPR_FetchFailingChecksInvoked(t *testing.T) {
+	installSeams(t)
+
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
+		t.Fatalf("write a.go: %v", err)
+	}
+	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+
+	fetchPRFn = func(string, int) (ghapi.PRInfo, error) {
+		return ghapi.PRInfo{
+			State: "OPEN", HeadRefName: "feature", BaseRefName: "main", Title: "t", HeadSHA: "abc123",
+		}, nil
+	}
+	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+		return []ghapi.Thread{{
+			ID: "t1", Path: "a.go", Line: 1,
+			Comments: []ghapi.Comment{{Author: "alice", Body: "lgtm"}},
+		}}, nil
+	}
+	var ciCalls int32
+	fetchFailingChecksFn = func(_ string, sha string) ([]ghapi.CICheck, error) {
+		atomic.AddInt32(&ciCalls, 1)
+		if sha != "abc123" {
+			t.Errorf("CI called with sha=%q want abc123", sha)
+		}
+		return []ghapi.CICheck{{Name: "build", LogText: "boom"}}, nil
+	}
+
+	res := ProcessPR(branchBaseOpts(t))
+	if res.Status != "ok" {
+		t.Fatalf("status=%q want ok (reason=%q)", res.Status, res.Reason)
+	}
+	if atomic.LoadInt32(&ciCalls) != 1 {
+		t.Fatalf("fetchFailingChecks calls=%d want 1", ciCalls)
+	}
+}
+
+// --- 32. ProcessPR: postComment + copilot review errors are swallowed ------
+
+func TestProcessPR_PostCommentAndCopilotErrorsSwallowed(t *testing.T) {
+	installSeams(t)
+
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
+		t.Fatalf("write a.go: %v", err)
+	}
+	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+
+	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+		return []ghapi.Thread{{
+			ID: "t1", Path: "a.go", Line: 1,
+			Comments: []ghapi.Comment{{Author: "alice", Body: "lgtm"}},
+		}}, nil
+	}
+	postCommentFn = func(string, int, string) error { return errors.New("post boom") }
+	requestCopilotReviewFn = func(string, int) error { return errors.New("copilot boom") }
+
+	res := ProcessPR(branchBaseOpts(t))
+	if res.Status != "ok" {
+		t.Fatalf("status=%q want ok (errors should be swallowed)", res.Status)
+	}
+}
+
+// --- 33. ProcessPR: reply/resolve errors are swallowed --------------------
+
+func TestProcessPR_ReplyResolveErrors(t *testing.T) {
+	installSeams(t)
+
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
+		t.Fatalf("write a.go: %v", err)
+	}
+	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+
+	// Produce a thread that classifies as already-fixed/skipped.
+	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+		return []ghapi.Thread{{
+			ID: "t1", Path: "a.go", Line: 1,
+			Comments: []ghapi.Comment{{Author: "x", Body: "lgtm"}},
+		}}, nil
+	}
+	replyToThreadFn = func(string, string) error { return errors.New("reply boom") }
+	resolveThreadFn = func(string) error { return errors.New("resolve boom") }
+
+	res := ProcessPR(branchBaseOpts(t))
+	if res.Status != "ok" {
+		t.Fatalf("status=%q want ok (reply/resolve errors should be swallowed)", res.Status)
+	}
+}
+
 // --- Helpers ------------------------------------------------------------------
 
 // contains is a tiny wrapper that lets us keep the substring checks readable.
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
+
+// gitCmdInDir shells out to git inside a directory. Kept small and
+// dependency-free so the cleanup test doesn't need a full helper package.
+func gitCmdInDir(dir string, args ...string) *exec.Cmd {
+	full := append([]string{"-C", dir}, args...)
+	return exec.Command("git", full...)
+}
+

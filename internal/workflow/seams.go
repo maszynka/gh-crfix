@@ -7,6 +7,8 @@ package workflow
 // Test seam; see workflow_branch_test.go
 
 import (
+	"time"
+
 	"github.com/maszynka/gh-crfix/internal/ai"
 	"github.com/maszynka/gh-crfix/internal/conflict"
 	ghapi "github.com/maszynka/gh-crfix/internal/github"
@@ -42,3 +44,7 @@ var (
 	runFixFn   = ai.RunFix
 	runPlainFn = ai.RunPlain
 )
+
+// sleepFn is a test seam for time.Sleep used by the post-fix review cycle.
+// Tests override this with a no-op or recorder so they don't actually block.
+var sleepFn = time.Sleep

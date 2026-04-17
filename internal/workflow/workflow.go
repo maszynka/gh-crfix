@@ -551,7 +551,7 @@ func postFixReviewCycle(opts Options, wtPath string, fixedCount int, log func(st
 		wait = 180
 	}
 	log("post-fix: waiting %ds...", wait)
-	time.Sleep(time.Duration(wait) * time.Second)
+	sleepFn(time.Duration(wait) * time.Second)
 
 	newThreads, err := fetchThreadsFn(opts.Repo, opts.PRNum, opts.MaxThreads)
 	if err != nil {
