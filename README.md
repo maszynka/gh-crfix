@@ -230,7 +230,8 @@ Model registry override behaviour is documented in [`docs/registry.md`](docs/reg
 End-to-end tests for the Go port live in:
 
 - `cmd/gh-crfix/main_e2e_test.go` — `go test -tags=e2e ./cmd/gh-crfix/...`
-- `test/e2e/go-port.sh` — POSIX-sh mirror, runs the built binary against stubbed `gh`/`claude`.
+- `test/e2e/go-port.sh` — POSIX-sh mirror of the dry-run happy path, runs the built binary against stubbed `gh`/`claude`.
+- `test/e2e/go-port-scenarios.sh` — additional POSIX-sh scenarios (CLOSED PR, zero threads, `--setup-only`, gate-skip below threshold).
 
 ## Tests
 
