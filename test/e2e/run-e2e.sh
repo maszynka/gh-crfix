@@ -208,7 +208,11 @@ echo "=== Step 7: Verifying ==="
 cd "$FIXTURE_DIR"
 git fetch origin "$E2E_BRANCH"
 git checkout "$E2E_BRANCH"
-git pull --rebase origin "$E2E_BRANCH"
+# gh crfix made its edits inside a separate git worktree and pushed them;
+# the fixture dir's checkout is still at the PRE-fix SHA with local tree
+# state that diverges from the new remote tip. Hard-reset to the remote
+# tip so assertions grep the files gh crfix actually produced.
+git reset --hard "origin/$E2E_BRANCH"
 
 PASS=0; FAIL=0
 check() {
