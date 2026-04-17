@@ -782,12 +782,16 @@ func detectAutofixHook(wtPath string) string {
 	return ""
 }
 
-func runHook(hookPath, dir string) {
+// runHook runs a shell hook in dir. The error return is wired up in commit 2;
+// this stub keeps commit 1's correctness_test.go building while letting the
+// RED tests for the failure case fail.
+func runHook(hookPath, dir string) error {
 	cmd := exec.Command(hookPath)
 	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	_ = cmd.Run()
+	return nil
 }
 
 func truncate(s string, maxLen int) string {
