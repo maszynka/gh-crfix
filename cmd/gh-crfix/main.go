@@ -90,11 +90,11 @@ func run(ctx context.Context, args []string) int {
 
 	// --- If no args AND both std streams are TTYs → launcher ------------------
 	if len(args) == 0 {
-		if isTerminal(os.Stdout) && isTerminal(os.Stderr) {
+		if isTerminalFn(stdoutFileFn()) && isTerminalFn(stderrFileFn()) {
 			// Load the model registry (best-effort — the launcher handles an
 			// empty ModelList gracefully via its own fallbacks).
 			ml, _ := registry.Fetch(registry.Options{})
-			launcherArgs, ok := runLauncher(ctx, cfg, ml)
+			launcherArgs, ok := runLauncherFn(ctx, cfg, ml)
 			if !ok {
 				// Launcher cancelled (ctrl+C / esc / q) — silent exit.
 				return 0
@@ -170,7 +170,7 @@ func run(ctx context.Context, args []string) int {
 	// --- Decide whether to run the dashboard alongside ProcessBatch ----------
 	useDashboard := !plan.noTUI &&
 		plan.concurrency > 1 &&
-		isTerminal(os.Stdout) &&
+		isTerminalFn(stdoutFileFn()) &&
 		runLog != nil &&
 		tracker != nil
 
@@ -251,7 +251,7 @@ func runBatch(
 	dashWg.Add(1)
 	go func() {
 		defer dashWg.Done()
-		_ = tui.Run(dashCtx, tui.DashboardConfig{
+		_ = runDashboardFn(dashCtx, tui.DashboardConfig{
 			PRNums:  plan.prNums,
 			Tracker: tracker,
 			Run:     runLog,
@@ -292,7 +292,7 @@ func runBatchPlain(ctx context.Context, plan runPlan) []workflow.Result {
 		return results
 	default:
 	}
-	return workflow.ProcessBatch(workflow.BatchOptions{
+	return processBatchFn(workflow.BatchOptions{
 		PRNums:      plan.prNums,
 		Concurrency: plan.concurrency,
 		Base:        plan.opts,
@@ -322,7 +322,7 @@ func resolveConfig(args []string, cfg config.Config) (runPlan, error) {
 	if strings.Contains(prSpec, "github.com/") {
 		ownerRepo, prNums, err = input.ParseURL(prSpec)
 	} else {
-		ownerRepo, err = currentRepo()
+		ownerRepo, err = currentRepoFn()
 		if err != nil {
 			return plan, fmt.Errorf("not in a GitHub repo and no URL given (%w)", err)
 		}
