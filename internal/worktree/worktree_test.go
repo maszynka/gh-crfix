@@ -1,6 +1,7 @@
 package worktree
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -95,7 +96,7 @@ func TestRepoRoot_ValidRepo(t *testing.T) {
 	skipIfWindows(t)
 	_, clone := makeUpstreamAndClone(t)
 
-	got, err := RepoRoot(clone)
+	got, err := RepoRoot(context.Background(), clone)
 	if err != nil {
 		t.Fatalf("RepoRoot: %v", err)
 	}
@@ -110,7 +111,7 @@ func TestRepoRoot_ValidRepo(t *testing.T) {
 
 func TestRepoRoot_NotARepo(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := RepoRoot(dir); err == nil {
+	if _, err := RepoRoot(context.Background(), dir); err == nil {
 		t.Fatalf("expected error for non-git dir %s", dir)
 	}
 }
@@ -147,7 +148,7 @@ func TestSetup_CreatesTrackingBranchFromOrigin(t *testing.T) {
 	pushBranchToBare(t, bare, "feature-x")
 
 	// Local does NOT yet have `feature-x` (clone only fetched HEAD by default).
-	wt, err := Setup(clone, "feature-x", 101)
+	wt, err := Setup(context.Background(), clone, "feature-x", 101)
 	if err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
@@ -171,7 +172,7 @@ func TestSetup_UsesExistingLocalBranch(t *testing.T) {
 	runGit(t, clone, "fetch", "--quiet", "origin", "feature-y")
 	runGit(t, clone, "branch", "feature-y", "origin/feature-y")
 
-	wt, err := Setup(clone, "feature-y", 102)
+	wt, err := Setup(context.Background(), clone, "feature-y", 102)
 	if err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
@@ -186,7 +187,7 @@ func TestSetup_SecondCallCleansExistingDirtyFile(t *testing.T) {
 	bare, clone := makeUpstreamAndClone(t)
 	pushBranchToBare(t, bare, "feature-z")
 
-	wt, err := Setup(clone, "feature-z", 103)
+	wt, err := Setup(context.Background(), clone, "feature-z", 103)
 	if err != nil {
 		t.Fatalf("Setup #1: %v", err)
 	}
@@ -201,7 +202,7 @@ func TestSetup_SecondCallCleansExistingDirtyFile(t *testing.T) {
 	}
 
 	// Second call should clean the worktree.
-	wt2, err := Setup(clone, "feature-z", 103)
+	wt2, err := Setup(context.Background(), clone, "feature-z", 103)
 	if err != nil {
 		t.Fatalf("Setup #2: %v", err)
 	}
@@ -220,7 +221,7 @@ func TestMergeBase_HappyPath(t *testing.T) {
 	bare, clone := makeUpstreamAndClone(t)
 	pushBranchToBare(t, bare, "mb-feature")
 
-	wt, err := Setup(clone, "mb-feature", 200)
+	wt, err := Setup(context.Background(), clone, "mb-feature", 200)
 	if err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
@@ -242,7 +243,7 @@ func TestMergeBase_HappyPath(t *testing.T) {
 	runGit(t, scratch, "commit", "-m", "advance main", "--quiet")
 	runGit(t, scratch, "push", "--quiet", "origin", "main")
 
-	if err := MergeBase(wt, "main"); err != nil {
+	if err := MergeBase(context.Background(), wt, "main"); err != nil {
 		t.Fatalf("MergeBase: %v", err)
 	}
 	// main-only.txt should now exist in the worktree.
@@ -291,12 +292,12 @@ func TestMergeBase_ConflictReturnsError(t *testing.T) {
 	runGit(t, scratch2, "push", "--quiet", "origin", "conflict-feature")
 
 	// Now Setup feature in clone and try to merge main -> conflict.
-	wt, err := Setup(clone, "conflict-feature", 300)
+	wt, err := Setup(context.Background(), clone, "conflict-feature", 300)
 	if err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
 
-	if err := MergeBase(wt, "main"); err == nil {
+	if err := MergeBase(context.Background(), wt, "main"); err == nil {
 		t.Fatalf("expected conflict error from MergeBase, got nil")
 	}
 }
@@ -308,7 +309,7 @@ func TestRemove_DeletesWorktreeDir_AndIsIdempotent(t *testing.T) {
 	bare, clone := makeUpstreamAndClone(t)
 	pushBranchToBare(t, bare, "rm-feature")
 
-	wt, err := Setup(clone, "rm-feature", 400)
+	wt, err := Setup(context.Background(), clone, "rm-feature", 400)
 	if err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
@@ -316,7 +317,7 @@ func TestRemove_DeletesWorktreeDir_AndIsIdempotent(t *testing.T) {
 		t.Fatalf("precondition: worktree dir missing: %v", err)
 	}
 
-	if err := Remove(clone, 400); err != nil {
+	if err := Remove(context.Background(), clone, 400); err != nil {
 		t.Fatalf("Remove: %v", err)
 	}
 	if _, err := os.Stat(wt); !os.IsNotExist(err) {
@@ -324,7 +325,7 @@ func TestRemove_DeletesWorktreeDir_AndIsIdempotent(t *testing.T) {
 	}
 
 	// Second call must not blow up.
-	if err := Remove(clone, 400); err != nil {
+	if err := Remove(context.Background(), clone, 400); err != nil {
 		t.Fatalf("Remove (2nd call): %v", err)
 	}
 }
@@ -336,7 +337,7 @@ func TestDirtyStatus_PristineIsEmpty(t *testing.T) {
 	bare, clone := makeUpstreamAndClone(t)
 	pushBranchToBare(t, bare, "ds-feature")
 
-	wt, err := Setup(clone, "ds-feature", 500)
+	wt, err := Setup(context.Background(), clone, "ds-feature", 500)
 	if err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
@@ -354,7 +355,7 @@ func TestDirtyStatus_UntrackedFileIsNonEmpty(t *testing.T) {
 	bare, clone := makeUpstreamAndClone(t)
 	pushBranchToBare(t, bare, "ds2-feature")
 
-	wt, err := Setup(clone, "ds2-feature", 501)
+	wt, err := Setup(context.Background(), clone, "ds2-feature", 501)
 	if err != nil {
 		t.Fatalf("Setup: %v", err)
 	}

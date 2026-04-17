@@ -48,6 +48,22 @@ func TestMatchesRepo_MismatchedRemote(t *testing.T) {
 	}
 }
 
+// TestMatchesRepo_LocalOriginPassesThrough: a non-GitHub origin (e.g., a
+// local bare repo used in tests or a GitLab mirror) is treated as unknown
+// and returned as a match so we don't break local fixtures.
+func TestMatchesRepo_LocalOriginPassesThrough(t *testing.T) {
+	skipIfWindows(t)
+	_, clone := makeUpstreamAndClone(t)
+	// Default origin is already a local path — don't touch it.
+	ok, _, err := MatchesRepo(clone, "maszynka", "gh-crfix")
+	if err != nil {
+		t.Fatalf("MatchesRepo: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected local origin to be treated as a match (pass-through)")
+	}
+}
+
 // TestMatchesRepo_NotGitRepo: non-git dir returns an error.
 func TestMatchesRepo_NotGitRepo(t *testing.T) {
 	dir := t.TempDir()

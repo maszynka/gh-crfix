@@ -76,7 +76,7 @@ func captureStdout(t *testing.T, fn func()) (string, string) {
 type seamOverrides struct {
 	isTerminal   func(*os.File) bool
 	runLauncher  func(ctx context.Context, cfg config.Config, ml registry.ModelList) ([]string, bool)
-	processBatch func(workflow.BatchOptions) []workflow.Result
+	processBatch func(context.Context, workflow.BatchOptions) []workflow.Result
 	runDashboard func(ctx context.Context, cfg tui.DashboardConfig) error
 	currentRepo  func() (string, error)
 	stdoutFile   func() *os.File
@@ -174,7 +174,7 @@ func TestRun_LauncherTriggersWhenNoArgs_TTY(t *testing.T) {
 				"--no-tui",
 			}, true
 		},
-		processBatch: func(opts workflow.BatchOptions) []workflow.Result {
+		processBatch: func(_ context.Context, opts workflow.BatchOptions) []workflow.Result {
 			mu.Lock()
 			processedPRs = append([]int{}, opts.PRNums...)
 			mu.Unlock()
@@ -219,7 +219,7 @@ func TestRun_NoTTY_PrintsUsageNoLauncher(t *testing.T) {
 			launcherCalled.Add(1)
 			return nil, false
 		},
-		processBatch: func(workflow.BatchOptions) []workflow.Result {
+		processBatch: func(context.Context, workflow.BatchOptions) []workflow.Result {
 			processCalled.Add(1)
 			return nil
 		},
@@ -254,7 +254,7 @@ func TestRun_LauncherCancel_SilentExit(t *testing.T) {
 		runLauncher: func(context.Context, config.Config, registry.ModelList) ([]string, bool) {
 			return nil, false
 		},
-		processBatch: func(workflow.BatchOptions) []workflow.Result {
+		processBatch: func(context.Context, workflow.BatchOptions) []workflow.Result {
 			processCalled.Add(1)
 			return nil
 		},
@@ -280,7 +280,7 @@ func TestRun_DashboardTriggersOnConcurrencyTTY(t *testing.T) {
 	withSeams(t, seamOverrides{
 		isTerminal:  func(*os.File) bool { return true },
 		currentRepo: func() (string, error) { return "acme/proj", nil },
-		processBatch: func(opts workflow.BatchOptions) []workflow.Result {
+		processBatch: func(_ context.Context, opts workflow.BatchOptions) []workflow.Result {
 			time.Sleep(20 * time.Millisecond)
 			return fakeOKResults(opts.PRNums)
 		},
@@ -312,7 +312,7 @@ func TestRun_NoTUIFlagSkipsDashboard(t *testing.T) {
 	withSeams(t, seamOverrides{
 		isTerminal:  func(*os.File) bool { return true },
 		currentRepo: func() (string, error) { return "acme/proj", nil },
-		processBatch: func(opts workflow.BatchOptions) []workflow.Result {
+		processBatch: func(_ context.Context, opts workflow.BatchOptions) []workflow.Result {
 			return fakeOKResults(opts.PRNums)
 		},
 		runDashboard: func(ctx context.Context, cfg tui.DashboardConfig) error {
@@ -341,7 +341,7 @@ func TestRun_Concurrency1_SkipsDashboard(t *testing.T) {
 	withSeams(t, seamOverrides{
 		isTerminal:  func(*os.File) bool { return true },
 		currentRepo: func() (string, error) { return "acme/proj", nil },
-		processBatch: func(opts workflow.BatchOptions) []workflow.Result {
+		processBatch: func(_ context.Context, opts workflow.BatchOptions) []workflow.Result {
 			return fakeOKResults(opts.PRNums)
 		},
 		runDashboard: func(ctx context.Context, cfg tui.DashboardConfig) error {
@@ -371,7 +371,7 @@ func TestRun_CancelledContextReturns130(t *testing.T) {
 	withSeams(t, seamOverrides{
 		isTerminal:  func(*os.File) bool { return false }, // no-TTY, no dashboard
 		currentRepo: func() (string, error) { return "acme/proj", nil },
-		processBatch: func(opts workflow.BatchOptions) []workflow.Result {
+		processBatch: func(_ context.Context, opts workflow.BatchOptions) []workflow.Result {
 			// runBatchPlain checks ctx.Done() before calling this, but to be
 			// safe, return placeholder results if ever reached.
 			return fakeOKResults(opts.PRNums)
@@ -436,7 +436,7 @@ func TestRun_NoNotifyFlag_DisablesNotify(t *testing.T) {
 	withSeams(t, seamOverrides{
 		isTerminal:  func(*os.File) bool { return false },
 		currentRepo: func() (string, error) { return "acme/proj", nil },
-		processBatch: func(opts workflow.BatchOptions) []workflow.Result {
+		processBatch: func(_ context.Context, opts workflow.BatchOptions) []workflow.Result {
 			return fakeOKResults(opts.PRNums)
 		},
 	})
@@ -748,7 +748,7 @@ func TestRun_EnvNoNotifyTriggersDisable(t *testing.T) {
 	withSeams(t, seamOverrides{
 		isTerminal:  func(*os.File) bool { return false },
 		currentRepo: func() (string, error) { return "acme/proj", nil },
-		processBatch: func(opts workflow.BatchOptions) []workflow.Result {
+		processBatch: func(_ context.Context, opts workflow.BatchOptions) []workflow.Result {
 			return fakeOKResults(opts.PRNums)
 		},
 	})

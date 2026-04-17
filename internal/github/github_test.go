@@ -1,6 +1,7 @@
 package github
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -41,7 +42,7 @@ cat <<'JSON'
 {"headRefName":"feat/x","baseRefName":"main","title":"add thing","state":"OPEN","isDraft":false,"headRefOid":"deadbeef"}
 JSON
 `)
-	info, err := FetchPR("owner/repo", 42)
+	info, err := FetchPR(context.Background(), "owner/repo", 42)
 	if err != nil {
 		t.Fatalf("FetchPR: %v", err)
 	}
@@ -57,7 +58,7 @@ func TestFetchPR_MissingFields(t *testing.T) {
 	writeScript(t, dir, "gh", `#!/bin/sh
 printf '{}'
 `)
-	info, err := FetchPR("owner/repo", 1)
+	info, err := FetchPR(context.Background(), "owner/repo", 1)
 	if err != nil {
 		t.Fatalf("FetchPR: %v", err)
 	}
@@ -71,7 +72,7 @@ func TestFetchPR_MalformedJSON(t *testing.T) {
 	writeScript(t, dir, "gh", `#!/bin/sh
 printf 'not-json'
 `)
-	_, err := FetchPR("owner/repo", 1)
+	_, err := FetchPR(context.Background(), "owner/repo", 1)
 	if err == nil {
 		t.Fatal("expected error on malformed JSON")
 	}
@@ -86,7 +87,7 @@ func TestFetchPR_NonZeroExit(t *testing.T) {
 echo "gh boom" 1>&2
 exit 1
 `)
-	_, err := FetchPR("owner/repo", 1)
+	_, err := FetchPR(context.Background(), "owner/repo", 1)
 	if err == nil {
 		t.Fatal("expected error on non-zero exit")
 	}
@@ -112,7 +113,7 @@ cat <<'JSON'
 ]}}}}}
 JSON
 `)
-	threads, err := FetchThreads("owner/repo", 7, 50)
+	threads, err := FetchThreads(context.Background(), "owner/repo", 7, 50)
 	if err != nil {
 		t.Fatalf("FetchThreads: %v", err)
 	}
@@ -144,7 +145,7 @@ cat <<'JSON'
 {"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}
 JSON
 `)
-	threads, err := FetchThreads("owner/repo", 1, 10)
+	threads, err := FetchThreads(context.Background(), "owner/repo", 1, 10)
 	if err != nil {
 		t.Fatalf("FetchThreads: %v", err)
 	}
@@ -156,7 +157,7 @@ JSON
 func TestFetchThreads_InvalidRepo(t *testing.T) {
 	// No gh invocation expected — parsing fails first.
 	isolatePATH(t)
-	_, err := FetchThreads("badrepo", 1, 10)
+	_, err := FetchThreads(context.Background(), "badrepo", 1, 10)
 	if err == nil {
 		t.Fatal("expected error for invalid repo")
 	}
@@ -214,7 +215,7 @@ func TestReplyToThread_Argv(t *testing.T) {
 	argFile := filepath.Join(dir, "args.txt")
 	writeScript(t, dir, "gh", ghRecorderScript(argFile))
 
-	if err := ReplyToThread("THREAD123", "Looks good"); err != nil {
+	if err := ReplyToThread(context.Background(), "THREAD123", "Looks good"); err != nil {
 		t.Fatalf("ReplyToThread: %v", err)
 	}
 	args := readArgs(t, argFile)
@@ -231,7 +232,7 @@ func TestResolveThread_Argv(t *testing.T) {
 	argFile := filepath.Join(dir, "args.txt")
 	writeScript(t, dir, "gh", ghRecorderScript(argFile))
 
-	if err := ResolveThread("THREAD999"); err != nil {
+	if err := ResolveThread(context.Background(), "THREAD999"); err != nil {
 		t.Fatalf("ResolveThread: %v", err)
 	}
 	args := readArgs(t, argFile)
@@ -245,7 +246,7 @@ func TestPostComment_Argv(t *testing.T) {
 	argFile := filepath.Join(dir, "args.txt")
 	writeScript(t, dir, "gh", ghRecorderScript(argFile))
 
-	if err := PostComment("owner/repo", 123, "foo"); err != nil {
+	if err := PostComment(context.Background(), "owner/repo", 123, "foo"); err != nil {
 		t.Fatalf("PostComment: %v", err)
 	}
 	args := readArgs(t, argFile)
@@ -260,7 +261,7 @@ func TestRequestCopilotReview_Argv(t *testing.T) {
 	argFile := filepath.Join(dir, "args.txt")
 	writeScript(t, dir, "gh", ghRecorderScript(argFile))
 
-	if err := RequestCopilotReview("owner/repo", 55); err != nil {
+	if err := RequestCopilotReview(context.Background(), "owner/repo", 55); err != nil {
 		t.Fatalf("RequestCopilotReview: %v", err)
 	}
 	args := readArgs(t, argFile)
@@ -302,7 +303,7 @@ exit 0
 `
 	writeScript(t, dir, "gh", script)
 
-	checks, err := FetchFailingChecks("owner/repo", "deadbeef")
+	checks, err := FetchFailingChecks(context.Background(), "owner/repo", "deadbeef")
 	if err != nil {
 		t.Fatalf("FetchFailingChecks: %v", err)
 	}
@@ -337,7 +338,7 @@ func TestFetchFailingChecks_APIFailureNonFatal(t *testing.T) {
 echo "api error" 1>&2
 exit 1
 `)
-	checks, err := FetchFailingChecks("owner/repo", "deadbeef")
+	checks, err := FetchFailingChecks(context.Background(), "owner/repo", "deadbeef")
 	if err != nil {
 		t.Fatalf("expected nil error on api failure (non-fatal), got: %v", err)
 	}
@@ -352,7 +353,7 @@ func TestFetchFailingChecks_EmptyOutput(t *testing.T) {
 # no output, exit success
 exit 0
 `)
-	checks, err := FetchFailingChecks("owner/repo", "deadbeef")
+	checks, err := FetchFailingChecks(context.Background(), "owner/repo", "deadbeef")
 	if err != nil {
 		t.Fatalf("FetchFailingChecks: %v", err)
 	}
@@ -376,7 +377,7 @@ case "$1" in
 esac
 exit 0
 `)
-	checks, err := FetchFailingChecks("owner/repo", "deadbeef")
+	checks, err := FetchFailingChecks(context.Background(), "owner/repo", "deadbeef")
 	if err != nil {
 		t.Fatalf("FetchFailingChecks: %v", err)
 	}

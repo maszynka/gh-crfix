@@ -2,11 +2,13 @@
 package ai
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // Backend represents the AI backend to use.
@@ -16,6 +18,15 @@ const (
 	BackendAuto   Backend = iota
 	BackendClaude         // Anthropic claude CLI
 	BackendCodex          // OpenAI codex CLI
+)
+
+// Default per-call exec timeouts. These bound external-CLI invocations so a
+// hung claude/codex doesn't stall the entire pipeline. Overridable via env:
+//   - GH_CRFIX_GATE_TIMEOUT (duration, e.g. "5m")
+//   - GH_CRFIX_FIX_TIMEOUT  (duration, e.g. "15m")
+const (
+	defaultGateTimeout = 5 * time.Minute
+	defaultFixTimeout  = 15 * time.Minute
 )
 
 // ParseBackend parses a backend string into a Backend constant.
@@ -49,8 +60,9 @@ type GateOutput struct {
 }
 
 // RunGate runs the gate model with a structured JSON schema.
-// Returns the parsed gate output.
-func RunGate(backend Backend, model, prompt string, schema map[string]interface{}) (GateOutput, error) {
+// Returns the parsed gate output. Honors ctx cancellation/deadline and
+// caps the call at GH_CRFIX_GATE_TIMEOUT (default 5m).
+func RunGate(ctx context.Context, backend Backend, model, prompt string, schema map[string]interface{}) (GateOutput, error) {
 	effective := resolveBackend(backend)
 
 	schemaBytes, err := json.Marshal(schema)
@@ -82,12 +94,15 @@ func RunGate(backend Backend, model, prompt string, schema map[string]interface{
 	}
 	pf.Close()
 
+	ctx, cancel := withTimeout(ctx, envDuration("GH_CRFIX_GATE_TIMEOUT", defaultGateTimeout))
+	defer cancel()
+
 	var rawOut []byte
 	switch effective {
 	case BackendClaude:
-		rawOut, err = runClaudeStructured(model, pf.Name(), sf.Name())
+		rawOut, err = runClaudeStructured(ctx, model, pf.Name(), sf.Name())
 	case BackendCodex:
-		rawOut, err = runCodexStructured(model, pf.Name(), sf.Name())
+		rawOut, err = runCodexStructured(ctx, model, pf.Name(), sf.Name())
 	default:
 		return GateOutput{}, fmt.Errorf("no AI backend available (install claude or codex)")
 	}
@@ -110,9 +125,10 @@ func RunGate(backend Backend, model, prompt string, schema map[string]interface{
 	return out, nil
 }
 
-// RunFix runs the fix model in dir with filesystem access.
+// RunFix runs the fix model in dir with filesystem access. Honors ctx
+// cancellation/deadline and caps the call at GH_CRFIX_FIX_TIMEOUT (15m).
 // The model is expected to make code changes and write thread-responses.json.
-func RunFix(backend Backend, model, prompt, dir string) error {
+func RunFix(ctx context.Context, backend Backend, model, prompt, dir string) error {
 	effective := resolveBackend(backend)
 
 	pf, err := os.CreateTemp("", "gh-crfix-fix-prompt-*.txt")
@@ -126,11 +142,14 @@ func RunFix(backend Backend, model, prompt, dir string) error {
 	}
 	pf.Close()
 
+	ctx, cancel := withTimeout(ctx, envDuration("GH_CRFIX_FIX_TIMEOUT", defaultFixTimeout))
+	defer cancel()
+
 	switch effective {
 	case BackendClaude:
-		return runClaudeFix(model, pf.Name(), dir)
+		return runClaudeFix(ctx, model, pf.Name(), dir)
 	case BackendCodex:
-		return runCodexFix(model, pf.Name(), dir)
+		return runCodexFix(ctx, model, pf.Name(), dir)
 	default:
 		return fmt.Errorf("no AI backend available (install claude or codex)")
 	}
@@ -139,8 +158,8 @@ func RunFix(backend Backend, model, prompt, dir string) error {
 // RunPlain runs the fix model with filesystem access on a free-form prompt.
 // Unlike RunFix it does not expect thread-responses.json — used for case
 // collision normalization and committed conflict marker fixes.
-func RunPlain(backend Backend, model, prompt, dir string) error {
-	return RunFix(backend, model, prompt, dir)
+func RunPlain(ctx context.Context, backend Backend, model, prompt, dir string) error {
+	return RunFix(ctx, backend, model, prompt, dir)
 }
 
 func resolveBackend(b Backend) Backend {
@@ -150,7 +169,34 @@ func resolveBackend(b Backend) Backend {
 	return Detect()
 }
 
-func runClaudeStructured(model, promptFile, schemaFile string) ([]byte, error) {
+// withTimeout wraps ctx with a timeout if it doesn't already have an earlier
+// deadline. Always returns a cancel func (no-op when input ctx already has a
+// deadline stricter than `d`).
+func withTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if d <= 0 {
+		return context.WithCancel(ctx)
+	}
+	if existing, ok := ctx.Deadline(); ok && time.Until(existing) <= d {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, d)
+}
+
+// envDuration reads a duration from env (e.g. "5m"), returns fallback on
+// empty/invalid.
+func envDuration(key string, fallback time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return fallback
+	}
+	return d
+}
+
+func runClaudeStructured(ctx context.Context, model, promptFile, schemaFile string) ([]byte, error) {
 	schemaBytes, err := os.ReadFile(schemaFile)
 	if err != nil {
 		return nil, err
@@ -159,7 +205,7 @@ func runClaudeStructured(model, promptFile, schemaFile string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.Command("claude", "-p",
+	cmd := exec.CommandContext(ctx, "claude", "-p",
 		"--model", model,
 		"--output-format", "json",
 		"--json-schema", string(schemaBytes),
@@ -167,15 +213,12 @@ func runClaudeStructured(model, promptFile, schemaFile string) ([]byte, error) {
 	cmd.Stdin = strings.NewReader(string(promptBytes))
 	out, err := cmd.Output()
 	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("claude: %w\n%s", err, ee.Stderr)
-		}
-		return nil, err
+		return nil, wrapExecErr(ctx, err, "claude")
 	}
 	return out, nil
 }
 
-func runCodexStructured(model, promptFile, schemaFile string) ([]byte, error) {
+func runCodexStructured(ctx context.Context, model, promptFile, schemaFile string) ([]byte, error) {
 	outFile, err := os.CreateTemp("", "gh-crfix-codex-out-*.json")
 	if err != nil {
 		return nil, err
@@ -187,7 +230,7 @@ func runCodexStructured(model, promptFile, schemaFile string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.Command("codex", "exec",
+	cmd := exec.CommandContext(ctx, "codex", "exec",
 		"--model", model,
 		"--sandbox", "read-only",
 		"--skip-git-repo-check",
@@ -196,21 +239,18 @@ func runCodexStructured(model, promptFile, schemaFile string) ([]byte, error) {
 		"-",
 	)
 	cmd.Stdin = strings.NewReader(string(promptBytes))
-	if out, err := cmd.Output(); err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("codex: %w\n%s\n%s", err, ee.Stderr, out)
-		}
-		return nil, err
+	if _, err := cmd.Output(); err != nil {
+		return nil, wrapExecErr(ctx, err, "codex")
 	}
 	return os.ReadFile(outFile.Name())
 }
 
-func runClaudeFix(model, promptFile, dir string) error {
+func runClaudeFix(ctx context.Context, model, promptFile, dir string) error {
 	promptBytes, err := os.ReadFile(promptFile)
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command("claude", "-p",
+	cmd := exec.CommandContext(ctx, "claude", "-p",
 		"--model", model,
 		"--dangerously-skip-permissions",
 	)
@@ -218,15 +258,18 @@ func runClaudeFix(model, promptFile, dir string) error {
 	cmd.Stdin = strings.NewReader(string(promptBytes))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return wrapExecErr(ctx, err, "claude")
+	}
+	return nil
 }
 
-func runCodexFix(model, promptFile, dir string) error {
+func runCodexFix(ctx context.Context, model, promptFile, dir string) error {
 	promptBytes, err := os.ReadFile(promptFile)
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command("codex", "exec",
+	cmd := exec.CommandContext(ctx, "codex", "exec",
 		"--model", model,
 		"--full-auto",
 		"--skip-git-repo-check",
@@ -236,5 +279,23 @@ func runCodexFix(model, promptFile, dir string) error {
 	cmd.Stdin = strings.NewReader(string(promptBytes))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return wrapExecErr(ctx, err, "codex")
+	}
+	return nil
+}
+
+// wrapExecErr maps exec errors into context-aware errors so callers can use
+// errors.Is(err, context.DeadlineExceeded) / context.Canceled.
+func wrapExecErr(ctx context.Context, err error, bin string) error {
+	if err == nil {
+		return nil
+	}
+	if cerr := ctx.Err(); cerr != nil {
+		return fmt.Errorf("%s: %w", bin, cerr)
+	}
+	if ee, ok := err.(*exec.ExitError); ok {
+		return fmt.Errorf("%s: %w\n%s", bin, err, ee.Stderr)
+	}
+	return fmt.Errorf("%s: %w", bin, err)
 }

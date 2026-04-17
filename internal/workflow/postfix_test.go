@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"sync"
@@ -35,21 +36,21 @@ func TestPostFixReviewCycle_NoNewThreads(t *testing.T) {
 		sleepCalls = append(sleepCalls, d)
 		sleepMu.Unlock()
 	}
-	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) { return nil, nil }
-	postCommentFn = func(_ string, _ int, body string) error {
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) { return nil, nil }
+	postCommentFn = func(_ context.Context, _ string, _ int, body string) error {
 		commentsMu.Lock()
 		commentBody = append(commentBody, body)
 		commentsMu.Unlock()
 		return nil
 	}
-	fetchPRFn = func(string, int) (ghapi.PRInfo, error) {
+	fetchPRFn = func(context.Context, string, int) (ghapi.PRInfo, error) {
 		return ghapi.PRInfo{State: "OPEN", HeadRefName: "feature", BaseRefName: "main"}, nil
 	}
-	mergeBaseFn = func(string, string) error {
+	mergeBaseFn = func(context.Context, string, string) error {
 		atomic.AddInt32(&mergeCount, 1)
 		return nil
 	}
-	requestCopilotReviewFn = func(string, int) error {
+	requestCopilotReviewFn = func(context.Context, string, int) error {
 		atomic.AddInt32(&copilotCount, 1)
 		return nil
 	}
@@ -58,7 +59,7 @@ func TestPostFixReviewCycle_NoNewThreads(t *testing.T) {
 	opts.ReviewWaitSecs = 7
 	wtPath := t.TempDir()
 
-	postFixReviewCycle(opts, wtPath, 4, noopLog)
+	postFixReviewCycle(context.Background(), opts, wtPath, 4, noopLog)
 
 	sleepMu.Lock()
 	defer sleepMu.Unlock()
@@ -104,20 +105,20 @@ func TestPostFixReviewCycle_NewThreadsFound(t *testing.T) {
 	)
 
 	sleepFn = func(time.Duration) {}
-	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) {
 		return []ghapi.Thread{{ID: "t1"}, {ID: "t2"}}, nil
 	}
-	postCommentFn = func(_ string, _ int, body string) error {
+	postCommentFn = func(_ context.Context, _ string, _ int, body string) error {
 		commentsMu.Lock()
 		commentBody = append(commentBody, body)
 		commentsMu.Unlock()
 		return nil
 	}
-	mergeBaseFn = func(string, string) error {
+	mergeBaseFn = func(context.Context, string, string) error {
 		atomic.AddInt32(&mergeCount, 1)
 		return nil
 	}
-	requestCopilotReviewFn = func(string, int) error {
+	requestCopilotReviewFn = func(context.Context, string, int) error {
 		atomic.AddInt32(&copilotCount, 1)
 		return nil
 	}
@@ -126,7 +127,7 @@ func TestPostFixReviewCycle_NewThreadsFound(t *testing.T) {
 	opts.ReviewWaitSecs = 1
 	wtPath := t.TempDir()
 
-	postFixReviewCycle(opts, wtPath, 5, noopLog)
+	postFixReviewCycle(context.Background(), opts, wtPath, 5, noopLog)
 
 	commentsMu.Lock()
 	defer commentsMu.Unlock()
@@ -156,10 +157,10 @@ func TestPostFixReviewCycle_FetchError(t *testing.T) {
 	)
 
 	sleepFn = func(time.Duration) { atomic.AddInt32(&sleepCount, 1) }
-	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) {
 		return nil, errors.New("boom")
 	}
-	postCommentFn = func(string, int, string) error {
+	postCommentFn = func(context.Context, string, int, string) error {
 		atomic.AddInt32(&commentCount, 1)
 		return nil
 	}
@@ -168,7 +169,7 @@ func TestPostFixReviewCycle_FetchError(t *testing.T) {
 	opts.ReviewWaitSecs = 1
 	wtPath := t.TempDir()
 
-	postFixReviewCycle(opts, wtPath, 1, noopLog)
+	postFixReviewCycle(context.Background(), opts, wtPath, 1, noopLog)
 
 	if atomic.LoadInt32(&sleepCount) != 1 {
 		t.Fatalf("sleepFn should still be invoked once; got %d", sleepCount)
@@ -195,15 +196,15 @@ func TestPostFixReviewCycle_DefaultWait(t *testing.T) {
 	}
 	// Return empty threads so the cycle completes through the "no new
 	// threads" path, which still sleeps first.
-	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) { return nil, nil }
-	postCommentFn = func(string, int, string) error { return nil }
-	requestCopilotReviewFn = func(string, int) error { return nil }
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) { return nil, nil }
+	postCommentFn = func(context.Context, string, int, string) error { return nil }
+	requestCopilotReviewFn = func(context.Context, string, int) error { return nil }
 
 	opts := branchBaseOpts(t)
 	// ReviewWaitSecs == 0 → should default to 180.
 	opts.ReviewWaitSecs = 0
 
-	postFixReviewCycle(opts, t.TempDir(), 0, noopLog)
+	postFixReviewCycle(context.Background(), opts, t.TempDir(), 0, noopLog)
 
 	sleepMu.Lock()
 	defer sleepMu.Unlock()

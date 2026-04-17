@@ -2,6 +2,7 @@
 package workflow
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -100,9 +101,20 @@ func OptionsFromConfig(cfg config.Config, repo string, prNum int) Options {
 	}
 }
 
-// ProcessPR runs the full gh-crfix pipeline for a single PR.
-func ProcessPR(opts Options) Result {
+// ProcessPR runs the full gh-crfix pipeline for a single PR. The ctx is
+// threaded through every long-running operation (ai, github, worktree) so
+// cancellation or a deadline propagates end-to-end.
+func ProcessPR(ctx context.Context, opts Options) Result {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	res := Result{PRNum: opts.PRNum, Status: "failed"}
+	// Fast-fail on already-cancelled ctx to avoid spawning subprocesses.
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		res.Reason = "cancelled: " + err.Error()
+		return res
+	}
 	log := func(format string, a ...interface{}) {
 		args := append([]interface{}{opts.PRNum}, a...)
 		fmt.Printf("  [PR #%d] "+format+"\n", args...)
@@ -120,7 +132,7 @@ func ProcessPR(opts Options) Result {
 
 	// ── 1. Fetch PR metadata ──────────────────────────────────────────────
 	log("fetching PR metadata...")
-	pr, err := fetchPRFn(opts.Repo, opts.PRNum)
+	pr, err := fetchPRFn(ctx, opts.Repo, opts.PRNum)
 	if err != nil {
 		res.Err = fmt.Errorf("fetch PR: %w", err)
 		res.Reason = res.Err.Error()
@@ -140,7 +152,7 @@ func ProcessPR(opts Options) Result {
 	repoRoot := opts.RepoRoot
 	if repoRoot == "" {
 		var rerr error
-		repoRoot, rerr = repoRootFn(".")
+		repoRoot, rerr = repoRootFn(ctx, ".")
 		if rerr != nil {
 			res.Err = fmt.Errorf("not in a git repo; set GH_CRFIX_DIR or cd into your clone: %w", rerr)
 			res.Reason = res.Err.Error()
@@ -149,7 +161,7 @@ func ProcessPR(opts Options) Result {
 	}
 	log("setting up worktree...")
 	setStep(progress.StepSetup, progress.Running, "")
-	wtPath, err := setupWorktreeFn(repoRoot, pr.HeadRefName, opts.PRNum)
+	wtPath, err := setupWorktreeFn(ctx, repoRoot, pr.HeadRefName, opts.PRNum)
 	if err != nil {
 		res.Err = fmt.Errorf("worktree setup: %w", err)
 		res.Reason = res.Err.Error()
@@ -162,7 +174,7 @@ func ProcessPR(opts Options) Result {
 	// ── 3. Handle case collisions if the worktree is dirty ────────────────
 	if dirty, _ := dirtyStatusFn(wtPath); dirty != "" {
 		setStep(progress.StepNormalizeCase, progress.Running, "")
-		if err := handleCaseCollisions(opts, wtPath, pr.HeadRefName); err != nil {
+		if err := handleCaseCollisions(ctx, opts, wtPath, pr.HeadRefName); err != nil {
 			log("case-collision: %v", err)
 		}
 		// Re-check — if still dirty, we can't proceed safely.
@@ -184,7 +196,7 @@ func ProcessPR(opts Options) Result {
 	}
 	log("merging base branch %q...", baseBranch)
 	setStep(progress.StepMergeBase, progress.Running, "")
-	if mergeErr := mergeBaseFn(wtPath, baseBranch); mergeErr != nil {
+	if mergeErr := mergeBaseFn(ctx, wtPath, baseBranch); mergeErr != nil {
 		log("warning: merge base failed: %v", mergeErr)
 		setStep(progress.StepMergeBase, progress.Failed, mergeErr.Error())
 	} else {
@@ -193,7 +205,7 @@ func ProcessPR(opts Options) Result {
 
 	// ── 5. Fix committed conflict markers ─────────────────────────────────
 	setStep(progress.StepResolveConflicts, progress.Running, "")
-	if err := fixConflictMarkers(opts, wtPath, log); err != nil {
+	if err := fixConflictMarkers(ctx, opts, wtPath, log); err != nil {
 		res.Reason = fmt.Sprintf("committed conflict markers could not be auto-fixed: %v", err)
 		log("%s", res.Reason)
 		setStep(progress.StepResolveConflicts, progress.Failed, err.Error())
@@ -204,7 +216,7 @@ func ProcessPR(opts Options) Result {
 	// ── 6. Fetch review threads ───────────────────────────────────────────
 	log("fetching review threads...")
 	setStep(progress.StepFetchThreads, progress.Running, "")
-	rawThreads, err := fetchThreadsFn(opts.Repo, opts.PRNum, opts.MaxThreads)
+	rawThreads, err := fetchThreadsFn(ctx, opts.Repo, opts.PRNum, opts.MaxThreads)
 	if err != nil {
 		res.Err = fmt.Errorf("fetch threads: %w", err)
 		res.Reason = res.Err.Error()
@@ -299,7 +311,7 @@ func ProcessPR(opts Options) Result {
 	var ciChecks []ghapi.CICheck
 	if pr.HeadSHA != "" {
 		log("fetching CI check results...")
-		ciChecks, _ = fetchFailingChecksFn(opts.Repo, pr.HeadSHA)
+		ciChecks, _ = fetchFailingChecksFn(ctx, opts.Repo, pr.HeadSHA)
 		if len(ciChecks) > 0 {
 			log("%d failing CI check(s)", len(ciChecks))
 		}
@@ -327,14 +339,35 @@ func ProcessPR(opts Options) Result {
 	// ── 13. Gate model ────────────────────────────────────────────────────
 	var gateOut ai.GateOutput
 	var selected []string
+	// gateFailed tracks whether an invocation error occurred so downstream
+	// fallbacks know not to treat needs_llm threads as already_fixed.
+	gateFailed := false
 	if gateCtx.ShouldRunGate && !opts.DryRun {
 		log("running gate model (%s)...", opts.GateModel)
 		setStep(progress.StepGate, progress.Running, opts.GateModel)
 		prompt := buildGatePrompt(rawThreads, activeNeedsLLM, validResult, ciChecks, gateCtx)
-		gateOut, err = runGateFn(opts.AIBackend, opts.GateModel, prompt, gate.GateSchema())
+		gateOut, err = runGateFn(ctx, opts.AIBackend, opts.GateModel, prompt, gate.GateSchema())
 		if err != nil {
 			log("gate model error: %v", err)
 			setStep(progress.StepGate, progress.Failed, err.Error())
+			gateFailed = true
+			// Emit an explicit "failed" skipped response for every needs_llm
+			// thread so the "already_fixed" fallback below does not silently
+			// resolve them. ResolveWhenSkipped stays false — a human should
+			// re-trigger once the gate model is healthy again.
+			reason := firstLine(err.Error())
+			if reason == "" {
+				reason = "gate model failed"
+			}
+			for _, c := range activeNeedsLLM {
+				responses = append(responses, ThreadResponse{
+					ThreadID: c.ThreadID,
+					Action:   "skipped",
+					Comment: fmt.Sprintf(
+						"gh crfix: gate model failed (%s) — leaving this thread unresolved for a human follow-up.",
+						reason),
+				})
+			}
 		} else {
 			log("gate: needs_advanced_model=%v threads_to_fix=%v", gateOut.NeedsAdvancedModel, gateOut.ThreadsToFix)
 			selected = gateOut.ThreadsToFix
@@ -361,7 +394,7 @@ func ProcessPR(opts Options) Result {
 	// non-empty list (contradictory but common); honoring the list prevents
 	// those threads from being silently dropped as "no code change needed".
 	shouldFix := gateOut.NeedsAdvancedModel || len(gateOut.ThreadsToFix) > 0
-	if shouldFix && !opts.DryRun {
+	if shouldFix && !opts.DryRun && !gateFailed {
 		// If gate didn't nominate a list, send all active needs_llm threads.
 		if len(selected) == 0 && len(activeNeedsLLM) > 0 {
 			for _, c := range activeNeedsLLM {
@@ -371,7 +404,7 @@ func ProcessPR(opts Options) Result {
 		log("running fix model (%s) on %d thread(s)...", opts.FixModel, len(selected))
 		setStep(progress.StepFix, progress.Running, fmt.Sprintf("%d thread(s)", len(selected)))
 		fixPrompt := buildFixPrompt(rawThreads, activeNeedsLLM, selected, validResult, ciChecks)
-		if ferr := runFixFn(opts.AIBackend, opts.FixModel, fixPrompt, wtPath); ferr != nil {
+		if ferr := runFixFn(ctx, opts.AIBackend, opts.FixModel, fixPrompt, wtPath); ferr != nil {
 			log("fix model error: %v", ferr)
 			setStep(progress.StepFix, progress.Failed, ferr.Error())
 		} else {
@@ -382,10 +415,12 @@ func ProcessPR(opts Options) Result {
 		if fixResponses, rerr := readThreadResponses(wtPath); rerr == nil {
 			responses = append(responses, fixResponses...)
 		}
-	} else if gateCtx.ShouldRunGate && !shouldFix {
+	} else if gateCtx.ShouldRunGate && !shouldFix && !gateFailed {
 		setStep(progress.StepFix, progress.Skipped, "gate said not needed")
 		// Gate ran and said "not needed" — generate already-fixed responses so
 		// needs_llm threads still get resolved. Mirrors Bash gate-skipped path.
+		// NB: this branch MUST be guarded by !gateFailed so a crashed gate
+		// model cannot silently resolve real review threads as already_fixed.
 		for _, c := range activeNeedsLLM {
 			responses = append(responses, ThreadResponse{
 				ThreadID: c.ThreadID,
@@ -402,7 +437,7 @@ func ProcessPR(opts Options) Result {
 	// ── 16. Reply and resolve ─────────────────────────────────────────────
 	if !opts.DryRun && !opts.NoResolve {
 		setStep(progress.StepReply, progress.Running, "")
-		replied, resolved, skipped := replyAndResolve(responses, opts.ResolveSkipped, log)
+		replied, resolved, skipped := replyAndResolve(ctx, responses, opts.ResolveSkipped, log)
 		res.Replied, res.Resolved, res.Skipped = replied, resolved, skipped
 		log("replied=%d resolved=%d skipped=%d", replied, resolved, skipped)
 		setStep(progress.StepReply, progress.Done,
@@ -432,7 +467,7 @@ func ProcessPR(opts Options) Result {
 	}
 	if !opts.DryRun {
 		summary := buildSummaryComment(skipList, autoList, alreadyFixedList, needsLLMList, fixedCount, len(rawThreads))
-		if cerr := postCommentFn(opts.Repo, opts.PRNum, summary); cerr != nil {
+		if cerr := postCommentFn(ctx, opts.Repo, opts.PRNum, summary); cerr != nil {
 			log("post comment: %v", cerr)
 		}
 	}
@@ -440,7 +475,7 @@ func ProcessPR(opts Options) Result {
 	// ── 19. Request Copilot re-review ─────────────────────────────────────
 	if !opts.DryRun {
 		setStep(progress.StepRereview, progress.Running, "")
-		if cerr := requestCopilotReviewFn(opts.Repo, opts.PRNum); cerr != nil {
+		if cerr := requestCopilotReviewFn(ctx, opts.Repo, opts.PRNum); cerr != nil {
 			log("copilot re-review: %v", cerr)
 			setStep(progress.StepRereview, progress.Failed, cerr.Error())
 		} else {
@@ -453,7 +488,7 @@ func ProcessPR(opts Options) Result {
 	// ── 20. Post-fix review cycle ─────────────────────────────────────────
 	if !opts.NoPostFix && !opts.DryRun {
 		setStep(progress.StepPostfix, progress.Running, "")
-		postFixReviewCycle(opts, wtPath, fixedCount, log)
+		postFixReviewCycle(ctx, opts, wtPath, fixedCount, log)
 		setStep(progress.StepPostfix, progress.Done, "")
 	} else {
 		setStep(progress.StepPostfix, progress.Skipped, "disabled")
@@ -466,11 +501,11 @@ func ProcessPR(opts Options) Result {
 
 // replyAndResolve posts reply comments and resolves threads according to
 // responses. Returns (replied, resolved, skipped_unresolved).
-func replyAndResolve(responses []ThreadResponse, resolveSkipped bool, log func(string, ...interface{})) (int, int, int) {
+func replyAndResolve(ctx context.Context, responses []ThreadResponse, resolveSkipped bool, log func(string, ...interface{})) (int, int, int) {
 	replied, resolved, skippedUnresolved := 0, 0, 0
 	for _, r := range responses {
 		if r.Comment != "" && r.ThreadID != "" {
-			if rerr := replyToThreadFn(r.ThreadID, r.Comment); rerr != nil {
+			if rerr := replyToThreadFn(ctx, r.ThreadID, r.Comment); rerr != nil {
 				log("reply thread %s: %v", r.ThreadID, rerr)
 			} else {
 				replied++
@@ -478,14 +513,14 @@ func replyAndResolve(responses []ThreadResponse, resolveSkipped bool, log func(s
 		}
 		switch r.Action {
 		case "fixed", "already_fixed":
-			if rerr := resolveThreadFn(r.ThreadID); rerr != nil {
+			if rerr := resolveThreadFn(ctx, r.ThreadID); rerr != nil {
 				log("resolve thread %s: %v", r.ThreadID, rerr)
 			} else {
 				resolved++
 			}
 		case "skipped":
 			if resolveSkipped || r.ResolveWhenSkipped {
-				_ = resolveThreadFn(r.ThreadID)
+				_ = resolveThreadFn(ctx, r.ThreadID)
 				resolved++
 			} else {
 				skippedUnresolved++
@@ -497,7 +532,7 @@ func replyAndResolve(responses []ThreadResponse, resolveSkipped bool, log func(s
 
 // ── Case collision + conflict marker handlers ───────────────────────────────
 
-func handleCaseCollisions(opts Options, wtPath, branch string) error {
+func handleCaseCollisions(ctx context.Context, opts Options, wtPath, branch string) error {
 	groups, err := detectCaseCollisionsFn(wtPath)
 	if err != nil || len(groups) == 0 {
 		return err
@@ -525,7 +560,7 @@ Required approach:
 6. Do NOT create thread-responses.json.
 7. End with a clean git status.
 `)
-	if err := runPlainFn(opts.AIBackend, opts.FixModel, sb.String(), wtPath); err != nil {
+	if err := runPlainFn(ctx, opts.AIBackend, opts.FixModel, sb.String(), wtPath); err != nil {
 		return err
 	}
 	// Verify it's actually clean.
@@ -535,7 +570,7 @@ Required approach:
 	return nil
 }
 
-func fixConflictMarkers(opts Options, wtPath string, log func(string, ...interface{})) error {
+func fixConflictMarkers(ctx context.Context, opts Options, wtPath string, log func(string, ...interface{})) error {
 	files, err := detectMarkersFn(wtPath)
 	if err != nil || len(files) == 0 {
 		return err
@@ -544,7 +579,7 @@ func fixConflictMarkers(opts Options, wtPath string, log func(string, ...interfa
 	if opts.DryRun {
 		return nil
 	}
-	if err := runPlainFn(opts.AIBackend, opts.FixModel, conflict.BuildFixPrompt(files), wtPath); err != nil {
+	if err := runPlainFn(ctx, opts.AIBackend, opts.FixModel, conflict.BuildFixPrompt(files), wtPath); err != nil {
 		return err
 	}
 	remaining, _ := detectMarkersFn(wtPath)
@@ -556,7 +591,7 @@ func fixConflictMarkers(opts Options, wtPath string, log func(string, ...interfa
 
 // ── Post-fix review cycle ───────────────────────────────────────────────────
 
-func postFixReviewCycle(opts Options, wtPath string, fixedCount int, log func(string, ...interface{})) {
+func postFixReviewCycle(ctx context.Context, opts Options, wtPath string, fixedCount int, log func(string, ...interface{})) {
 	wait := opts.ReviewWaitSecs
 	if wait <= 0 {
 		wait = 180
@@ -564,7 +599,7 @@ func postFixReviewCycle(opts Options, wtPath string, fixedCount int, log func(st
 	log("post-fix: waiting %ds...", wait)
 	sleepFn(time.Duration(wait) * time.Second)
 
-	newThreads, err := fetchThreadsFn(opts.Repo, opts.PRNum, opts.MaxThreads)
+	newThreads, err := fetchThreadsFn(ctx, opts.Repo, opts.PRNum, opts.MaxThreads)
 	if err != nil {
 		log("post-fix: fetch threads failed: %v", err)
 		return
@@ -574,16 +609,16 @@ func postFixReviewCycle(opts Options, wtPath string, fixedCount int, log func(st
 		body := fmt.Sprintf(
 			"gh crfix: All %d comments addressed. No new issues after re-review.",
 			fixedCount)
-		_ = postCommentFn(opts.Repo, opts.PRNum, body)
+		_ = postCommentFn(ctx, opts.Repo, opts.PRNum, body)
 		// Merge + re-fix conflict markers one more time; swallow all errors.
-		if pr, err := fetchPRFn(opts.Repo, opts.PRNum); err == nil && pr.BaseRefName != "" {
-			if merr := mergeBaseFn(wtPath, pr.BaseRefName); merr != nil {
-				_ = postCommentFn(opts.Repo, opts.PRNum,
+		if pr, err := fetchPRFn(ctx, opts.Repo, opts.PRNum); err == nil && pr.BaseRefName != "" {
+			if merr := mergeBaseFn(ctx, wtPath, pr.BaseRefName); merr != nil {
+				_ = postCommentFn(ctx, opts.Repo, opts.PRNum,
 					"gh crfix: WARNING — could not merge base branch; conflicts need manual resolution.")
 			}
 		}
-		_ = fixConflictMarkers(opts, wtPath, log)
-		_ = requestCopilotReviewFn(opts.Repo, opts.PRNum)
+		_ = fixConflictMarkers(ctx, opts, wtPath, log)
+		_ = requestCopilotReviewFn(ctx, opts.Repo, opts.PRNum)
 		log("post-fix: done")
 		return
 	}
@@ -591,7 +626,7 @@ func postFixReviewCycle(opts Options, wtPath string, fixedCount int, log func(st
 	body := fmt.Sprintf(
 		"gh crfix: Fixed %d comments, but %d new issue(s) raised. Run again to address.",
 		fixedCount, len(newThreads))
-	_ = postCommentFn(opts.Repo, opts.PRNum, body)
+	_ = postCommentFn(ctx, opts.Repo, opts.PRNum, body)
 }
 
 // ── Prompt builders ─────────────────────────────────────────────────────────
