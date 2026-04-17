@@ -48,6 +48,7 @@ type Options struct {
 	NoResolve       bool
 	NoPostFix       bool
 	NoAutofix       bool
+	NoValidate      bool
 	SetupOnly       bool
 	ReviewWaitSecs  int
 	Weights         gate.ScoreWeights
@@ -295,21 +296,26 @@ func ProcessPR(ctx context.Context, opts Options) Result {
 	}
 
 	// ── 10. Validation ────────────────────────────────────────────────────
-	runner := validate.Detect(wtPath, opts.ValidateHook)
 	var validResult validate.Result
-	if runner.Kind != validate.RunnerNone {
-		log("running validation (%s)...", runner.Command)
-		setStep(progress.StepValidate, progress.Running, runner.Command)
-		validResult = validate.Run(wtPath, runner)
-		if validResult.TestsFailed {
-			log("validation: FAILED — %s", firstLine(validResult.Summary))
-			setStep(progress.StepValidate, progress.Failed, firstLine(validResult.Summary))
-		} else {
-			log("validation: passed")
-			setStep(progress.StepValidate, progress.Done, "passed")
-		}
+	if opts.NoValidate {
+		log("validation skipped (disabled by --no-validate)")
+		setStep(progress.StepValidate, progress.Skipped, "disabled by --no-validate")
 	} else {
-		setStep(progress.StepValidate, progress.Skipped, "no runner")
+		runner := validate.Detect(wtPath, opts.ValidateHook)
+		if runner.Kind != validate.RunnerNone {
+			log("running validation (%s)...", runner.Command)
+			setStep(progress.StepValidate, progress.Running, runner.Command)
+			validResult = validate.Run(wtPath, runner)
+			if validResult.TestsFailed {
+				log("validation: FAILED — %s", firstLine(validResult.Summary))
+				setStep(progress.StepValidate, progress.Failed, firstLine(validResult.Summary))
+			} else {
+				log("validation: passed")
+				setStep(progress.StepValidate, progress.Done, "passed")
+			}
+		} else {
+			setStep(progress.StepValidate, progress.Skipped, "no runner")
+		}
 	}
 
 	// ── 11. Fetch failing CI checks ───────────────────────────────────────

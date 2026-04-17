@@ -309,7 +309,10 @@ func resolveConfig(args []string, cfg config.Config) (runPlan, error) {
 
 	prSpec, flags := splitArgsAndFlags(args)
 
-	// Mutate cfg with flag overrides before we derive Options from it.
+	// Precedence matches the bash script: flag > env > file > default.
+	// applyEnvToConfig fills in anything GH_CRFIX_* declares; applyFlags then
+	// layers CLI flags on top so explicit flags always win over env values.
+	applyEnvToConfig(&cfg)
 	applyFlags(flags, &cfg)
 
 	// Parse PR spec.
@@ -334,15 +337,17 @@ func resolveConfig(args []string, cfg config.Config) (runPlan, error) {
 
 	opts := workflow.OptionsFromConfig(cfg, ownerRepo, 0)
 	opts.RepoRoot = os.Getenv("GH_CRFIX_DIR")
-	applyWorkflowFlags(flags, &opts)
 
-	// Env-var overrides that bash already honors.
+	// Apply env-var overrides to opts (bash precedence: env > file > default).
+	// Flags are applied AFTER this so --review-wait beats GH_CRFIX_REVIEW_WAIT.
 	if v := os.Getenv("GH_CRFIX_REVIEW_WAIT"); v != "" {
 		var n int
 		if _, serr := fmt.Sscanf(v, "%d", &n); serr == nil && n >= 0 {
 			opts.ReviewWaitSecs = n
 		}
 	}
+
+	applyWorkflowFlags(flags, &opts)
 
 	// Score weights come from Config (possibly CLI-overridden above). Mirror
 	// them into the gate.ScoreWeights struct OptionsFromConfig built for us,
@@ -489,6 +494,41 @@ func splitArgsAndFlags(args []string) (prSpec string, flags []string) {
 	return
 }
 
+// applyEnvToConfig overlays GH_CRFIX_* environment variables on top of the
+// persisted config. These mirror the exports the bash script honors (see
+// `gh-crfix` around lines 60–90). Invalid values are ignored — never fatal —
+// so a typo in the environment doesn't break a run. Flags (applyFlags) are
+// applied AFTER this so CLI flags still take precedence over env.
+func applyEnvToConfig(cfg *config.Config) {
+	if v := os.Getenv("GH_CRFIX_AI_BACKEND"); v != "" {
+		cfg.AIBackend = v
+	}
+	if v := os.Getenv("GH_CRFIX_GATE_MODEL"); v != "" {
+		cfg.GateModel = v
+	}
+	if v := os.Getenv("GH_CRFIX_FIX_MODEL"); v != "" {
+		cfg.FixModel = v
+	}
+	if v := os.Getenv("GH_CRFIX_SCORE_NEEDS_LLM"); v != "" {
+		var f float64
+		if _, err := fmt.Sscanf(v, "%f", &f); err == nil && f >= 0 && f <= 1 {
+			cfg.ScoreNeedsLLM = f
+		}
+	}
+	if v := os.Getenv("GH_CRFIX_SCORE_PR_COMMENT"); v != "" {
+		var f float64
+		if _, err := fmt.Sscanf(v, "%f", &f); err == nil && f >= 0 && f <= 1 {
+			cfg.ScorePRComment = f
+		}
+	}
+	if v := os.Getenv("GH_CRFIX_SCORE_TEST_FAILURE"); v != "" {
+		var f float64
+		if _, err := fmt.Sscanf(v, "%f", &f); err == nil && f >= 0 && f <= 1 {
+			cfg.ScoreTestFailure = f
+		}
+	}
+}
+
 // applyFlags overlays CLI flags on top of the loaded config.
 func applyFlags(flags []string, cfg *config.Config) {
 	for i := 0; i < len(flags); i++ {
@@ -604,6 +644,8 @@ func applyWorkflowFlags(flags []string, opts *workflow.Options) {
 			opts.NoPostFix = true
 		case "--no-autofix":
 			opts.NoAutofix = true
+		case "--no-validate":
+			opts.NoValidate = true
 		case "--setup-only":
 			opts.SetupOnly = true
 		case "--exclude-outdated":
@@ -670,6 +712,7 @@ Flags:
   --validate-hook PATH     repo-local validation script
   --autofix-hook PATH      repo-local autofix script
   --no-autofix             skip autofix hook
+  --no-validate            skip the validation step entirely
   --dry-run                no GitHub writes, no AI run
   --exclude-outdated       skip outdated threads
   --include-outdated       include outdated threads (default)
@@ -688,10 +731,18 @@ Flags:
   --help, -h               show this help
 
 Env:
-  GH_CRFIX_DIR             local repo path (defaults to current git root)
-  GH_CRFIX_MODEL_REGISTRY  override the registry JSON URL
-  GH_CRFIX_REVIEW_WAIT     seconds to wait for post-fix re-review
-  GH_CRFIX_NO_NOTIFY=1     process-wide suppression of completion notifications
+  GH_CRFIX_DIR                   local repo path (defaults to current git root)
+  GH_CRFIX_MODEL_REGISTRY        override the registry JSON URL
+  GH_CRFIX_AI_BACKEND            auto|claude|codex (overrides persisted config)
+  GH_CRFIX_GATE_MODEL            gate model name (overrides persisted config)
+  GH_CRFIX_FIX_MODEL             fix model name (overrides persisted config)
+  GH_CRFIX_REVIEW_WAIT           seconds to wait for post-fix re-review
+  GH_CRFIX_SCORE_NEEDS_LLM       gate score weight [0,1]
+  GH_CRFIX_SCORE_PR_COMMENT      gate score weight [0,1]
+  GH_CRFIX_SCORE_TEST_FAILURE    gate score weight [0,1]
+  GH_CRFIX_NO_NOTIFY=1           process-wide suppression of completion notifications
+
+Precedence for config values: CLI flag > GH_CRFIX_* env var > config file > default.
 
 Config: %s
 `, version, defaultConfigPath())

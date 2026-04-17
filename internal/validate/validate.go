@@ -36,11 +36,19 @@ type Result struct {
 
 // Detect finds the best available validation runner.
 // hookOverride is an explicit path from --validate-hook (empty = auto-detect).
+//
+// When hookOverride is relative, it is resolved against worktreePath so that
+// `--validate-hook scripts/ci.sh` finds the hook inside the PR worktree rather
+// than the (unpredictable) process CWD. Absolute paths are used verbatim.
 func Detect(worktreePath, hookOverride string) Runner {
 	// 1. Explicit flag
 	if hookOverride != "" {
-		if isExec(hookOverride) {
-			return Runner{Kind: RunnerHook, Command: hookOverride}
+		candidate := hookOverride
+		if !filepath.IsAbs(candidate) {
+			candidate = filepath.Join(worktreePath, candidate)
+		}
+		if isExec(candidate) {
+			return Runner{Kind: RunnerHook, Command: candidate}
 		}
 	}
 

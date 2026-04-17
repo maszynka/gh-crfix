@@ -1319,6 +1319,77 @@ func TestProcessPR_MasterLogCapturesProcessPhase(t *testing.T) {
 	}
 }
 
+// --- 21. ProcessPR: --no-validate skips the validation step ------------------
+//
+// When opts.NoValidate is true, ProcessPR must NOT invoke the validate runner
+// even when a repo-local hook exists, and the StepValidate progress entry must
+// be recorded as Skipped with reason "disabled by --no-validate".
+
+func TestProcessPR_NoValidateSkipsValidation(t *testing.T) {
+	installSeams(t)
+
+	// Populate the worktree with a real validate.sh that would otherwise be
+	// executed. The hook writes a marker file so the test can observe whether
+	// validate.Run ran.
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
+		t.Fatalf("write a.go: %v", err)
+	}
+	hookDir := filepath.Join(wt, ".gh-crfix")
+	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	marker := filepath.Join(wt, "validate-ran.marker")
+	hook := filepath.Join(hookDir, "validate.sh")
+	script := "#!/bin/sh\ntouch " + marker + "\nexit 0\n"
+	if err := os.WriteFile(hook, []byte(script), 0o755); err != nil {
+		t.Fatalf("write hook: %v", err)
+	}
+	if err := os.Chmod(hook, 0o755); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	setupWorktreeFn = func(context.Context, string, string, int) (string, error) { return wt, nil }
+
+	// Provide at least one thread so ProcessPR doesn't early-exit before the
+	// validation step.
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) {
+		return []ghapi.Thread{{
+			ID: "t1", Path: "a.go", Line: 1,
+			Comments: []ghapi.Comment{{Author: "alice", Body: "please reconsider the approach"}},
+		}}, nil
+	}
+
+	tracker := progress.NewTracker(t.TempDir())
+	opts := branchBaseOpts(t)
+	opts.RepoRoot = t.TempDir()
+	opts.Tracker = tracker
+	opts.NoValidate = true
+	// Keep gate below threshold so we don't need to drive the gate model.
+	opts.Weights = gate.ScoreWeights{NeedsLLM: 0.5, TestFailure: 1.0}
+	if err := tracker.Init(opts.PRNum); err != nil {
+		t.Fatalf("tracker init: %v", err)
+	}
+
+	_ = ProcessPR(context.Background(), opts)
+
+	// The validation hook must NOT have been executed.
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatalf("validate hook ran despite --no-validate (marker exists at %s)", marker)
+	}
+
+	// StepValidate must be marked Skipped with the explicit reason.
+	st, note, ok := tracker.Get(opts.PRNum, progress.StepValidate)
+	if !ok {
+		t.Fatalf("StepValidate not recorded on tracker")
+	}
+	if st != progress.Skipped {
+		t.Fatalf("StepValidate status=%v want Skipped", st)
+	}
+	if !strings.Contains(note, "--no-validate") {
+		t.Fatalf("StepValidate note=%q want mention of --no-validate", note)
+	}
+}
+
 // --- Helpers ------------------------------------------------------------------
 
 // contains is a tiny wrapper that lets us keep the substring checks readable.
