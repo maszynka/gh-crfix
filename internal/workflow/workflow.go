@@ -280,8 +280,13 @@ func ProcessPR(ctx context.Context, opts Options) Result {
 		if hookPath != "" {
 			log("running autofix hook...")
 			setStep(progress.StepAutofix, progress.Running, hookPath)
-			runHook(hookPath, wtPath)
-			setStep(progress.StepAutofix, progress.Done, hookPath)
+			if herr := runHook(hookPath, wtPath); herr != nil {
+				// Autofix is best-effort; surface the error but continue.
+				log("autofix hook failed: %v", herr)
+				setStep(progress.StepAutofix, progress.Failed, herr.Error())
+			} else {
+				setStep(progress.StepAutofix, progress.Done, hookPath)
+			}
 			autofixRan = true
 		}
 	}
@@ -520,8 +525,11 @@ func replyAndResolve(ctx context.Context, responses []ThreadResponse, resolveSki
 			}
 		case "skipped":
 			if resolveSkipped || r.ResolveWhenSkipped {
-				_ = resolveThreadFn(ctx, r.ThreadID)
-				resolved++
+				if rerr := resolveThreadFn(ctx, r.ThreadID); rerr != nil {
+					log("resolve thread %s: %v", r.ThreadID, rerr)
+				} else {
+					resolved++
+				}
 			} else {
 				skippedUnresolved++
 			}
@@ -817,12 +825,15 @@ func detectAutofixHook(wtPath string) string {
 	return ""
 }
 
-func runHook(hookPath, dir string) {
+// runHook runs a shell hook in dir and propagates cmd.Run()'s error so the
+// caller can log or surface the failure. The hook's stdout/stderr are
+// streamed to the process's stdout/stderr as before.
+func runHook(hookPath, dir string) error {
 	cmd := exec.Command(hookPath)
 	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	_ = cmd.Run()
+	return cmd.Run()
 }
 
 func truncate(s string, maxLen int) string {
