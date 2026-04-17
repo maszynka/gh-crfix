@@ -442,12 +442,16 @@ EOF
     fi
   "
   mock_command "osascript" 0
+  # claude must not be reached — early-exit contract: merge failure aborts before the LLM step
+  mock_command_script "claude" "exit 1"
 
   cd "$REPO_DIR"
   run bash "$SCRIPT_PATH" --seq --no-tui --dry-run "https://github.com/test-owner/test-repo/pull/1"
   [ "$status" -eq 0 ]
   assert_output --partial "Could not merge base branch"
   assert_output --partial "Threads total      : 1"
+  # Verify claude was never invoked
+  [ ! -f "$MOCK_CALLS/claude.log" ]
   run git -C "$REPO_DIR/.gh-crfix/worktrees/pr-1" status --short
   [ "$status" -eq 0 ]
   [ -z "$output" ]

@@ -17,7 +17,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Default: bash script at repo root; set GHCRFIX=/path/to/bin/gh-crfix for Go.
 GHCRFIX="${GHCRFIX:-$SCRIPT_DIR/../../gh-crfix}"
 FIXTURE_REPO="${FIXTURE_REPO:-maszynka/gh-crfix-e2e-fixtures}"
-FIXTURE_DIR="${FIXTURE_DIR:-$SCRIPT_DIR/../../fixture-repo}"
+# Resolve FIXTURE_DIR to an absolute path so cd stays consistent throughout
+_raw_fixture="${FIXTURE_DIR:-$SCRIPT_DIR/../../fixture-repo}"
+FIXTURE_DIR="$(cd "$_raw_fixture" 2>/dev/null && pwd || echo "$_raw_fixture")"
 E2E_BRANCH="e2e-test-$(date +%s)-$$"
 PR_NUMBER=""
 MAIN_SHA_BEFORE=""        # saved so cleanup can restore main
@@ -74,9 +76,10 @@ trap cleanup EXIT
 # ── Preflight ────────────────────────────────────────────────────────────────
 
 echo "=== Preflight ==="
-command -v gh     >/dev/null || { echo "FAIL: gh CLI not found";     exit 1; }
-command -v claude >/dev/null || { echo "FAIL: claude CLI not found"; exit 1; }
-command -v jq     >/dev/null || { echo "FAIL: jq not found";         exit 1; }
+command -v gh      >/dev/null || { echo "FAIL: gh CLI not found";      exit 1; }
+command -v claude  >/dev/null || { echo "FAIL: claude CLI not found";  exit 1; }
+command -v jq      >/dev/null || { echo "FAIL: jq not found";          exit 1; }
+command -v python3 >/dev/null || { echo "FAIL: python3 not found";     exit 1; }
 [ -x "$GHCRFIX" ] || { echo "FAIL: $GHCRFIX not executable"; exit 1; }
 [ -d "$FIXTURE_DIR/.git" ] || { echo "FAIL: $FIXTURE_DIR is not a git repo"; exit 1; }
 echo "All checks passed."
@@ -153,21 +156,25 @@ REVIEW_RESPONSE=$(gh api "repos/$FIXTURE_REPO/pulls/$PR_NUMBER/reviews" \
     {
       "path": "src/utils.py",
       "line": 15,
-      "body": "Typo: \`frist_name\` should be \`first_name\`. Fix the parameter name and the f-string."
+      "side": "RIGHT",
+      "body": "The parameter is named \`frist_name\` but should be \`first_name\` — this breaks the f-string interpolation and any callers using the function. Please rename it everywhere in the function signature and body."
     },
     {
       "path": "src/utils.py",
       "line": 4,
-      "body": "Unused import: \`sys\` is imported but never used. Please remove it."
+      "side": "RIGHT",
+      "body": "The \`sys\` module is imported on line 4 but never referenced anywhere in this file. Please remove it to keep the module imports clean."
     },
     {
       "path": "src/validator.js",
       "line": 11,
+      "side": "RIGHT",
       "body": "\`isPositiveNumber(0)\` now incorrectly returns true. Zero is not positive — use strict \`>\` instead of \`>=\`."
     },
     {
       "path": "src/config.py",
       "line": 2,
+      "side": "RIGHT",
       "body": "DEFAULT_TIMEOUT should be 60 seconds to match the production default, not 30."
     }
   ]
