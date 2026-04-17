@@ -15,6 +15,8 @@ import (
 	"github.com/maszynka/gh-crfix/internal/conflict"
 	"github.com/maszynka/gh-crfix/internal/gate"
 	ghapi "github.com/maszynka/gh-crfix/internal/github"
+	"github.com/maszynka/gh-crfix/internal/logs"
+	"github.com/maszynka/gh-crfix/internal/progress"
 	"github.com/maszynka/gh-crfix/internal/triage"
 	"github.com/maszynka/gh-crfix/internal/validate"
 	"github.com/maszynka/gh-crfix/internal/worktree"
@@ -51,6 +53,15 @@ type Options struct {
 	Weights         gate.ScoreWeights
 	Verbose         bool
 	LogDir          string // batch-level log dir; workflow writes per-PR logs here
+
+	// Run is the batch-level log run. When nil, logging is a no-op and the
+	// workflow prints to stdout exactly as it did before.
+	Run *logs.Run
+	// Tracker records per-step progress. When nil, all tracker updates are no-ops.
+	Tracker *progress.Tracker
+	// SetupMaxConc optionally overrides the setup-phase concurrency cap. A
+	// zero value defaults to SetupMaxConcurrency in batch.go.
+	SetupMaxConc int
 }
 
 // Result summarises the outcome of a single ProcessPR call. Filled in even on
@@ -96,6 +107,11 @@ func ProcessPR(opts Options) Result {
 	log := func(format string, a ...interface{}) {
 		fmt.Printf("  [PR #%d] "+format+"\n", append([]interface{}{opts.PRNum}, a...)...)
 	}
+	setStep := func(step progress.Step, status progress.Status, note string) {
+		if opts.Tracker != nil {
+			_ = opts.Tracker.Set(opts.PRNum, step, status, note)
+		}
+	}
 
 	// ── 1. Fetch PR metadata ──────────────────────────────────────────────
 	log("fetching PR metadata...")
@@ -127,16 +143,20 @@ func ProcessPR(opts Options) Result {
 		}
 	}
 	log("setting up worktree...")
+	setStep(progress.StepSetup, progress.Running, "")
 	wtPath, err := worktree.Setup(repoRoot, pr.HeadRefName, opts.PRNum)
 	if err != nil {
 		res.Err = fmt.Errorf("worktree setup: %w", err)
 		res.Reason = res.Err.Error()
+		setStep(progress.StepSetup, progress.Failed, err.Error())
 		return res
 	}
 	res.Worktree = wtPath
+	setStep(progress.StepSetup, progress.Done, "worktree ready")
 
 	// ── 3. Handle case collisions if the worktree is dirty ────────────────
 	if dirty, _ := worktree.DirtyStatus(wtPath); dirty != "" {
+		setStep(progress.StepNormalizeCase, progress.Running, "")
 		if err := handleCaseCollisions(opts, wtPath, pr.HeadRefName); err != nil {
 			log("case-collision: %v", err)
 		}
@@ -144,8 +164,12 @@ func ProcessPR(opts Options) Result {
 		if dirty2, _ := worktree.DirtyStatus(wtPath); dirty2 != "" {
 			res.Reason = "worktree dirty before processing"
 			log("%s", res.Reason)
+			setStep(progress.StepNormalizeCase, progress.Failed, "dirty after LLM")
 			return res
 		}
+		setStep(progress.StepNormalizeCase, progress.Done, "")
+	} else {
+		setStep(progress.StepNormalizeCase, progress.Skipped, "clean worktree")
 	}
 
 	// ── 4. Merge base branch ──────────────────────────────────────────────
@@ -154,27 +178,37 @@ func ProcessPR(opts Options) Result {
 		baseBranch = "main"
 	}
 	log("merging base branch %q...", baseBranch)
+	setStep(progress.StepMergeBase, progress.Running, "")
 	if mergeErr := worktree.MergeBase(wtPath, baseBranch); mergeErr != nil {
 		log("warning: merge base failed: %v", mergeErr)
+		setStep(progress.StepMergeBase, progress.Failed, mergeErr.Error())
+	} else {
+		setStep(progress.StepMergeBase, progress.Done, "")
 	}
 
 	// ── 5. Fix committed conflict markers ─────────────────────────────────
+	setStep(progress.StepResolveConflicts, progress.Running, "")
 	if err := fixConflictMarkers(opts, wtPath, log); err != nil {
 		res.Reason = fmt.Sprintf("committed conflict markers could not be auto-fixed: %v", err)
 		log("%s", res.Reason)
+		setStep(progress.StepResolveConflicts, progress.Failed, err.Error())
 		return res
 	}
+	setStep(progress.StepResolveConflicts, progress.Done, "")
 
 	// ── 6. Fetch review threads ───────────────────────────────────────────
 	log("fetching review threads...")
+	setStep(progress.StepFetchThreads, progress.Running, "")
 	rawThreads, err := ghapi.FetchThreads(opts.Repo, opts.PRNum, opts.MaxThreads)
 	if err != nil {
 		res.Err = fmt.Errorf("fetch threads: %w", err)
 		res.Reason = res.Err.Error()
+		setStep(progress.StepFetchThreads, progress.Failed, err.Error())
 		return res
 	}
 	res.Threads = len(rawThreads)
 	log("%d unresolved threads", len(rawThreads))
+	setStep(progress.StepFetchThreads, progress.Done, fmt.Sprintf("%d threads", len(rawThreads)))
 
 	if len(rawThreads) == 0 {
 		res.Status = "skipped"
@@ -189,6 +223,7 @@ func ProcessPR(opts Options) Result {
 	}
 
 	// ── 7. Triage threads ─────────────────────────────────────────────────
+	setStep(progress.StepFilterThreads, progress.Running, "")
 	classifications := make([]triage.Classification, 0, len(rawThreads))
 	for _, rt := range rawThreads {
 		t := toTriageThread(rt)
@@ -211,11 +246,15 @@ func ProcessPR(opts Options) Result {
 	}
 	log("triage: skip=%d auto=%d already_fixed=%d needs_llm=%d",
 		len(skipList), len(autoList), len(alreadyFixedList), len(needsLLMList))
+	setStep(progress.StepFilterThreads, progress.Done,
+		fmt.Sprintf("skip=%d auto=%d already=%d llm=%d",
+			len(skipList), len(autoList), len(alreadyFixedList), len(needsLLMList)))
 
 	// ── 8. Build deterministic responses ──────────────────────────────────
 	responses := deterministicResponses(skipList, alreadyFixedList)
 
 	// ── 9. Run autofix hook ───────────────────────────────────────────────
+	autofixRan := false
 	if !opts.NoAutofix {
 		hookPath := opts.AutofixHook
 		if hookPath == "" {
@@ -223,8 +262,14 @@ func ProcessPR(opts Options) Result {
 		}
 		if hookPath != "" {
 			log("running autofix hook...")
+			setStep(progress.StepAutofix, progress.Running, hookPath)
 			runHook(hookPath, wtPath)
+			setStep(progress.StepAutofix, progress.Done, hookPath)
+			autofixRan = true
 		}
+	}
+	if !autofixRan {
+		setStep(progress.StepAutofix, progress.Skipped, "no hook")
 	}
 
 	// ── 10. Validation ────────────────────────────────────────────────────
@@ -232,12 +277,17 @@ func ProcessPR(opts Options) Result {
 	var validResult validate.Result
 	if runner.Kind != validate.RunnerNone {
 		log("running validation (%s)...", runner.Command)
+		setStep(progress.StepValidate, progress.Running, runner.Command)
 		validResult = validate.Run(wtPath, runner)
 		if validResult.TestsFailed {
 			log("validation: FAILED — %s", firstLine(validResult.Summary))
+			setStep(progress.StepValidate, progress.Failed, firstLine(validResult.Summary))
 		} else {
 			log("validation: passed")
+			setStep(progress.StepValidate, progress.Done, "passed")
 		}
+	} else {
+		setStep(progress.StepValidate, progress.Skipped, "no runner")
 	}
 
 	// ── 11. Fetch failing CI checks ───────────────────────────────────────
@@ -274,15 +324,20 @@ func ProcessPR(opts Options) Result {
 	var selected []string
 	if gateCtx.ShouldRunGate && !opts.DryRun {
 		log("running gate model (%s)...", opts.GateModel)
+		setStep(progress.StepGate, progress.Running, opts.GateModel)
 		prompt := buildGatePrompt(rawThreads, activeNeedsLLM, validResult, ciChecks, gateCtx)
 		gateOut, err = ai.RunGate(opts.AIBackend, opts.GateModel, prompt, gate.GateSchema())
 		if err != nil {
 			log("gate model error: %v", err)
+			setStep(progress.StepGate, progress.Failed, err.Error())
 		} else {
 			log("gate: needs_advanced_model=%v threads_to_fix=%v", gateOut.NeedsAdvancedModel, gateOut.ThreadsToFix)
 			selected = gateOut.ThreadsToFix
+			setStep(progress.StepGate, progress.Done,
+				fmt.Sprintf("advanced=%v selected=%d", gateOut.NeedsAdvancedModel, len(selected)))
 		}
 	} else if !gateCtx.ShouldRunGate {
+		setStep(progress.StepGate, progress.Skipped, "below threshold")
 		// Below threshold — emit "skipped by score" responses.
 		for _, c := range activeNeedsLLM {
 			responses = append(responses, ThreadResponse{
@@ -304,17 +359,21 @@ func ProcessPR(opts Options) Result {
 			}
 		}
 		log("running fix model (%s) on %d thread(s)...", opts.FixModel, len(selected))
+		setStep(progress.StepFix, progress.Running, fmt.Sprintf("%d thread(s)", len(selected)))
 		fixPrompt := buildFixPrompt(rawThreads, activeNeedsLLM, selected, validResult, ciChecks)
 		if ferr := ai.RunFix(opts.AIBackend, opts.FixModel, fixPrompt, wtPath); ferr != nil {
 			log("fix model error: %v", ferr)
+			setStep(progress.StepFix, progress.Failed, ferr.Error())
 		} else {
 			res.FixModelRan = true
+			setStep(progress.StepFix, progress.Done, opts.FixModel)
 		}
 		// Read thread-responses.json written by the fix model.
 		if fixResponses, rerr := readThreadResponses(wtPath); rerr == nil {
 			responses = append(responses, fixResponses...)
 		}
 	} else if gateCtx.ShouldRunGate && !gateOut.NeedsAdvancedModel {
+		setStep(progress.StepFix, progress.Skipped, "gate said not needed")
 		// Gate ran and said "not needed" — generate already-fixed responses so
 		// needs_llm threads still get resolved. Mirrors Bash gate-skipped path.
 		for _, c := range activeNeedsLLM {
@@ -332,16 +391,26 @@ func ProcessPR(opts Options) Result {
 
 	// ── 16. Reply and resolve ─────────────────────────────────────────────
 	if !opts.DryRun && !opts.NoResolve {
+		setStep(progress.StepReply, progress.Running, "")
 		replied, resolved, skipped := replyAndResolve(responses, opts.ResolveSkipped, log)
 		res.Replied, res.Resolved, res.Skipped = replied, resolved, skipped
 		log("replied=%d resolved=%d skipped=%d", replied, resolved, skipped)
+		setStep(progress.StepReply, progress.Done,
+			fmt.Sprintf("replied=%d resolved=%d skipped=%d", replied, resolved, skipped))
 	} else if opts.DryRun {
 		log("dry-run: would process %d responses", len(responses))
+		setStep(progress.StepReply, progress.Skipped, "dry-run")
+	} else {
+		setStep(progress.StepReply, progress.Skipped, "no-resolve flag")
 	}
 
 	// ── 17. Remove thread-responses.json artifact ─────────────────────────
 	if !opts.DryRun {
+		setStep(progress.StepCleanup, progress.Running, "")
 		cleanupThreadResponsesArtifact(wtPath)
+		setStep(progress.StepCleanup, progress.Done, "")
+	} else {
+		setStep(progress.StepCleanup, progress.Skipped, "dry-run")
 	}
 
 	// ── 18. Post-fix summary comment ──────────────────────────────────────
@@ -360,14 +429,24 @@ func ProcessPR(opts Options) Result {
 
 	// ── 19. Request Copilot re-review ─────────────────────────────────────
 	if !opts.DryRun {
+		setStep(progress.StepRereview, progress.Running, "")
 		if cerr := ghapi.RequestCopilotReview(opts.Repo, opts.PRNum); cerr != nil {
 			log("copilot re-review: %v", cerr)
+			setStep(progress.StepRereview, progress.Failed, cerr.Error())
+		} else {
+			setStep(progress.StepRereview, progress.Done, "")
 		}
+	} else {
+		setStep(progress.StepRereview, progress.Skipped, "dry-run")
 	}
 
 	// ── 20. Post-fix review cycle ─────────────────────────────────────────
 	if !opts.NoPostFix && !opts.DryRun {
+		setStep(progress.StepPostfix, progress.Running, "")
 		postFixReviewCycle(opts, wtPath, fixedCount, log)
+		setStep(progress.StepPostfix, progress.Done, "")
+	} else {
+		setStep(progress.StepPostfix, progress.Skipped, "disabled")
 	}
 
 	res.Status = "ok"
