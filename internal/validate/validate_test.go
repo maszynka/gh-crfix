@@ -208,6 +208,60 @@ func TestDetect_InvalidPackageJSON(t *testing.T) {
 	}
 }
 
+// TestDetect_HookOverrideRelativePath_ResolvedAgainstWorktree verifies that a
+// relative --validate-hook path is resolved against the PR worktree root rather
+// than the process CWD. Without this resolution, `--validate-hook scripts/ci.sh`
+// would silently miss a hook that lives inside the worktree.
+func TestDetect_HookOverrideRelativePath_ResolvedAgainstWorktree(t *testing.T) {
+	skipIfWindows(t)
+	wt := t.TempDir()
+	// Hook lives inside the worktree at scripts/ci.sh.
+	rel := filepath.Join("scripts", "ci.sh")
+	abs := filepath.Join(wt, rel)
+	writeExec(t, abs, "#!/bin/sh\nexit 0\n")
+
+	r := Detect(wt, rel)
+	if r.Kind != RunnerHook {
+		t.Fatalf("expected RunnerHook, got %v", r.Kind)
+	}
+	if r.Command != abs {
+		t.Fatalf("expected command %q (resolved against worktree), got %q", abs, r.Command)
+	}
+}
+
+// TestDetect_HookOverrideRelativePath_MissingFallsThrough verifies that a
+// relative hook path that does not exist inside the worktree falls through to
+// auto-detection rather than being treated as a process-CWD-relative path.
+func TestDetect_HookOverrideRelativePath_MissingFallsThrough(t *testing.T) {
+	skipIfWindows(t)
+	wt := t.TempDir()
+	// No hook anywhere.
+	r := Detect(wt, "scripts/does-not-exist.sh")
+	if r.Kind != RunnerNone {
+		t.Fatalf("expected RunnerNone when relative hook is missing, got %v (cmd=%q)",
+			r.Kind, r.Command)
+	}
+}
+
+// TestDetect_HookOverrideAbsolutePath_StaysAbsolute verifies that an absolute
+// hook path is NOT re-resolved against the worktree (the existing behavior for
+// absolute paths must be preserved).
+func TestDetect_HookOverrideAbsolutePath_StaysAbsolute(t *testing.T) {
+	skipIfWindows(t)
+	wt := t.TempDir()
+	hookDir := t.TempDir()
+	hook := filepath.Join(hookDir, "abs-hook.sh")
+	writeExec(t, hook, "#!/bin/sh\nexit 0\n")
+
+	r := Detect(wt, hook)
+	if r.Kind != RunnerHook {
+		t.Fatalf("expected RunnerHook, got %v", r.Kind)
+	}
+	if r.Command != hook {
+		t.Fatalf("expected absolute command %q unchanged, got %q", hook, r.Command)
+	}
+}
+
 // ---------- Run ----------
 
 func TestRun_NoneReturnsUnavailable(t *testing.T) {

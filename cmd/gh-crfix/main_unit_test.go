@@ -133,6 +133,107 @@ func TestResolveConfig_LauncherHandoff(t *testing.T) {
 	}
 }
 
+// TestResolveConfig_EnvOverridesAreApplied verifies that GH_CRFIX_* environment
+// variables documented by the bash script are honored by resolveConfig. Per
+// the bash precedence rule (flag > env > file > default), env vars override
+// persisted config only when no CLI flag explicitly sets them.
+func TestResolveConfig_EnvOverridesAreApplied(t *testing.T) {
+	// A persisted config that differs from what we'll set via env vars.
+	cfg := config.Config{
+		AIBackend:        "auto",
+		GateModel:        "sonnet",
+		FixModel:         "sonnet",
+		Concurrency:      3,
+		ScoreNeedsLLM:    1.0,
+		ScorePRComment:   0.4,
+		ScoreTestFailure: 1.0,
+	}
+
+	t.Setenv("GH_CRFIX_AI_BACKEND", "claude")
+	t.Setenv("GH_CRFIX_GATE_MODEL", "env-gate")
+	t.Setenv("GH_CRFIX_FIX_MODEL", "env-fix")
+	t.Setenv("GH_CRFIX_REVIEW_WAIT", "45")
+	t.Setenv("GH_CRFIX_SCORE_NEEDS_LLM", "0.9")
+	t.Setenv("GH_CRFIX_SCORE_PR_COMMENT", "0.2")
+	t.Setenv("GH_CRFIX_SCORE_TEST_FAILURE", "0.8")
+
+	plan, err := resolveConfig(
+		[]string{"https://github.com/a/b/pull/1"},
+		cfg,
+	)
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if plan.opts.AIBackend != ai.BackendClaude {
+		t.Errorf("AIBackend=%v, want claude (from GH_CRFIX_AI_BACKEND)", plan.opts.AIBackend)
+	}
+	if plan.opts.GateModel != "env-gate" {
+		t.Errorf("GateModel=%q, want env-gate (from GH_CRFIX_GATE_MODEL)", plan.opts.GateModel)
+	}
+	if plan.opts.FixModel != "env-fix" {
+		t.Errorf("FixModel=%q, want env-fix (from GH_CRFIX_FIX_MODEL)", plan.opts.FixModel)
+	}
+	if plan.opts.ReviewWaitSecs != 45 {
+		t.Errorf("ReviewWaitSecs=%d, want 45 (from GH_CRFIX_REVIEW_WAIT)", plan.opts.ReviewWaitSecs)
+	}
+	if plan.opts.Weights.NeedsLLM != 0.9 {
+		t.Errorf("Weights.NeedsLLM=%v, want 0.9 (from env)", plan.opts.Weights.NeedsLLM)
+	}
+	if plan.opts.Weights.PRComment != 0.2 {
+		t.Errorf("Weights.PRComment=%v, want 0.2 (from env)", plan.opts.Weights.PRComment)
+	}
+	if plan.opts.Weights.TestFailure != 0.8 {
+		t.Errorf("Weights.TestFailure=%v, want 0.8 (from env)", plan.opts.Weights.TestFailure)
+	}
+}
+
+// TestResolveConfig_FlagBeatsEnv verifies bash precedence: CLI flags take
+// precedence over GH_CRFIX_* environment variables.
+func TestResolveConfig_FlagBeatsEnv(t *testing.T) {
+	cfg := config.Defaults()
+
+	t.Setenv("GH_CRFIX_AI_BACKEND", "codex")
+	t.Setenv("GH_CRFIX_GATE_MODEL", "env-gate")
+	t.Setenv("GH_CRFIX_REVIEW_WAIT", "45")
+
+	plan, err := resolveConfig(
+		[]string{
+			"https://github.com/a/b/pull/1",
+			"--ai-backend", "claude",
+			"--gate-model", "flag-gate",
+			"--review-wait", "90",
+		},
+		cfg,
+	)
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if plan.opts.AIBackend != ai.BackendClaude {
+		t.Errorf("flag should beat env: AIBackend=%v, want claude", plan.opts.AIBackend)
+	}
+	if plan.opts.GateModel != "flag-gate" {
+		t.Errorf("flag should beat env: GateModel=%q, want flag-gate", plan.opts.GateModel)
+	}
+	if plan.opts.ReviewWaitSecs != 90 {
+		t.Errorf("flag should beat env: ReviewWaitSecs=%d, want 90", plan.opts.ReviewWaitSecs)
+	}
+}
+
+// TestResolveConfig_NoValidateFlag verifies that --no-validate sets
+// opts.NoValidate so ProcessPR can skip the validation step.
+func TestResolveConfig_NoValidateFlag(t *testing.T) {
+	plan, err := resolveConfig(
+		[]string{"https://github.com/a/b/pull/1", "--no-validate"},
+		config.Defaults(),
+	)
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if !plan.opts.NoValidate {
+		t.Errorf("--no-validate did not set opts.NoValidate")
+	}
+}
+
 // TestResolveConfig_ErrorOnMissingTarget verifies that running with no
 // positional args and no URL produces a helpful error.
 func TestResolveConfig_ErrorOnMissingTarget(t *testing.T) {
