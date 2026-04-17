@@ -51,8 +51,11 @@ gh crfix [123,125,130]
 # Full URL (works from anywhere)
 gh crfix https://github.com/owner/repo/pull/123
 
-# Parallel with TUI dashboard
+# Parallel batch run (plain output by default)
 gh crfix 100-110 -c 5
+
+# Parallel with TUI dashboard
+gh crfix 100-110 -c 5 --tui
 
 # Dry run (no mutations)
 gh crfix 123 --dry-run
@@ -71,7 +74,8 @@ gh crfix 123 --score-needs-llm .2 --score-pr-comment .4 --score-test-failure 1
 | `-c N, --concurrency N` | 3 | Max parallel PR workers |
 | `--ai-backend BACKEND` | auto | AI backend: `auto`, `claude`, `codex` |
 | `--seq` | | Sequential mode (same as `-c 1`) |
-| `--no-tui` | | Disable TUI dashboard |
+| `--tui` | | Enable the fullscreen TUI dashboard for batch runs |
+| `--no-tui` | | Force plain output; this is the default for CLI batch runs |
 | `--no-post-fix` | | Skip post-fix review cycle |
 | `--setup-only` | | Only setup worktrees + triage |
 | `--no-resolve` | | Do not resolve GitHub threads |
@@ -121,6 +125,8 @@ ${XDG_CONFIG_HOME:-~/.config}/gh-crfix/defaults
 The next launcher run will preload them, and CLI runs without explicit flags will also use them unless overridden by env vars or flags.
 
 The launcher keeps the target field as free text, but the other fields use allowed option lists. It starts with static fallback model names and then tries to refresh live model lists in the background when API credentials are available.
+
+When you pass PR numbers or URLs directly on the CLI, `gh crfix` now stays in plain output mode by default. Use `--tui` if you want the live fullscreen dashboard for a batch run.
 
 The gate score uses three weights:
 
