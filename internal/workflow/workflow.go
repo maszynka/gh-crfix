@@ -19,7 +19,6 @@ import (
 	"github.com/maszynka/gh-crfix/internal/progress"
 	"github.com/maszynka/gh-crfix/internal/triage"
 	"github.com/maszynka/gh-crfix/internal/validate"
-	"github.com/maszynka/gh-crfix/internal/worktree"
 )
 
 // ThreadResponse is written by the fix model (and by deterministic logic)
@@ -115,7 +114,7 @@ func ProcessPR(opts Options) Result {
 
 	// ── 1. Fetch PR metadata ──────────────────────────────────────────────
 	log("fetching PR metadata...")
-	pr, err := ghapi.FetchPR(opts.Repo, opts.PRNum)
+	pr, err := fetchPRFn(opts.Repo, opts.PRNum)
 	if err != nil {
 		res.Err = fmt.Errorf("fetch PR: %w", err)
 		res.Reason = res.Err.Error()
@@ -135,7 +134,7 @@ func ProcessPR(opts Options) Result {
 	repoRoot := opts.RepoRoot
 	if repoRoot == "" {
 		var rerr error
-		repoRoot, rerr = worktree.RepoRoot(".")
+		repoRoot, rerr = repoRootFn(".")
 		if rerr != nil {
 			res.Err = fmt.Errorf("not in a git repo; set GH_CRFIX_DIR or cd into your clone: %w", rerr)
 			res.Reason = res.Err.Error()
@@ -144,7 +143,7 @@ func ProcessPR(opts Options) Result {
 	}
 	log("setting up worktree...")
 	setStep(progress.StepSetup, progress.Running, "")
-	wtPath, err := worktree.Setup(repoRoot, pr.HeadRefName, opts.PRNum)
+	wtPath, err := setupWorktreeFn(repoRoot, pr.HeadRefName, opts.PRNum)
 	if err != nil {
 		res.Err = fmt.Errorf("worktree setup: %w", err)
 		res.Reason = res.Err.Error()
@@ -155,13 +154,13 @@ func ProcessPR(opts Options) Result {
 	setStep(progress.StepSetup, progress.Done, "worktree ready")
 
 	// ── 3. Handle case collisions if the worktree is dirty ────────────────
-	if dirty, _ := worktree.DirtyStatus(wtPath); dirty != "" {
+	if dirty, _ := dirtyStatusFn(wtPath); dirty != "" {
 		setStep(progress.StepNormalizeCase, progress.Running, "")
 		if err := handleCaseCollisions(opts, wtPath, pr.HeadRefName); err != nil {
 			log("case-collision: %v", err)
 		}
 		// Re-check — if still dirty, we can't proceed safely.
-		if dirty2, _ := worktree.DirtyStatus(wtPath); dirty2 != "" {
+		if dirty2, _ := dirtyStatusFn(wtPath); dirty2 != "" {
 			res.Reason = "worktree dirty before processing"
 			log("%s", res.Reason)
 			setStep(progress.StepNormalizeCase, progress.Failed, "dirty after LLM")
@@ -179,7 +178,7 @@ func ProcessPR(opts Options) Result {
 	}
 	log("merging base branch %q...", baseBranch)
 	setStep(progress.StepMergeBase, progress.Running, "")
-	if mergeErr := worktree.MergeBase(wtPath, baseBranch); mergeErr != nil {
+	if mergeErr := mergeBaseFn(wtPath, baseBranch); mergeErr != nil {
 		log("warning: merge base failed: %v", mergeErr)
 		setStep(progress.StepMergeBase, progress.Failed, mergeErr.Error())
 	} else {
@@ -199,7 +198,7 @@ func ProcessPR(opts Options) Result {
 	// ── 6. Fetch review threads ───────────────────────────────────────────
 	log("fetching review threads...")
 	setStep(progress.StepFetchThreads, progress.Running, "")
-	rawThreads, err := ghapi.FetchThreads(opts.Repo, opts.PRNum, opts.MaxThreads)
+	rawThreads, err := fetchThreadsFn(opts.Repo, opts.PRNum, opts.MaxThreads)
 	if err != nil {
 		res.Err = fmt.Errorf("fetch threads: %w", err)
 		res.Reason = res.Err.Error()
@@ -294,7 +293,7 @@ func ProcessPR(opts Options) Result {
 	var ciChecks []ghapi.CICheck
 	if pr.HeadSHA != "" {
 		log("fetching CI check results...")
-		ciChecks, _ = ghapi.FetchFailingChecks(opts.Repo, pr.HeadSHA)
+		ciChecks, _ = fetchFailingChecksFn(opts.Repo, pr.HeadSHA)
 		if len(ciChecks) > 0 {
 			log("%d failing CI check(s)", len(ciChecks))
 		}
@@ -326,7 +325,7 @@ func ProcessPR(opts Options) Result {
 		log("running gate model (%s)...", opts.GateModel)
 		setStep(progress.StepGate, progress.Running, opts.GateModel)
 		prompt := buildGatePrompt(rawThreads, activeNeedsLLM, validResult, ciChecks, gateCtx)
-		gateOut, err = ai.RunGate(opts.AIBackend, opts.GateModel, prompt, gate.GateSchema())
+		gateOut, err = runGateFn(opts.AIBackend, opts.GateModel, prompt, gate.GateSchema())
 		if err != nil {
 			log("gate model error: %v", err)
 			setStep(progress.StepGate, progress.Failed, err.Error())
@@ -361,7 +360,7 @@ func ProcessPR(opts Options) Result {
 		log("running fix model (%s) on %d thread(s)...", opts.FixModel, len(selected))
 		setStep(progress.StepFix, progress.Running, fmt.Sprintf("%d thread(s)", len(selected)))
 		fixPrompt := buildFixPrompt(rawThreads, activeNeedsLLM, selected, validResult, ciChecks)
-		if ferr := ai.RunFix(opts.AIBackend, opts.FixModel, fixPrompt, wtPath); ferr != nil {
+		if ferr := runFixFn(opts.AIBackend, opts.FixModel, fixPrompt, wtPath); ferr != nil {
 			log("fix model error: %v", ferr)
 			setStep(progress.StepFix, progress.Failed, ferr.Error())
 		} else {
@@ -422,7 +421,7 @@ func ProcessPR(opts Options) Result {
 	}
 	if !opts.DryRun {
 		summary := buildSummaryComment(skipList, autoList, alreadyFixedList, needsLLMList, fixedCount, len(rawThreads))
-		if cerr := ghapi.PostComment(opts.Repo, opts.PRNum, summary); cerr != nil {
+		if cerr := postCommentFn(opts.Repo, opts.PRNum, summary); cerr != nil {
 			log("post comment: %v", cerr)
 		}
 	}
@@ -430,7 +429,7 @@ func ProcessPR(opts Options) Result {
 	// ── 19. Request Copilot re-review ─────────────────────────────────────
 	if !opts.DryRun {
 		setStep(progress.StepRereview, progress.Running, "")
-		if cerr := ghapi.RequestCopilotReview(opts.Repo, opts.PRNum); cerr != nil {
+		if cerr := requestCopilotReviewFn(opts.Repo, opts.PRNum); cerr != nil {
 			log("copilot re-review: %v", cerr)
 			setStep(progress.StepRereview, progress.Failed, cerr.Error())
 		} else {
@@ -460,7 +459,7 @@ func replyAndResolve(responses []ThreadResponse, resolveSkipped bool, log func(s
 	replied, resolved, skippedUnresolved := 0, 0, 0
 	for _, r := range responses {
 		if r.Comment != "" && r.ThreadID != "" {
-			if rerr := ghapi.ReplyToThread(r.ThreadID, r.Comment); rerr != nil {
+			if rerr := replyToThreadFn(r.ThreadID, r.Comment); rerr != nil {
 				log("reply thread %s: %v", r.ThreadID, rerr)
 			} else {
 				replied++
@@ -468,14 +467,14 @@ func replyAndResolve(responses []ThreadResponse, resolveSkipped bool, log func(s
 		}
 		switch r.Action {
 		case "fixed", "already_fixed":
-			if rerr := ghapi.ResolveThread(r.ThreadID); rerr != nil {
+			if rerr := resolveThreadFn(r.ThreadID); rerr != nil {
 				log("resolve thread %s: %v", r.ThreadID, rerr)
 			} else {
 				resolved++
 			}
 		case "skipped":
 			if resolveSkipped || r.ResolveWhenSkipped {
-				_ = ghapi.ResolveThread(r.ThreadID)
+				_ = resolveThreadFn(r.ThreadID)
 				resolved++
 			} else {
 				skippedUnresolved++
@@ -488,7 +487,7 @@ func replyAndResolve(responses []ThreadResponse, resolveSkipped bool, log func(s
 // ── Case collision + conflict marker handlers ───────────────────────────────
 
 func handleCaseCollisions(opts Options, wtPath, branch string) error {
-	groups, err := worktree.DetectCaseCollisions(wtPath)
+	groups, err := detectCaseCollisionsFn(wtPath)
 	if err != nil || len(groups) == 0 {
 		return err
 	}
@@ -515,18 +514,18 @@ Required approach:
 6. Do NOT create thread-responses.json.
 7. End with a clean git status.
 `)
-	if err := ai.RunPlain(opts.AIBackend, opts.FixModel, sb.String(), wtPath); err != nil {
+	if err := runPlainFn(opts.AIBackend, opts.FixModel, sb.String(), wtPath); err != nil {
 		return err
 	}
 	// Verify it's actually clean.
-	if remaining, _ := worktree.DetectCaseCollisions(wtPath); len(remaining) > 0 {
+	if remaining, _ := detectCaseCollisionsFn(wtPath); len(remaining) > 0 {
 		return fmt.Errorf("remaining case collisions after LLM: %d group(s)", len(remaining))
 	}
 	return nil
 }
 
 func fixConflictMarkers(opts Options, wtPath string, log func(string, ...interface{})) error {
-	files, err := conflict.DetectMarkers(wtPath)
+	files, err := detectMarkersFn(wtPath)
 	if err != nil || len(files) == 0 {
 		return err
 	}
@@ -534,10 +533,10 @@ func fixConflictMarkers(opts Options, wtPath string, log func(string, ...interfa
 	if opts.DryRun {
 		return nil
 	}
-	if err := ai.RunPlain(opts.AIBackend, opts.FixModel, conflict.BuildFixPrompt(files), wtPath); err != nil {
+	if err := runPlainFn(opts.AIBackend, opts.FixModel, conflict.BuildFixPrompt(files), wtPath); err != nil {
 		return err
 	}
-	remaining, _ := conflict.DetectMarkers(wtPath)
+	remaining, _ := detectMarkersFn(wtPath)
 	if len(remaining) > 0 {
 		return fmt.Errorf("markers remain in %v after LLM run", remaining)
 	}
@@ -554,7 +553,7 @@ func postFixReviewCycle(opts Options, wtPath string, fixedCount int, log func(st
 	log("post-fix: waiting %ds...", wait)
 	time.Sleep(time.Duration(wait) * time.Second)
 
-	newThreads, err := ghapi.FetchThreads(opts.Repo, opts.PRNum, opts.MaxThreads)
+	newThreads, err := fetchThreadsFn(opts.Repo, opts.PRNum, opts.MaxThreads)
 	if err != nil {
 		log("post-fix: fetch threads failed: %v", err)
 		return
@@ -564,16 +563,16 @@ func postFixReviewCycle(opts Options, wtPath string, fixedCount int, log func(st
 		body := fmt.Sprintf(
 			"gh crfix: All %d comments addressed. No new issues after re-review.",
 			fixedCount)
-		_ = ghapi.PostComment(opts.Repo, opts.PRNum, body)
+		_ = postCommentFn(opts.Repo, opts.PRNum, body)
 		// Merge + re-fix conflict markers one more time; swallow all errors.
-		if pr, err := ghapi.FetchPR(opts.Repo, opts.PRNum); err == nil && pr.BaseRefName != "" {
-			if merr := worktree.MergeBase(wtPath, pr.BaseRefName); merr != nil {
-				_ = ghapi.PostComment(opts.Repo, opts.PRNum,
+		if pr, err := fetchPRFn(opts.Repo, opts.PRNum); err == nil && pr.BaseRefName != "" {
+			if merr := mergeBaseFn(wtPath, pr.BaseRefName); merr != nil {
+				_ = postCommentFn(opts.Repo, opts.PRNum,
 					"gh crfix: WARNING — could not merge base branch; conflicts need manual resolution.")
 			}
 		}
 		_ = fixConflictMarkers(opts, wtPath, log)
-		_ = ghapi.RequestCopilotReview(opts.Repo, opts.PRNum)
+		_ = requestCopilotReviewFn(opts.Repo, opts.PRNum)
 		log("post-fix: done")
 		return
 	}
@@ -581,7 +580,7 @@ func postFixReviewCycle(opts Options, wtPath string, fixedCount int, log func(st
 	body := fmt.Sprintf(
 		"gh crfix: Fixed %d comments, but %d new issue(s) raised. Run again to address.",
 		fixedCount, len(newThreads))
-	_ = ghapi.PostComment(opts.Repo, opts.PRNum, body)
+	_ = postCommentFn(opts.Repo, opts.PRNum, body)
 }
 
 // ── Prompt builders ─────────────────────────────────────────────────────────

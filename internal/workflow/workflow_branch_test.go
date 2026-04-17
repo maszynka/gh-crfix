@@ -1,0 +1,587 @@
+package workflow
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+
+	"github.com/maszynka/gh-crfix/internal/ai"
+	"github.com/maszynka/gh-crfix/internal/gate"
+	ghapi "github.com/maszynka/gh-crfix/internal/github"
+	"github.com/maszynka/gh-crfix/internal/progress"
+)
+
+// seamBackup captures the current values of every package-level seam so a
+// test's t.Cleanup can restore them. Each branch test calls installSeams(t)
+// which both resets defaults and registers the restore.
+type seamBackup struct {
+	fetchPR              func(string, int) (ghapi.PRInfo, error)
+	fetchThreads         func(string, int, int) ([]ghapi.Thread, error)
+	postComment          func(string, int, string) error
+	replyToThread        func(string, string) error
+	resolveThread        func(string) error
+	fetchFailingChecks   func(string, string) ([]ghapi.CICheck, error)
+	requestCopilotReview func(string, int) error
+	repoRoot             func(string) (string, error)
+	setupWorktree        func(string, string, int) (string, error)
+	dirtyStatus          func(string) (string, error)
+	mergeBase            func(string, string) error
+	detectCaseCollisions func(string) ([][]string, error)
+	detectMarkers        func(string) ([]string, error)
+	runGate              func(ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error)
+	runFix               func(ai.Backend, string, string, string) error
+	runPlain             func(ai.Backend, string, string, string) error
+}
+
+func snapshotSeams() seamBackup {
+	return seamBackup{
+		fetchPR:              fetchPRFn,
+		fetchThreads:         fetchThreadsFn,
+		postComment:          postCommentFn,
+		replyToThread:        replyToThreadFn,
+		resolveThread:        resolveThreadFn,
+		fetchFailingChecks:   fetchFailingChecksFn,
+		requestCopilotReview: requestCopilotReviewFn,
+		repoRoot:             repoRootFn,
+		setupWorktree:        setupWorktreeFn,
+		dirtyStatus:          dirtyStatusFn,
+		mergeBase:            mergeBaseFn,
+		detectCaseCollisions: detectCaseCollisionsFn,
+		detectMarkers:        detectMarkersFn,
+		runGate:              runGateFn,
+		runFix:               runFixFn,
+		runPlain:             runPlainFn,
+	}
+}
+
+func restoreSeams(b seamBackup) {
+	fetchPRFn = b.fetchPR
+	fetchThreadsFn = b.fetchThreads
+	postCommentFn = b.postComment
+	replyToThreadFn = b.replyToThread
+	resolveThreadFn = b.resolveThread
+	fetchFailingChecksFn = b.fetchFailingChecks
+	requestCopilotReviewFn = b.requestCopilotReview
+	repoRootFn = b.repoRoot
+	setupWorktreeFn = b.setupWorktree
+	dirtyStatusFn = b.dirtyStatus
+	mergeBaseFn = b.mergeBase
+	detectCaseCollisionsFn = b.detectCaseCollisions
+	detectMarkersFn = b.detectMarkers
+	runGateFn = b.runGate
+	runFixFn = b.runFix
+	runPlainFn = b.runPlain
+}
+
+// installSeams replaces every seam with safe defaults for branch tests
+// (empty/no-op/nil-returning) and restores them at test end. Callers
+// override specific seams after this returns to drive a specific branch.
+func installSeams(t *testing.T) {
+	t.Helper()
+	prev := snapshotSeams()
+	t.Cleanup(func() { restoreSeams(prev) })
+
+	fetchPRFn = func(string, int) (ghapi.PRInfo, error) {
+		return ghapi.PRInfo{State: "OPEN", HeadRefName: "feature", BaseRefName: "main", Title: "t", HeadSHA: ""}, nil
+	}
+	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) { return nil, nil }
+	postCommentFn = func(string, int, string) error { return nil }
+	replyToThreadFn = func(string, string) error { return nil }
+	resolveThreadFn = func(string) error { return nil }
+	fetchFailingChecksFn = func(string, string) ([]ghapi.CICheck, error) { return nil, nil }
+	requestCopilotReviewFn = func(string, int) error { return nil }
+	repoRootFn = func(string) (string, error) { return "/repo", nil }
+	setupWorktreeFn = func(string, string, int) (string, error) { return t.TempDir(), nil }
+	dirtyStatusFn = func(string) (string, error) { return "", nil }
+	mergeBaseFn = func(string, string) error { return nil }
+	detectCaseCollisionsFn = func(string) ([][]string, error) { return nil, nil }
+	detectMarkersFn = func(string) ([]string, error) { return nil, nil }
+	runGateFn = func(ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
+		return ai.GateOutput{}, nil
+	}
+	runFixFn = func(ai.Backend, string, string, string) error { return nil }
+	runPlainFn = func(ai.Backend, string, string, string) error { return nil }
+}
+
+// branchBaseOpts is a minimal Options that keeps ProcessPR out of trouble:
+// real filesystem temp path, NoPostFix set so there's no 3-minute sleep,
+// NoAutofix so we don't need a hook, NoResolve/DryRun off by default.
+func branchBaseOpts(t *testing.T) Options {
+	t.Helper()
+	return Options{
+		Repo:       "owner/repo",
+		PRNum:      42,
+		RepoRoot:   t.TempDir(),
+		AIBackend:  ai.BackendClaude,
+		GateModel:  "gate-model",
+		FixModel:   "fix-model",
+		MaxThreads: 100,
+		NoPostFix:  true,
+		NoAutofix:  true,
+		Weights: gate.ScoreWeights{
+			NeedsLLM:    0.5,
+			PRComment:   0.5,
+			TestFailure: 1.0,
+		},
+	}
+}
+
+// --- 1. PR not OPEN -----------------------------------------------------------
+
+func TestProcessPR_PRClosedSkipped(t *testing.T) {
+	installSeams(t)
+	fetchPRFn = func(string, int) (ghapi.PRInfo, error) {
+		return ghapi.PRInfo{State: "CLOSED", HeadRefName: "feature", Title: "t"}, nil
+	}
+
+	res := ProcessPR(branchBaseOpts(t))
+	if res.Status != "skipped" {
+		t.Fatalf("status=%q want skipped", res.Status)
+	}
+	if res.Reason != "PR is CLOSED" {
+		t.Fatalf("reason=%q want %q", res.Reason, "PR is CLOSED")
+	}
+}
+
+// --- 2. FetchPR error ---------------------------------------------------------
+
+func TestProcessPR_FetchPRError(t *testing.T) {
+	installSeams(t)
+	fetchPRFn = func(string, int) (ghapi.PRInfo, error) {
+		return ghapi.PRInfo{}, errors.New("gh not found")
+	}
+
+	res := ProcessPR(branchBaseOpts(t))
+	if res.Status != "failed" {
+		t.Fatalf("status=%q want failed", res.Status)
+	}
+	if res.Err == nil {
+		t.Fatalf("expected Err to be set")
+	}
+}
+
+// --- 3. Worktree clean, no threads -------------------------------------------
+
+func TestProcessPR_NoThreadsSkipped(t *testing.T) {
+	installSeams(t)
+	tracker := progress.NewTracker(t.TempDir())
+	opts := branchBaseOpts(t)
+	opts.Tracker = tracker
+	if err := tracker.Init(opts.PRNum); err != nil {
+		t.Fatalf("tracker init: %v", err)
+	}
+
+	// Threads already default to nil via installSeams.
+	res := ProcessPR(opts)
+	if res.Status != "skipped" || res.Reason != "no unresolved threads" {
+		t.Fatalf("want skipped/no unresolved threads, got %+v", res)
+	}
+
+	// Tracker should show StepSetup=Done and StepFetchThreads=Done.
+	if st, _, ok := tracker.Get(opts.PRNum, progress.StepSetup); !ok || st != progress.Done {
+		t.Fatalf("StepSetup want done; got %v (ok=%v)", st, ok)
+	}
+	if st, _, ok := tracker.Get(opts.PRNum, progress.StepFetchThreads); !ok || st != progress.Done {
+		t.Fatalf("StepFetchThreads want done; got %v (ok=%v)", st, ok)
+	}
+}
+
+// --- 4. SetupOnly + threads → skipped "setup-only" ---------------------------
+
+func TestProcessPR_SetupOnlySkipped(t *testing.T) {
+	installSeams(t)
+	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+		return []ghapi.Thread{{ID: "t1", Path: "a.go", Line: 1, Comments: []ghapi.Comment{
+			{Author: "alice", Body: "please fix"},
+		}}}, nil
+	}
+	opts := branchBaseOpts(t)
+	opts.SetupOnly = true
+
+	res := ProcessPR(opts)
+	if res.Status != "skipped" || res.Reason != "setup-only" {
+		t.Fatalf("want skipped/setup-only; got %+v", res)
+	}
+}
+
+// --- 5. Gate score below threshold, skipped ----------------------------------
+//
+// With a single needs_llm thread and weights (NeedsLLM=0.5) the total is 0.5 < 1,
+// so ShouldRunGate=false. Code path emits "Skipped automatically: score below
+// threshold" comments for each active needs_llm thread.
+
+func TestProcessPR_GateBelowThresholdSkipped(t *testing.T) {
+	installSeams(t)
+
+	// 1 thread that classifies as needs_llm (file path that exists, no mechanical/non-actionable body).
+	wt := t.TempDir()
+	// Create the file so the triage step passes the existence check.
+	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
+		t.Fatalf("write a.go: %v", err)
+	}
+	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+
+	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+		return []ghapi.Thread{{
+			ID: "t1", Path: "a.go", Line: 1,
+			Comments: []ghapi.Comment{{Author: "alice", Body: "thoughtful review needing semantic thought"}},
+		}}, nil
+	}
+
+	// Track reply calls + their bodies so we can assert the skipped-by-score message.
+	var mu sync.Mutex
+	var replyBodies []string
+	replyToThreadFn = func(id, body string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		replyBodies = append(replyBodies, body)
+		return nil
+	}
+	// gate below threshold means RunGate should NOT be called — fail if it is.
+	runGateFn = func(ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
+		t.Fatalf("runGate must not be called when score is below threshold")
+		return ai.GateOutput{}, nil
+	}
+
+	opts := branchBaseOpts(t)
+	// Make sure total score is < 1: only NeedsLLM=0.5, PRComment=0 (no empty path), TestFailure=0.
+	opts.Weights = gate.ScoreWeights{NeedsLLM: 0.5, PRComment: 0.5, TestFailure: 1.0}
+
+	res := ProcessPR(opts)
+	if res.Status != "ok" {
+		t.Fatalf("status=%q (reason=%q) want ok", res.Status, res.Reason)
+	}
+	// Find at least one reply with the expected text.
+	found := false
+	mu.Lock()
+	for _, b := range replyBodies {
+		if contains(b, "Skipped automatically: score below threshold") {
+			found = true
+		}
+	}
+	mu.Unlock()
+	if !found {
+		t.Fatalf("expected a reply with 'Skipped automatically: score below threshold'; got %v", replyBodies)
+	}
+}
+
+// --- 6. Gate returns NeedsAdvancedModel=false --------------------------------
+
+func TestProcessPR_GateDeclinesAdvancedModel(t *testing.T) {
+	installSeams(t)
+
+	// 3 needs_llm threads → total score 0.5 * 3? No — score weights NeedsLLM only fires once (count>0).
+	// With NeedsLLM=1.0 score=1.0, ShouldRunGate=true, runGate called, gate says
+	// NeedsAdvancedModel=false.
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
+		t.Fatalf("write a.go: %v", err)
+	}
+	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+
+	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+		return []ghapi.Thread{{
+			ID: "t1", Path: "a.go", Line: 1,
+			Comments: []ghapi.Comment{{Author: "alice", Body: "needs semantic review of this"}},
+		}}, nil
+	}
+
+	gateCalled := int32(0)
+	runGateFn = func(ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
+		atomic.AddInt32(&gateCalled, 1)
+		return ai.GateOutput{NeedsAdvancedModel: false, Reason: "not needed"}, nil
+	}
+	fixCalled := int32(0)
+	runFixFn = func(ai.Backend, string, string, string) error {
+		atomic.AddInt32(&fixCalled, 1)
+		return nil
+	}
+
+	var mu sync.Mutex
+	var replyBodies []string
+	replyToThreadFn = func(_, body string) error {
+		mu.Lock()
+		replyBodies = append(replyBodies, body)
+		mu.Unlock()
+		return nil
+	}
+
+	opts := branchBaseOpts(t)
+	// NeedsLLM=1.0 guarantees total score ≥ 1 → gate runs.
+	opts.Weights = gate.ScoreWeights{NeedsLLM: 1.0}
+
+	res := ProcessPR(opts)
+	if res.Status != "ok" {
+		t.Fatalf("status=%q want ok (reason=%q)", res.Status, res.Reason)
+	}
+	if atomic.LoadInt32(&gateCalled) != 1 {
+		t.Fatalf("gate should be called exactly once; got %d", gateCalled)
+	}
+	if atomic.LoadInt32(&fixCalled) != 0 {
+		t.Fatalf("fix must NOT be called when gate declines; got %d", fixCalled)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	found := false
+	for _, b := range replyBodies {
+		if contains(b, "Reviewed by automation — no code change needed") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected reply 'Reviewed by automation — no code change needed'; got %v", replyBodies)
+	}
+}
+
+// --- 7. DryRun=true: no PostComment, no ReplyToThread, no ResolveThread ------
+
+func TestProcessPR_DryRun(t *testing.T) {
+	installSeams(t)
+
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
+		t.Fatalf("write a.go: %v", err)
+	}
+	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+
+	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+		return []ghapi.Thread{{
+			ID: "t1", Path: "a.go", Line: 1,
+			Comments: []ghapi.Comment{{Author: "alice", Body: "needs semantic review"}},
+		}}, nil
+	}
+
+	var postCalled, replyCalled, resolveCalled int32
+	postCommentFn = func(string, int, string) error { atomic.AddInt32(&postCalled, 1); return nil }
+	replyToThreadFn = func(string, string) error { atomic.AddInt32(&replyCalled, 1); return nil }
+	resolveThreadFn = func(string) error { atomic.AddInt32(&resolveCalled, 1); return nil }
+	// Gate and fix should not run in dry mode.
+	runGateFn = func(ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
+		t.Fatalf("RunGate should not run in dry-run mode")
+		return ai.GateOutput{}, nil
+	}
+	runFixFn = func(ai.Backend, string, string, string) error {
+		t.Fatalf("RunFix should not run in dry-run mode")
+		return nil
+	}
+	// Copilot re-review seam may still fire if !opts.DryRun — with DryRun=true it should not.
+	requestCopilotReviewFn = func(string, int) error {
+		t.Fatalf("RequestCopilotReview should not run in dry-run mode")
+		return nil
+	}
+
+	opts := branchBaseOpts(t)
+	opts.DryRun = true
+
+	res := ProcessPR(opts)
+	if res.Status != "ok" {
+		t.Fatalf("status=%q want ok (reason=%q)", res.Status, res.Reason)
+	}
+	if atomic.LoadInt32(&postCalled) != 0 {
+		t.Fatalf("PostComment must not be called in dry-run; got %d", postCalled)
+	}
+	if atomic.LoadInt32(&replyCalled) != 0 {
+		t.Fatalf("ReplyToThread must not be called in dry-run; got %d", replyCalled)
+	}
+	if atomic.LoadInt32(&resolveCalled) != 0 {
+		t.Fatalf("ResolveThread must not be called in dry-run; got %d", resolveCalled)
+	}
+	if res.Replied != 0 || res.Resolved != 0 || res.Skipped != 0 {
+		t.Fatalf("want all counts 0 in dry-run; got replied=%d resolved=%d skipped=%d",
+			res.Replied, res.Resolved, res.Skipped)
+	}
+}
+
+// --- 8. NoResolve=true: ReplyToThread/ResolveThread NOT called --------------
+
+func TestProcessPR_NoResolve(t *testing.T) {
+	installSeams(t)
+
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
+		t.Fatalf("write a.go: %v", err)
+	}
+	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+
+	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+		return []ghapi.Thread{{
+			ID: "t1", Path: "a.go", Line: 1,
+			Comments: []ghapi.Comment{{Author: "alice", Body: "needs semantic review"}},
+		}}, nil
+	}
+
+	var replyCalled, resolveCalled int32
+	replyToThreadFn = func(string, string) error { atomic.AddInt32(&replyCalled, 1); return nil }
+	resolveThreadFn = func(string) error { atomic.AddInt32(&resolveCalled, 1); return nil }
+
+	opts := branchBaseOpts(t)
+	opts.NoResolve = true
+	// Weights that keep us below threshold so gate doesn't run — keeps the
+	// test focused on the "no reply/resolve even outside dry-run" check.
+	opts.Weights = gate.ScoreWeights{NeedsLLM: 0.5, TestFailure: 1.0}
+
+	res := ProcessPR(opts)
+	if res.Status != "ok" {
+		t.Fatalf("status=%q want ok", res.Status)
+	}
+	if atomic.LoadInt32(&replyCalled) != 0 {
+		t.Fatalf("ReplyToThread must not be called with NoResolve; got %d", replyCalled)
+	}
+	if atomic.LoadInt32(&resolveCalled) != 0 {
+		t.Fatalf("ResolveThread must not be called with NoResolve; got %d", resolveCalled)
+	}
+}
+
+// --- 9. All threads classified as skip → deterministic only, gate silent -----
+
+func TestProcessPR_AllSkipped(t *testing.T) {
+	installSeams(t)
+
+	wt := t.TempDir()
+	// File exists so triage won't send us to "file no longer exists in worktree"
+	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
+		t.Fatalf("write a.go: %v", err)
+	}
+	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+
+	// All threads are "lgtm" (non-actionable → skip, ResolveWhenSkipped=true).
+	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+		return []ghapi.Thread{
+			{ID: "t1", Path: "a.go", Line: 1, Comments: []ghapi.Comment{{Author: "x", Body: "lgtm"}}},
+			{ID: "t2", Path: "a.go", Line: 2, Comments: []ghapi.Comment{{Author: "y", Body: "lgtm"}}},
+		}, nil
+	}
+
+	runGateFn = func(ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
+		t.Fatalf("gate must not run when all threads are skipped")
+		return ai.GateOutput{}, nil
+	}
+	runFixFn = func(ai.Backend, string, string, string) error {
+		t.Fatalf("fix must not run when all threads are skipped")
+		return nil
+	}
+
+	var replies []string
+	replyToThreadFn = func(_, body string) error {
+		replies = append(replies, body)
+		return nil
+	}
+
+	res := ProcessPR(branchBaseOpts(t))
+	if res.Status != "ok" {
+		t.Fatalf("status=%q want ok (reason=%q)", res.Status, res.Reason)
+	}
+	// Each deterministic skip reply starts with "Skipped automatically:".
+	for _, r := range replies {
+		if !contains(r, "Skipped automatically:") {
+			t.Fatalf("unexpected non-skip reply: %q", r)
+		}
+	}
+	if len(replies) != 2 {
+		t.Fatalf("want 2 replies; got %d: %v", len(replies), replies)
+	}
+}
+
+// --- 15. replyAndResolve with seam swap --------------------------------------
+
+func TestReplyAndResolve_CountsAndSkipsEmptyBodies(t *testing.T) {
+	installSeams(t)
+
+	var (
+		repliesMu   sync.Mutex
+		replied     []string
+		resolves    []string
+	)
+	replyToThreadFn = func(id, _ string) error {
+		repliesMu.Lock()
+		replied = append(replied, id)
+		repliesMu.Unlock()
+		return nil
+	}
+	resolveThreadFn = func(id string) error {
+		repliesMu.Lock()
+		resolves = append(resolves, id)
+		repliesMu.Unlock()
+		return nil
+	}
+
+	responses := []ThreadResponse{
+		// fixed with comment → reply + resolve
+		{ThreadID: "a", Action: "fixed", Comment: "done"},
+		// already_fixed with empty comment → no reply, but resolve
+		{ThreadID: "b", Action: "already_fixed", Comment: ""},
+		// already_fixed with no thread id → no reply (guard), still resolve (id="" passed to resolveThreadFn)
+		{ThreadID: "", Action: "already_fixed", Comment: "foo"},
+		// skipped without resolveSkipped → no reply (empty comment), not resolved
+		{ThreadID: "c", Action: "skipped", Comment: ""},
+		// skipped with ResolveWhenSkipped=true → no reply (empty), resolved
+		{ThreadID: "d", Action: "skipped", Comment: "", ResolveWhenSkipped: true},
+		// skipped with comment → reply, not resolved (resolveSkipped=false & ResolveWhenSkipped=false)
+		{ThreadID: "e", Action: "skipped", Comment: "ignore"},
+	}
+
+	replies, resolved, skippedUnresolved := replyAndResolve(
+		responses,
+		false, // resolveSkipped
+		func(string, ...interface{}) {},
+	)
+
+	if replies != 2 {
+		t.Errorf("replied=%d want 2 (a,e)", replies)
+	}
+	// a (fixed) + b (already_fixed) + "" (already_fixed, empty id still counted) + d (skipped+flag) = 4
+	if resolved != 4 {
+		t.Errorf("resolved=%d want 4 (a,b,empty,d)", resolved)
+	}
+	if skippedUnresolved != 2 {
+		// c (skipped no flag) + e (skipped no flag) → unresolved
+		t.Errorf("skippedUnresolved=%d want 2 (c,e)", skippedUnresolved)
+	}
+
+	// Verify replyToThread was only invoked when Comment and ThreadID non-empty.
+	for _, id := range replied {
+		if id == "" {
+			t.Errorf("reply to empty thread id should have been skipped")
+		}
+	}
+}
+
+func TestReplyAndResolve_ResolveSkippedFlag(t *testing.T) {
+	installSeams(t)
+
+	var resolved []string
+	resolveThreadFn = func(id string) error {
+		resolved = append(resolved, id)
+		return nil
+	}
+	replyToThreadFn = func(string, string) error { return nil }
+
+	responses := []ThreadResponse{
+		{ThreadID: "a", Action: "skipped", Comment: "c1"},
+		{ThreadID: "b", Action: "skipped", Comment: ""},
+	}
+	_, resolvedCount, skippedUnresolved := replyAndResolve(
+		responses,
+		true, // resolveSkipped=true → resolve every skipped
+		func(string, ...interface{}) {},
+	)
+	if resolvedCount != 2 {
+		t.Errorf("resolvedCount=%d want 2", resolvedCount)
+	}
+	if skippedUnresolved != 0 {
+		t.Errorf("skippedUnresolved=%d want 0", skippedUnresolved)
+	}
+	if len(resolved) != 2 {
+		t.Errorf("resolveThreadFn called %d times; want 2", len(resolved))
+	}
+}
+
+// --- Helpers ------------------------------------------------------------------
+
+// contains is a tiny wrapper that lets us keep the substring checks readable.
+func contains(s, sub string) bool { return strings.Contains(s, sub) }
