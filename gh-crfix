@@ -2120,7 +2120,7 @@ After all files are fixed: git commit -m 'fix: resolve committed conflict marker
 
     local llm_succeeded=false
     if [ "$AI_BACKEND" = "claude" ]; then
-      (cd "$worktree_path" && run_noninteractive claude --dangerously-skip-permissions -p "$prompt" < /dev/null 2>&1) && llm_succeeded=true
+      (cd "$worktree_path" && run_noninteractive claude --dangerously-skip-permissions -p "$prompt" < /dev/null) && llm_succeeded=true
     else
       run_noninteractive codex exec \
         --cd "$worktree_path" \
