@@ -292,11 +292,15 @@ func TestDetailShowsLogTail(t *testing.T) {
 	}
 
 	m := newModel(cfg)
-	m2, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m2, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	mm := m2.(model)
-	// Force detail to populate log tail via refresh.
-	m3, _ := mm.Update(refreshMsg{})
-	mm = m3.(model)
+	// Execute the log-tail cmd returned by entering detail view.
+	if cmd != nil {
+		if msg := cmd(); msg != nil {
+			m3, _ := mm.Update(msg)
+			mm = m3.(model)
+		}
+	}
 
 	view := mm.View()
 	if !strings.Contains(view, "log-line-30") {
