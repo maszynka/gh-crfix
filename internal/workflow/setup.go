@@ -166,10 +166,24 @@ func setupOnePR(
 		}
 	}
 
+	// progress writes one-liner setup-phase updates to opts.ProgressOut.
+	// These are safe to call even when ProgressOut is nil. The dashboard
+	// caller wires stderr here (stderr is not redirected even when the
+	// dashboard takes over stdout), so the user still sees some feedback
+	// during the otherwise-silent setup phase.
+	prog := func(format string, a ...interface{}) {
+		if opts.ProgressOut == nil {
+			return
+		}
+		fmt.Fprintf(opts.ProgressOut, "[setup] PR #%d: "+format+"\n",
+			append([]interface{}{opts.PRNum}, a...)...)
+	}
+
 	markStarted()
 	setStep(progress.Running, "")
 	logMaster("starting setup")
 	logPR("starting setup")
+	prog("fetching metadata...")
 
 	// 1. Fetch PR metadata.
 	info, err := prf.FetchPR(opts.Repo, opts.PRNum)
@@ -178,6 +192,7 @@ func setupOnePR(
 		pr.Reason = "not found"
 		logMaster("gh pr view failed: %v -- marking as %s (%s)", err, pr.Status, pr.Reason)
 		logPR("gh pr view failed: %v", err)
+		prog("skipped (%s)", pr.Reason)
 		setStep(progress.Skipped, pr.Reason)
 		markStatus(false)
 		return pr
@@ -192,6 +207,7 @@ func setupOnePR(
 		pr.Reason = fmt.Sprintf("PR is %s", info.State)
 		logMaster("state=%s -- skipping", info.State)
 		logPR("state=%s -- skipping", info.State)
+		prog("skipped (%s)", pr.Reason)
 		setStep(progress.Skipped, pr.Reason)
 		// Non-OPEN PRs are a clean no-op, not a failure.
 		markStatus(true)
@@ -210,6 +226,7 @@ func setupOnePR(
 			pr.Reason = "worktree setup failed"
 			logMaster("could not resolve repo root: %v", rerr)
 			logPR("could not resolve repo root: %v", rerr)
+			prog("failed (%s)", pr.Reason)
 			setStep(progress.Failed, pr.Reason)
 			markStatus(false)
 			return pr
@@ -224,6 +241,7 @@ func setupOnePR(
 		pr.Reason = "worktree setup failed"
 		logMaster("worktree setup error: %v", err)
 		logPR("worktree setup error: %v", err)
+		prog("failed (%s)", pr.Reason)
 		setStep(progress.Failed, pr.Reason)
 		markStatus(false)
 		return pr
@@ -242,6 +260,7 @@ func setupOnePR(
 			pr.Reason = "worktree not clean"
 			logMaster("worktree dirty with no recoverable case collisions -- failing")
 			logPR("worktree dirty: %s", firstLine(dirty))
+			prog("failed (%s)", pr.Reason)
 			setStep(progress.Failed, pr.Reason)
 			markStatus(false)
 			return pr
@@ -255,6 +274,7 @@ func setupOnePR(
 		pr.Reason = "fetch threads failed"
 		logMaster("fetch threads error: %v", err)
 		logPR("fetch threads error: %v", err)
+		prog("failed (%s)", pr.Reason)
 		setStep(progress.Failed, pr.Reason)
 		markStatus(false)
 		return pr
@@ -266,6 +286,7 @@ func setupOnePR(
 		pr.Reason = "no unresolved threads"
 		logMaster("no unresolved threads -- skipping")
 		logPR("no unresolved threads")
+		prog("skipped (%s)", pr.Reason)
 		setStep(progress.Skipped, pr.Reason)
 		markStatus(true)
 		return pr
@@ -276,6 +297,7 @@ func setupOnePR(
 		pr.Reason = "setup-only"
 		logMaster("setup-only: worktree ready at %s", wtPath)
 		logPR("setup-only: cd %s", wtPath)
+		prog("skipped (setup-only)")
 		setStep(progress.Done, "setup-only")
 		markStatus(true)
 		return pr
@@ -285,6 +307,7 @@ func setupOnePR(
 	pr.Reason = "ready"
 	logMaster("ready -- %d thread(s), worktree=%s", pr.Threads, wtPath)
 	logPR("ready -- %d thread(s)", pr.Threads)
+	prog("ready (%d thread(s))", pr.Threads)
 	setStep(progress.Done, fmt.Sprintf("%d thread(s)", pr.Threads))
 	return pr
 }

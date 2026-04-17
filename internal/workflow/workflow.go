@@ -4,6 +4,7 @@ package workflow
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -61,6 +62,19 @@ type Options struct {
 	// SetupMaxConc optionally overrides the setup-phase concurrency cap. A
 	// zero value defaults to SetupMaxConcurrency in batch.go.
 	SetupMaxConc int
+
+	// Out is the writer used for the per-PR human-readable log lines (the
+	// `[PR #N] ...` narrative). When nil, ProcessPR falls back to os.Stdout.
+	// Setting this to a bytes.Buffer lets tests capture output without
+	// swapping the global os.Stdout, and lets a dashboard redirect those
+	// lines into the master log without the global `os.Stdout = logfile`
+	// hack currently in cmd/gh-crfix/main.go.
+	Out io.Writer
+	// ProgressOut receives coarse setup-phase progress lines (one per
+	// setupOnePR start / result). Writing to stderr lets users see progress
+	// even when stdout is redirected to the master log for a TUI. When nil,
+	// setupOnePR emits no progress lines.
+	ProgressOut io.Writer
 }
 
 // Result summarises the outcome of a single ProcessPR call. Filled in even on
@@ -103,9 +117,16 @@ func OptionsFromConfig(cfg config.Config, repo string, prNum int) Options {
 // ProcessPR runs the full gh-crfix pipeline for a single PR.
 func ProcessPR(opts Options) Result {
 	res := Result{PRNum: opts.PRNum, Status: "failed"}
+	// Resolve the log writer once so the closure doesn't re-evaluate the
+	// fallback on every line. Defaulting to os.Stdout preserves the legacy
+	// behavior when callers don't set opts.Out.
+	out := opts.Out
+	if out == nil {
+		out = os.Stdout
+	}
 	log := func(format string, a ...interface{}) {
 		args := append([]interface{}{opts.PRNum}, a...)
-		fmt.Printf("  [PR #%d] "+format+"\n", args...)
+		fmt.Fprintf(out, "  [PR #%d] "+format+"\n", args...)
 		if opts.Run != nil {
 			// Mirror the bash `[process-pr]` prefix so the master log carries
 			// the same shape. `Mlog` handles timestamp + newline.

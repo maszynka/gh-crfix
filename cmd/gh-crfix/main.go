@@ -221,6 +221,9 @@ func runBatch(
 ) []workflow.Result {
 
 	if !useDashboard {
+		// Plain-text mode: setup-phase progress lines should appear on stdout
+		// so users aren't staring at a silent terminal during a 30s git fetch.
+		plan.opts.ProgressOut = os.Stdout
 		return runBatchPlain(ctx, plan)
 	}
 
@@ -228,6 +231,17 @@ func runBatch(
 	// the dashboard returns and we cancel the batch ctx.
 	dashCtx, dashCancel := context.WithCancel(ctx)
 	defer dashCancel()
+
+	// Dashboard mode: a one-liner on stderr before the framebuffer takes over
+	// so the user knows something is happening during setup. stderr isn't
+	// redirected to the log file the way stdout is below.
+	fmt.Fprintf(os.Stderr, "Setting up %d PR(s)...\n", len(plan.prNums))
+	// Per-setupOnePR progress goes to stderr too (not stdout, which we're
+	// about to redirect into the master log). These lines will interleave
+	// with the dashboard briefly during setup, but they land on stderr which
+	// bubbletea's framebuffer doesn't touch — they'll scroll above the
+	// dashboard at worst. Better than 30s of silence.
+	plan.opts.ProgressOut = os.Stderr
 
 	// Silence per-PR stdout during dashboard so the two surfaces don't
 	// overlap. All those writes go to the master log via the usual tee in
