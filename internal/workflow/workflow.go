@@ -104,7 +104,13 @@ func OptionsFromConfig(cfg config.Config, repo string, prNum int) Options {
 func ProcessPR(opts Options) Result {
 	res := Result{PRNum: opts.PRNum, Status: "failed"}
 	log := func(format string, a ...interface{}) {
-		fmt.Printf("  [PR #%d] "+format+"\n", append([]interface{}{opts.PRNum}, a...)...)
+		args := append([]interface{}{opts.PRNum}, a...)
+		fmt.Printf("  [PR #%d] "+format+"\n", args...)
+		if opts.Run != nil {
+			// Mirror the bash `[process-pr]` prefix so the master log carries
+			// the same shape. `Mlog` handles timestamp + newline.
+			opts.Run.Mlog("[process-pr] PR #%d: "+format, args...)
+		}
 	}
 	setStep := func(step progress.Step, status progress.Status, note string) {
 		if opts.Tracker != nil {
@@ -350,7 +356,12 @@ func ProcessPR(opts Options) Result {
 	}
 
 	// ── 14. Fix model ─────────────────────────────────────────────────────
-	if gateOut.NeedsAdvancedModel && !opts.DryRun {
+	// Run the fix model when EITHER the gate flag is set OR the gate returned
+	// a non-empty ThreadsToFix list. Some models respond with flag=false +
+	// non-empty list (contradictory but common); honoring the list prevents
+	// those threads from being silently dropped as "no code change needed".
+	shouldFix := gateOut.NeedsAdvancedModel || len(gateOut.ThreadsToFix) > 0
+	if shouldFix && !opts.DryRun {
 		// If gate didn't nominate a list, send all active needs_llm threads.
 		if len(selected) == 0 && len(activeNeedsLLM) > 0 {
 			for _, c := range activeNeedsLLM {
@@ -371,7 +382,7 @@ func ProcessPR(opts Options) Result {
 		if fixResponses, rerr := readThreadResponses(wtPath); rerr == nil {
 			responses = append(responses, fixResponses...)
 		}
-	} else if gateCtx.ShouldRunGate && !gateOut.NeedsAdvancedModel {
+	} else if gateCtx.ShouldRunGate && !shouldFix {
 		setStep(progress.StepFix, progress.Skipped, "gate said not needed")
 		// Gate ran and said "not needed" — generate already-fixed responses so
 		// needs_llm threads still get resolved. Mirrors Bash gate-skipped path.
@@ -655,9 +666,10 @@ func buildGatePrompt(
 
 	sb.WriteString("\n### Output Instructions\n")
 	sb.WriteString("Return a JSON object with:\n")
-	sb.WriteString("- `needs_advanced_model` (boolean): true if advanced model should fix threads\n")
+	sb.WriteString("- `needs_advanced_model` (boolean): set true if ANY thread needs a code change\n")
 	sb.WriteString("- `reason` (string): brief explanation\n")
-	sb.WriteString("- `threads_to_fix` (array of thread IDs): which threads need fixing\n")
+	sb.WriteString("- `threads_to_fix` (array of thread IDs): IDs that require code changes.\n")
+	sb.WriteString("  If this array is non-empty you MUST set `needs_advanced_model` to true.\n")
 
 	return sb.String()
 }

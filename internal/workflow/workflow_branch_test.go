@@ -15,6 +15,7 @@ import (
 	"github.com/maszynka/gh-crfix/internal/config"
 	"github.com/maszynka/gh-crfix/internal/gate"
 	ghapi "github.com/maszynka/gh-crfix/internal/github"
+	"github.com/maszynka/gh-crfix/internal/logs"
 	"github.com/maszynka/gh-crfix/internal/progress"
 )
 
@@ -1188,6 +1189,133 @@ func TestProcessPR_ReplyResolveErrors(t *testing.T) {
 	}
 }
 
+// --- 34. Gate returns contradictory signal (flag=false + ThreadsToFix non-empty) --
+//
+// Some models respond with `needs_advanced_model=false` + a non-empty
+// `threads_to_fix`. Treat this as "fix these threads" — do not drop them on
+// the floor as "no code change needed".
+
+func TestProcessPR_GateFlagFalseButThreadsToFixNonEmpty(t *testing.T) {
+	installSeams(t)
+
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
+		t.Fatalf("write a.go: %v", err)
+	}
+	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+
+	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+		return []ghapi.Thread{{
+			ID: "t1", Path: "a.go", Line: 1,
+			Comments: []ghapi.Comment{{Author: "alice", Body: "needs semantic review"}},
+		}, {
+			ID: "t2", Path: "a.go", Line: 2,
+			Comments: []ghapi.Comment{{Author: "bob", Body: "also needs review"}},
+		}}, nil
+	}
+
+	runGateFn = func(ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
+		// The contradictory shape: flag says "no", but caller still lists 2 IDs.
+		return ai.GateOutput{
+			NeedsAdvancedModel: false,
+			Reason:             "simple fixes",
+			ThreadsToFix:       []string{"t1", "t2"},
+		}, nil
+	}
+
+	fixCalled := int32(0)
+	var fixedIDs []string
+	runFixFn = func(_ ai.Backend, _ string, prompt, _ string) error {
+		atomic.AddInt32(&fixCalled, 1)
+		// Record which IDs the prompt targets so the assertion can compare.
+		for _, id := range []string{"t1", "t2"} {
+			if strings.Contains(prompt, id) {
+				fixedIDs = append(fixedIDs, id)
+			}
+		}
+		return nil
+	}
+
+	opts := branchBaseOpts(t)
+	opts.Weights = gate.ScoreWeights{NeedsLLM: 1.0}
+
+	res := ProcessPR(opts)
+	if res.Status != "ok" {
+		t.Fatalf("status=%q want ok (reason=%q)", res.Status, res.Reason)
+	}
+	if atomic.LoadInt32(&fixCalled) != 1 {
+		t.Fatalf("fix model must run when ThreadsToFix non-empty regardless of flag; got calls=%d", fixCalled)
+	}
+	if len(fixedIDs) != 2 {
+		t.Fatalf("fix prompt should target both thread IDs; got %v", fixedIDs)
+	}
+	if !res.FixModelRan {
+		t.Fatal("result.FixModelRan should be true")
+	}
+}
+
+// --- 35. Master log captures process-phase entries --------------------------
+//
+// The per-PR `log()` closure in ProcessPR used to only write to stdout, leaving
+// $LOG_DIR/run.log missing the process-phase narrative (the bash `[process-pr]`
+// lines that the e2e harness greps for). Assert that when opts.Run is set, the
+// master log is populated.
+
+func TestProcessPR_MasterLogCapturesProcessPhase(t *testing.T) {
+	installSeams(t)
+
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
+		t.Fatalf("write a.go: %v", err)
+	}
+	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+
+	// One thread that flows all the way through.
+	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+		return []ghapi.Thread{{
+			ID: "t1", Path: "a.go", Line: 1,
+			Comments: []ghapi.Comment{{Author: "alice", Body: "needs semantic review"}},
+		}}, nil
+	}
+	runGateFn = func(ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
+		return ai.GateOutput{NeedsAdvancedModel: true, ThreadsToFix: []string{"t1"}}, nil
+	}
+
+	// Stand up a real logs.Run in a temp $HOME so the symlink/mkdir succeed.
+	t.Setenv("HOME", t.TempDir())
+	run, err := newTestRun(t)
+	if err != nil {
+		t.Fatalf("newTestRun: %v", err)
+	}
+	t.Cleanup(func() { _ = run.Close() })
+
+	opts := branchBaseOpts(t)
+	opts.Run = run
+	opts.Weights = gate.ScoreWeights{NeedsLLM: 1.0}
+
+	res := ProcessPR(opts)
+	if res.Status != "ok" {
+		t.Fatalf("status=%q want ok (reason=%q)", res.Status, res.Reason)
+	}
+
+	master, err := os.ReadFile(run.MasterLog())
+	if err != nil {
+		t.Fatalf("read master log: %v", err)
+	}
+	body := string(master)
+	for _, want := range []string{
+		"[process-pr]",
+		"fetching PR metadata",
+		"fetching review threads",
+		"running gate model",
+		"running fix model",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("master log missing %q; body=%s", want, body)
+		}
+	}
+}
+
 // --- Helpers ------------------------------------------------------------------
 
 // contains is a tiny wrapper that lets us keep the substring checks readable.
@@ -1198,5 +1326,12 @@ func contains(s, sub string) bool { return strings.Contains(s, sub) }
 func gitCmdInDir(dir string, args ...string) *exec.Cmd {
 	full := append([]string{"-C", dir}, args...)
 	return exec.Command("git", full...)
+}
+
+// newTestRun creates a fresh logs.Run rooted at a temp HOME. The caller is
+// responsible for closing it via t.Cleanup.
+func newTestRun(t *testing.T) (*logs.Run, error) {
+	t.Helper()
+	return logs.NewRun()
 }
 
