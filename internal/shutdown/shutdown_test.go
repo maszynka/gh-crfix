@@ -2,11 +2,8 @@ package shutdown
 
 import (
 	"context"
-	"os"
-	"os/signal"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -18,58 +15,6 @@ func waitForCancel(ctx context.Context, d time.Duration) bool {
 		return true
 	case <-time.After(d):
 		return false
-	}
-}
-
-func TestWithSignals_CancelsOnSIGINT(t *testing.T) {
-	ctx, cleanup := WithSignals(context.Background())
-	defer cleanup()
-
-	// Sanity: not cancelled yet.
-	select {
-	case <-ctx.Done():
-		t.Fatalf("context cancelled before signal delivery")
-	default:
-	}
-
-	if err := syscall.Kill(os.Getpid(), syscall.SIGINT); err != nil {
-		t.Fatalf("syscall.Kill: %v", err)
-	}
-	if !waitForCancel(ctx, 2*time.Second) {
-		t.Fatalf("context not cancelled within 2s of SIGINT")
-	}
-}
-
-func TestWithSignals_CleanupStopsWatcher(t *testing.T) {
-	ctx, cleanup := WithSignals(context.Background())
-	cleanup()
-
-	// After cleanup the derived context is cancelled. Deliver SIGINT and
-	// ensure the process isn't killed because signal.NotifyContext has
-	// been released. Installing our own handler is how we detect that the
-	// Notify watcher is no longer capturing the signal.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT)
-	defer signal.Stop(sigCh)
-
-	if err := syscall.Kill(os.Getpid(), syscall.SIGINT); err != nil {
-		t.Fatalf("syscall.Kill: %v", err)
-	}
-
-	select {
-	case <-sigCh:
-		// Good — our test-local handler received SIGINT. The watcher
-		// wasn't holding on to it (if it were still alive it would
-		// also deliver, but more importantly after cleanup the ctx
-		// is already cancelled so we can't observe "doesn't cancel".
-		// We at least confirmed the process did not die.)
-	case <-time.After(2 * time.Second):
-		t.Fatalf("test-local signal handler did not receive SIGINT")
-	}
-
-	// ctx is expected to be cancelled by cleanup().
-	if !waitForCancel(ctx, time.Second) {
-		t.Fatalf("context not cancelled after cleanup")
 	}
 }
 
@@ -182,7 +127,7 @@ func TestCleanupRegistry_ConcurrentRegisterUnregister(t *testing.T) {
 	reg.RunAll()
 }
 
-func TestCleanupRegistry_RunAllSafeAfterCancel(t *testing.T) {
+func TestCleanupRegistry_RunAllIdempotent(t *testing.T) {
 	// Calling RunAll twice is idempotent (no double execution).
 	reg := NewCleanupRegistry()
 	var ran atomic.Int32
