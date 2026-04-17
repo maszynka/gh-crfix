@@ -266,7 +266,7 @@ func TestDetect_HookOverrideAbsolutePath_StaysAbsolute(t *testing.T) {
 
 func TestRun_NoneReturnsUnavailable(t *testing.T) {
 	wt := t.TempDir()
-	res := Run(wt, Runner{Kind: RunnerNone})
+	res := Run(nil, wt, Runner{Kind: RunnerNone}, nil)
 	if res.Available {
 		t.Fatalf("expected Available=false, got %+v", res)
 	}
@@ -278,7 +278,7 @@ func TestRun_HookSuccess(t *testing.T) {
 	hook := filepath.Join(wt, ".gh-crfix", "validate.sh")
 	writeExec(t, hook, "#!/bin/sh\necho all good\nexit 0\n")
 
-	res := Run(wt, Runner{Kind: RunnerHook, Command: hook})
+	res := Run(nil, wt, Runner{Kind: RunnerHook, Command: hook}, nil)
 	if !res.Available || !res.Ran {
 		t.Fatalf("expected available+ran, got %+v", res)
 	}
@@ -299,7 +299,7 @@ func TestRun_HookFailure(t *testing.T) {
 	hook := filepath.Join(wt, ".gh-crfix", "validate.sh")
 	writeExec(t, hook, "#!/bin/sh\necho tests broke\nexit 1\n")
 
-	res := Run(wt, Runner{Kind: RunnerHook, Command: hook})
+	res := Run(nil, wt, Runner{Kind: RunnerHook, Command: hook}, nil)
 	if !res.Available || !res.Ran {
 		t.Fatalf("expected available+ran, got %+v", res)
 	}
@@ -324,7 +324,7 @@ func TestRun_Builtin_FakeNpmOnPath(t *testing.T) {
 		"#!/bin/sh\necho fake-npm \"$@\"\nexit 0\n")
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	res := Run(wt, Runner{Kind: RunnerBuiltin, Command: "npm test"})
+	res := Run(nil, wt, Runner{Kind: RunnerBuiltin, Command: "npm test"}, nil)
 	if !res.Available || !res.Ran {
 		t.Fatalf("expected available+ran, got %+v", res)
 	}
@@ -343,7 +343,7 @@ func TestRun_OutputTruncatedAt2000(t *testing.T) {
 	// Produce > 2000 chars of output.
 	writeExec(t, hook, "#!/bin/sh\nawk 'BEGIN{for(i=0;i<3000;i++)printf \"x\"}'\nexit 0\n")
 
-	res := Run(wt, Runner{Kind: RunnerHook, Command: hook})
+	res := Run(nil, wt, Runner{Kind: RunnerHook, Command: hook}, nil)
 	if !res.Success {
 		t.Fatalf("expected success, got %+v", res)
 	}
@@ -388,7 +388,7 @@ func TestRun_HookJSONSupersedesStdout(t *testing.T) {
 		"exit 0\n"
 	writeExec(t, hook, script)
 
-	res := Run(wt, Runner{Kind: RunnerHook, Command: hook})
+	res := Run(nil, wt, Runner{Kind: RunnerHook, Command: hook}, nil)
 	if res.Summary != "from-json-file" {
 		t.Fatalf("expected JSON summary, got %q (full=%+v)", res.Summary, res)
 	}
@@ -410,7 +410,7 @@ func TestRun_HookJSONInvalid_FallsBackToStdout(t *testing.T) {
 		"exit 0\n"
 	writeExec(t, hook, script)
 
-	res := Run(wt, Runner{Kind: RunnerHook, Command: hook})
+	res := Run(nil, wt, Runner{Kind: RunnerHook, Command: hook}, nil)
 	if !strings.Contains(res.Summary, "stdout-wins") {
 		t.Fatalf("expected stdout fallback, got %q", res.Summary)
 	}

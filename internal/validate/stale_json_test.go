@@ -36,7 +36,7 @@ func TestRun_HookDoesNotWriteJSON_StaleFileIsDiscarded(t *testing.T) {
 	hook := filepath.Join(wt, ".gh-crfix", "validate.sh")
 	writeExec(t, hook, "#!/bin/sh\necho fresh-success\nexit 0\n")
 
-	res := Run(wt, Runner{Kind: RunnerHook, Command: hook})
+	res := Run(nil, wt, Runner{Kind: RunnerHook, Command: hook}, nil)
 
 	if res.Summary == "stale-data-from-previous-run" {
 		t.Fatalf("Run returned stale JSON contents; want fresh stdout-based Result. Got: %+v", res)
@@ -75,7 +75,7 @@ func TestRun_HookWritesFreshJSONOverwritingStale(t *testing.T) {
 		"exit 0\n"
 	writeExec(t, hook, script)
 
-	res := Run(wt, Runner{Kind: RunnerHook, Command: hook})
+	res := Run(nil, wt, Runner{Kind: RunnerHook, Command: hook}, nil)
 	if res.Summary != "NEW" {
 		t.Fatalf("expected summary=NEW, got %q", res.Summary)
 	}

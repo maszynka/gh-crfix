@@ -2,13 +2,23 @@
 package validate
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
+
+// defaultValidateTimeout bounds the validation runner so a hung `bun test`,
+// `pnpm test`, or custom hook doesn't stall the whole pipeline. Override via
+// env `GH_CRFIX_VALIDATE_TIMEOUT` (Go duration, e.g. "30m").
+const defaultValidateTimeout = 15 * time.Minute
 
 // RunnerKind identifies what kind of runner is available.
 type RunnerKind int
@@ -72,9 +82,31 @@ func Detect(worktreePath, hookOverride string) Runner {
 }
 
 // Run executes the validation runner inside worktreePath and returns the result.
-func Run(worktreePath string, r Runner) Result {
+//
+// ctx is honored for cancellation/deadline. A default 15-minute budget is
+// applied if ctx has no earlier deadline; override via env
+// `GH_CRFIX_VALIDATE_TIMEOUT`.
+//
+// stream (optional, may be nil) receives the runner's combined stdout/stderr
+// line by line as it's produced — this is what the caller uses to keep the
+// terminal alive during long test suites. The full output is still collected
+// and returned in Result.Summary (truncated at 2000 chars).
+func Run(ctx context.Context, worktreePath string, r Runner, stream io.Writer) Result {
 	if r.Kind == RunnerNone {
 		return Result{Available: false}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// Apply the default timeout if the caller didn't supply a stricter one.
+	timeout := envDuration("GH_CRFIX_VALIDATE_TIMEOUT", defaultValidateTimeout)
+	if timeout > 0 {
+		if existing, ok := ctx.Deadline(); !ok || time.Until(existing) > timeout {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
 	}
 
 	var cmd *exec.Cmd
@@ -84,21 +116,35 @@ func Run(worktreePath string, r Runner) Result {
 		// Ensure we never read a stale JSON result from a previous run —
 		// preserved worktrees would otherwise short-circuit to the old data.
 		_ = os.Remove(jsonOut)
-		cmd = exec.Command(r.Command)
+		cmd = exec.CommandContext(ctx, r.Command)
 		cmd.Env = append(os.Environ(),
 			"GH_CRFIX_VALIDATION_OUT="+jsonOut,
 		)
 	case RunnerBuiltin:
 		parts := strings.Fields(r.Command)
-		cmd = exec.Command(parts[0], parts[1:]...)
+		cmd = exec.CommandContext(ctx, parts[0], parts[1:]...)
 	}
 	cmd.Dir = worktreePath
 
-	out, err := cmd.CombinedOutput()
+	// Stream stdout+stderr line-by-line while collecting the full output for
+	// the Summary. If stream is nil, we still collect but don't mirror.
+	var collected bytes.Buffer
+	var writer io.Writer = &collected
+	if stream != nil {
+		writer = io.MultiWriter(&collected, stream)
+	}
+	cmd.Stdout = writer
+	cmd.Stderr = writer
+
+	err := cmd.Run()
 	success := err == nil
-	summary := strings.TrimSpace(string(out))
+	summary := strings.TrimSpace(collected.String())
 	if len(summary) > 2000 {
 		summary = summary[:2000] + "\n...(truncated)"
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		summary = fmt.Sprintf("validation timed out after %s (set GH_CRFIX_VALIDATE_TIMEOUT to override)\n%s",
+			timeout, summary)
 	}
 
 	// Hook may write a JSON file with structured results.
@@ -115,6 +161,19 @@ func Run(worktreePath string, r Runner) Result {
 		TestsFailed: !success,
 		Summary:     summary,
 	}
+}
+
+// envDuration reads a Go duration from env, returns fallback on empty/invalid.
+func envDuration(key string, fallback time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return fallback
+	}
+	return d
 }
 
 func readHookJSON(path string) (Result, bool) {

@@ -326,7 +326,15 @@ func ProcessPR(ctx context.Context, opts Options) Result {
 		if runner.Kind != validate.RunnerNone {
 			log("running validation (%s)...", runner.Command)
 			setStep(progress.StepValidate, progress.Running, runner.Command)
-			validResult = validate.Run(wtPath, runner)
+			// Prefix every streamed line so users don't confuse test runner
+			// output with gh-crfix's own progress. stream falls through to
+			// stderr when a dashboard is active (opts.ProgressOut routes the
+			// same way).
+			stream := opts.ProgressOut
+			if stream == nil {
+				stream = out
+			}
+			validResult = validate.Run(ctx, wtPath, runner, prefixWriter(stream, "    "))
 			if validResult.TestsFailed {
 				log("validation: FAILED — %s", firstLine(validResult.Summary))
 				setStep(progress.StepValidate, progress.Failed, firstLine(validResult.Summary))
@@ -875,4 +883,44 @@ func firstLine(s string) string {
 		return s[:i]
 	}
 	return s
+}
+
+// prefixWriter wraps w so that every newline-terminated line written to the
+// returned writer is prefixed with prefix. This is how validation output gets
+// indented under the per-PR log when streamed live. A trailing partial line
+// (no newline) is buffered until the next write completes it — safe enough
+// since cmd output from bun/npm tests always ends with a final newline.
+func prefixWriter(w io.Writer, prefix string) io.Writer {
+	return &prefixWriterImpl{w: w, prefix: []byte(prefix), atLineStart: true}
+}
+
+type prefixWriterImpl struct {
+	w           io.Writer
+	prefix      []byte
+	atLineStart bool
+}
+
+func (p *prefixWriterImpl) Write(data []byte) (int, error) {
+	written := 0
+	for i, b := range data {
+		if p.atLineStart {
+			if _, err := p.w.Write(p.prefix); err != nil {
+				return written, err
+			}
+			p.atLineStart = false
+		}
+		if b == '\n' {
+			if _, err := p.w.Write(data[written : i+1]); err != nil {
+				return written, err
+			}
+			written = i + 1
+			p.atLineStart = true
+		}
+	}
+	if written < len(data) {
+		if _, err := p.w.Write(data[written:]); err != nil {
+			return written, err
+		}
+	}
+	return len(data), nil
 }
