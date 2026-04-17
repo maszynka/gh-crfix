@@ -612,22 +612,76 @@ func maxInt(a, b int) int {
 // tailFile returns the last n lines of path. Missing or unreadable files
 // yield an empty slice — never an error — because the dashboard must
 // keep rendering even while pipeline workers are still spinning up.
+//
+// Implementation note: this is called every refresh tick (≈250ms) on the
+// master log file, which grows throughout a batch run. Slurping the full
+// file (os.ReadFile + strings.Split) gets quadratic in total work as the
+// file grows to 10s of MB — so we seek from EOF and read chunks backwards
+// until we have n newlines or we hit the start of file. Memory use is
+// bounded by (n + 1) * max-line-length + one chunk.
 func tailFile(path string, n int) []string {
-	data, err := os.ReadFile(path)
+	if n <= 0 {
+		return nil
+	}
+	f, err := os.Open(path)
 	if err != nil {
 		return nil
 	}
-	lines := strings.Split(string(data), "\n")
-	// strings.Split leaves a trailing empty element when the file ends
-	// in \n; drop it so the tail contains only real log lines.
-	if len(lines) > 0 && lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1]
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return nil
 	}
+	size := fi.Size()
+	if size == 0 {
+		return nil
+	}
+
+	// Read chunks of this size from the end, doubling if a single chunk
+	// doesn't yield enough newlines. 8KB is comfortable for the typical
+	// master-log line widths we see in practice.
+	const chunkSize int64 = 8 * 1024
+	var (
+		buf      []byte
+		pos      = size
+		newlines = 0
+	)
+	for pos > 0 {
+		read := chunkSize
+		if pos < read {
+			read = pos
+		}
+		pos -= read
+		chunk := make([]byte, read)
+		if _, err := f.ReadAt(chunk, pos); err != nil {
+			return nil
+		}
+		// Prepend chunk to buf (we're walking backwards).
+		buf = append(chunk, buf...)
+		newlines = 0
+		for _, b := range buf {
+			if b == '\n' {
+				newlines++
+			}
+		}
+		// We need n newlines AND one extra to guarantee the first full line
+		// isn't truncated. If the file is smaller than our window we just
+		// stop when pos hits 0.
+		if newlines > n {
+			break
+		}
+	}
+
+	// Drop a trailing newline (file ends in \n) so Split doesn't add an
+	// empty element.
+	if len(buf) > 0 && buf[len(buf)-1] == '\n' {
+		buf = buf[:len(buf)-1]
+	}
+	lines := strings.Split(string(buf), "\n")
 	if len(lines) > n {
 		lines = lines[len(lines)-n:]
 	}
-	// Stable order: already chronological from file; make a copy so the
-	// caller can't mutate our backing slice.
 	out := make([]string, len(lines))
 	copy(out, lines)
 	return out
