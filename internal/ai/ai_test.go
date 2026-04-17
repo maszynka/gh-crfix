@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -117,7 +118,7 @@ cat <<'JSON'
 {"needs_advanced_model": true, "reason": "complex refactor", "threads_to_fix": ["T1","T2"]}
 JSON
 `)
-	out, err := RunGate(BackendClaude, "sonnet", "prompt body", map[string]interface{}{"type": "object"})
+	out, err := RunGate(context.Background(), BackendClaude, "sonnet", "prompt body", map[string]interface{}{"type": "object"})
 	if err != nil {
 		t.Fatalf("RunGate: %v", err)
 	}
@@ -134,7 +135,7 @@ cat <<'JSON'
 {"structured_output": {"needs_advanced_model": false, "reason": "simple", "threads_to_fix": []}}
 JSON
 `)
-	out, err := RunGate(BackendClaude, "sonnet", "p", map[string]interface{}{})
+	out, err := RunGate(context.Background(), BackendClaude, "sonnet", "p", map[string]interface{}{})
 	if err != nil {
 		t.Fatalf("RunGate: %v", err)
 	}
@@ -148,7 +149,7 @@ func TestRunGate_Claude_Malformed(t *testing.T) {
 	writeScript(t, dir, "claude", `#!/bin/sh
 printf 'not valid json at all'
 `)
-	_, err := RunGate(BackendClaude, "sonnet", "p", map[string]interface{}{})
+	_, err := RunGate(context.Background(), BackendClaude, "sonnet", "p", map[string]interface{}{})
 	if err == nil {
 		t.Fatal("expected error on malformed JSON")
 	}
@@ -163,7 +164,7 @@ func TestRunGate_Claude_NonZeroExit(t *testing.T) {
 echo "boom on stderr" 1>&2
 exit 3
 `)
-	_, err := RunGate(BackendClaude, "sonnet", "p", map[string]interface{}{})
+	_, err := RunGate(context.Background(), BackendClaude, "sonnet", "p", map[string]interface{}{})
 	if err == nil {
 		t.Fatal("expected error on non-zero exit")
 	}
@@ -196,7 +197,7 @@ JSON
 fi
 exit 0
 `)
-	out, err := RunGate(BackendCodex, "gpt", "p", map[string]interface{}{})
+	out, err := RunGate(context.Background(), BackendCodex, "gpt", "p", map[string]interface{}{})
 	if err != nil {
 		t.Fatalf("RunGate codex: %v", err)
 	}
@@ -209,7 +210,7 @@ exit 0
 func TestRunGate_NoBackendAvailable(t *testing.T) {
 	// Exclusive PATH with no claude/codex and use Auto -> Detect returns Auto -> error.
 	exclusivePATH(t)
-	_, err := RunGate(BackendAuto, "m", "p", map[string]interface{}{})
+	_, err := RunGate(context.Background(), BackendAuto, "m", "p", map[string]interface{}{})
 	if err == nil {
 		t.Fatal("expected no-backend error")
 	}
@@ -223,7 +224,7 @@ func TestRunFix_Claude_Happy(t *testing.T) {
 	writeScript(t, dir, "claude", `#!/bin/sh
 exit 0
 `)
-	if err := RunFix(BackendClaude, "sonnet", "prompt", t.TempDir()); err != nil {
+	if err := RunFix(context.Background(), BackendClaude, "sonnet", "prompt", t.TempDir()); err != nil {
 		t.Fatalf("RunFix: %v", err)
 	}
 }
@@ -233,7 +234,7 @@ func TestRunFix_Claude_NonZeroExit(t *testing.T) {
 	writeScript(t, dir, "claude", `#!/bin/sh
 exit 2
 `)
-	if err := RunFix(BackendClaude, "sonnet", "prompt", t.TempDir()); err == nil {
+	if err := RunFix(context.Background(), BackendClaude, "sonnet", "prompt", t.TempDir()); err == nil {
 		t.Fatal("expected non-nil error on non-zero exit")
 	}
 }
@@ -246,7 +247,7 @@ echo "hello" > marker.txt
 exit 0
 `)
 	workDir := t.TempDir()
-	if err := RunFix(BackendClaude, "sonnet", "prompt", workDir); err != nil {
+	if err := RunFix(context.Background(), BackendClaude, "sonnet", "prompt", workDir); err != nil {
 		t.Fatalf("RunFix: %v", err)
 	}
 	p := filepath.Join(workDir, "marker.txt")
@@ -264,14 +265,14 @@ func TestRunFix_Codex_Happy(t *testing.T) {
 	writeScript(t, dir, "codex", `#!/bin/sh
 exit 0
 `)
-	if err := RunFix(BackendCodex, "gpt", "p", t.TempDir()); err != nil {
+	if err := RunFix(context.Background(), BackendCodex, "gpt", "p", t.TempDir()); err != nil {
 		t.Fatalf("RunFix codex: %v", err)
 	}
 }
 
 func TestRunFix_NoBackendAvailable(t *testing.T) {
 	exclusivePATH(t)
-	err := RunFix(BackendAuto, "m", "p", t.TempDir())
+	err := RunFix(context.Background(), BackendAuto, "m", "p", t.TempDir())
 	if err == nil {
 		t.Fatal("expected no-backend error")
 	}
@@ -285,7 +286,7 @@ func TestRunPlain_DelegatesToRunFix(t *testing.T) {
 	writeScript(t, dir, "claude", `#!/bin/sh
 exit 0
 `)
-	if err := RunPlain(BackendClaude, "m", "p", t.TempDir()); err != nil {
+	if err := RunPlain(context.Background(), BackendClaude, "m", "p", t.TempDir()); err != nil {
 		t.Fatalf("RunPlain: %v", err)
 	}
 }

@@ -2,12 +2,19 @@
 package github
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
+	"time"
 )
+
+// defaultGHTimeout bounds every gh CLI invocation so a hung network/API
+// call doesn't block the pipeline. Overridable via GH_CRFIX_GH_TIMEOUT.
+const defaultGHTimeout = 2 * time.Minute
 
 // PRInfo is basic metadata about a pull request.
 type PRInfo struct {
@@ -47,8 +54,8 @@ type CICheck struct {
 }
 
 // FetchPR returns basic info about a pull request.
-func FetchPR(repo string, prNum int) (PRInfo, error) {
-	out, err := gh("pr", "view", fmt.Sprintf("%d", prNum), "--repo", repo,
+func FetchPR(ctx context.Context, repo string, prNum int) (PRInfo, error) {
+	out, err := gh(ctx, "pr", "view", fmt.Sprintf("%d", prNum), "--repo", repo,
 		"--json", "headRefName,baseRefName,title,state,isDraft,headRefOid")
 	if err != nil {
 		return PRInfo{}, err
@@ -75,7 +82,7 @@ func FetchPR(repo string, prNum int) (PRInfo, error) {
 }
 
 // FetchThreads returns unresolved review threads for a PR.
-func FetchThreads(repo string, prNum, maxThreads int) ([]Thread, error) {
+func FetchThreads(ctx context.Context, repo string, prNum, maxThreads int) ([]Thread, error) {
 	parts := strings.SplitN(repo, "/", 2)
 	if len(parts) != 2 {
 		return nil, fmt.Errorf("invalid repo %q", repo)
@@ -101,7 +108,7 @@ func FetchThreads(repo string, prNum, maxThreads int) ([]Thread, error) {
   }
 }`
 
-	out, err := gh("api", "graphql",
+	out, err := gh(ctx, "api", "graphql",
 		"-f", "query="+query,
 		"-F", "owner="+owner,
 		"-F", "repo="+repoName,
@@ -174,13 +181,13 @@ func FetchThreads(repo string, prNum, maxThreads int) ([]Thread, error) {
 }
 
 // ReplyToThread posts a reply on the given review thread.
-func ReplyToThread(threadID, body string) error {
+func ReplyToThread(ctx context.Context, threadID, body string) error {
 	const query = `mutation($threadId: ID!, $body: String!) {
   addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $threadId, body: $body}) {
     comment { id }
   }
 }`
-	_, err := gh("api", "graphql",
+	_, err := gh(ctx, "api", "graphql",
 		"-f", "query="+query,
 		"-f", "threadId="+threadID,
 		"-f", "body="+body,
@@ -189,13 +196,13 @@ func ReplyToThread(threadID, body string) error {
 }
 
 // ResolveThread marks a review thread as resolved.
-func ResolveThread(threadID string) error {
+func ResolveThread(ctx context.Context, threadID string) error {
 	const query = `mutation($threadId: ID!) {
   resolveReviewThread(input: {threadId: $threadId}) {
     thread { id }
   }
 }`
-	_, err := gh("api", "graphql",
+	_, err := gh(ctx, "api", "graphql",
 		"-f", "query="+query,
 		"-f", "threadId="+threadID,
 	)
@@ -203,14 +210,14 @@ func ResolveThread(threadID string) error {
 }
 
 // PostComment posts a comment on the PR.
-func PostComment(repo string, prNum int, body string) error {
-	_, err := gh("pr", "comment", fmt.Sprintf("%d", prNum), "--repo", repo, "--body", body)
+func PostComment(ctx context.Context, repo string, prNum int, body string) error {
+	_, err := gh(ctx, "pr", "comment", fmt.Sprintf("%d", prNum), "--repo", repo, "--body", body)
 	return err
 }
 
 // RequestCopilotReview requests a Copilot re-review.
-func RequestCopilotReview(repo string, prNum int) error {
-	_, err := gh("api", "--method", "POST",
+func RequestCopilotReview(ctx context.Context, repo string, prNum int) error {
+	_, err := gh(ctx, "api", "--method", "POST",
 		fmt.Sprintf("/repos/%s/pulls/%d/requested_reviewers", repo, prNum),
 		"-f", "reviewers[]=Copilot",
 	)
@@ -220,8 +227,8 @@ func RequestCopilotReview(repo string, prNum int) error {
 var runIDRe = regexp.MustCompile(`/runs/([0-9]+)`)
 
 // FetchFailingChecks returns failing CI checks with log snippets.
-func FetchFailingChecks(repo, headSHA string) ([]CICheck, error) {
-	out, err := gh("api",
+func FetchFailingChecks(ctx context.Context, repo, headSHA string) ([]CICheck, error) {
+	out, err := gh(ctx, "api",
 		fmt.Sprintf("repos/%s/commits/%s/check-runs", repo, headSHA),
 		"--paginate",
 		"--jq", `.check_runs[] | select(.conclusion == "failure") | {name, details_url}`,
@@ -244,7 +251,7 @@ func FetchFailingChecks(repo, headSHA string) ([]CICheck, error) {
 		if err := json.Unmarshal([]byte(line), &item); err != nil {
 			continue
 		}
-		logText := fetchRunLog(repo, item.DetailsURL)
+		logText := fetchRunLog(ctx, repo, item.DetailsURL)
 		checks = append(checks, CICheck{
 			Name:    item.Name,
 			LogText: logText,
@@ -253,12 +260,12 @@ func FetchFailingChecks(repo, headSHA string) ([]CICheck, error) {
 	return checks, nil
 }
 
-func fetchRunLog(repo, detailsURL string) string {
+func fetchRunLog(ctx context.Context, repo, detailsURL string) string {
 	m := runIDRe.FindStringSubmatch(detailsURL)
 	if len(m) < 2 {
 		return ""
 	}
-	out, err := exec.Command("gh", "run", "view", m[1], "--repo", repo, "--log-failed").Output()
+	out, err := gh(ctx, "run", "view", m[1], "--repo", repo, "--log-failed")
 	if err != nil {
 		return ""
 	}
@@ -269,16 +276,42 @@ func fetchRunLog(repo, detailsURL string) string {
 	return strings.Join(lines, "\n")
 }
 
-// gh runs the gh CLI and returns stdout.
-func gh(args ...string) ([]byte, error) {
-	out, err := exec.Command("gh", args...).Output()
+// gh runs the gh CLI and returns stdout. Every invocation is bounded by
+// GH_CRFIX_GH_TIMEOUT (default 2 minutes) so a hung network call cannot
+// stall the whole pipeline.
+func gh(ctx context.Context, args ...string) ([]byte, error) {
+	ctx, cancel := withGHTimeout(ctx)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "gh", args...)
+	out, err := cmd.Output()
 	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("gh %s: %w\n%s", strings.Join(args[:min(3, len(args))], " "), err, ee.Stderr)
+		preview := strings.Join(args[:min(3, len(args))], " ")
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, fmt.Errorf("gh %s: %w", preview, cerr)
 		}
-		return nil, fmt.Errorf("gh %s: %w", strings.Join(args[:min(3, len(args))], " "), err)
+		if ee, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("gh %s: %w\n%s", preview, err, ee.Stderr)
+		}
+		return nil, fmt.Errorf("gh %s: %w", preview, err)
 	}
 	return out, nil
+}
+
+func withGHTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	d := defaultGHTimeout
+	if v := os.Getenv("GH_CRFIX_GH_TIMEOUT"); v != "" {
+		if parsed, err := time.ParseDuration(v); err == nil && parsed > 0 {
+			d = parsed
+		}
+	}
+	if d <= 0 {
+		return context.WithCancel(ctx)
+	}
+	if existing, ok := ctx.Deadline(); ok && time.Until(existing) <= d {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, d)
 }
 
 func min(a, b int) int {

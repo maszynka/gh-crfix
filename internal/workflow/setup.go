@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -13,6 +14,18 @@ import (
 // SetupMaxConcurrency caps the number of PRs that can run their setup phase
 // in parallel, mirroring the bash SETUP_MAX_CONCURRENCY=8 constant.
 const SetupMaxConcurrency = 8
+
+// splitOwnerRepo splits "owner/name" into (owner, name). Unexpected shapes
+// return the input as owner with an empty repo — callers that use this for
+// MatchesRepo treat that as a non-match safely.
+func splitOwnerRepo(repo string) (string, string) {
+	for i := 0; i < len(repo); i++ {
+		if repo[i] == '/' {
+			return repo[:i], repo[i+1:]
+		}
+	}
+	return repo, ""
+}
 
 // PreparedPR is one PR after the setup phase. Status is one of
 // "ready" | "skipped" | "failed".
@@ -31,6 +44,15 @@ type PreparedPR struct {
 
 // --- Small interfaces used by setupOnePR so tests can fake I/O --------------
 
+// The setup interfaces keep their historical (no-ctx) shapes so existing
+// tests that implement them with fakes (see setup_test.go) don't have to
+// change. The real adapters stamp context.Background() onto every call —
+// the cancellation semantics in the setup phase are already handled by the
+// outer goroutine pool in ProcessBatch, and the blocking work is dominated
+// by local git operations that return quickly on a real disk.
+//
+// If deeper ctx plumbing is needed here in the future, add ctx-bearing
+// overloads and gate the old ones on a transitional adapter.
 type prFetcher interface {
 	FetchPR(repo string, prNum int) (ghapi.PRInfo, error)
 }
@@ -48,39 +70,55 @@ type threadFetcher interface {
 
 // Default production adapters ------------------------------------------------
 
-type realPRFetcher struct{}
+type realPRFetcher struct{ ctx context.Context }
 
-func (realPRFetcher) FetchPR(repo string, prNum int) (ghapi.PRInfo, error) {
-	return ghapi.FetchPR(repo, prNum)
+func (r realPRFetcher) FetchPR(repo string, prNum int) (ghapi.PRInfo, error) {
+	return ghapi.FetchPR(r.pickCtx(), repo, prNum)
 }
 
-type realWorktreeSetup struct{}
-
-func (realWorktreeSetup) Setup(repoRoot, branch string, prNum int) (string, error) {
-	return worktree.Setup(repoRoot, branch, prNum)
+func (r realPRFetcher) pickCtx() context.Context {
+	if r.ctx == nil {
+		return context.Background()
+	}
+	return r.ctx
 }
-func (realWorktreeSetup) DirtyStatus(path string) (string, error) {
+
+type realWorktreeSetup struct{ ctx context.Context }
+
+func (r realWorktreeSetup) Setup(repoRoot, branch string, prNum int) (string, error) {
+	return worktree.Setup(r.pickCtx(), repoRoot, branch, prNum)
+}
+func (r realWorktreeSetup) DirtyStatus(path string) (string, error) {
 	return worktree.DirtyStatus(path)
 }
-func (realWorktreeSetup) DetectCaseCollisions(path string) ([][]string, error) {
+func (r realWorktreeSetup) DetectCaseCollisions(path string) ([][]string, error) {
 	return worktree.DetectCaseCollisions(path)
 }
-func (realWorktreeSetup) RepoRoot(path string) (string, error) {
-	return worktree.RepoRoot(path)
+func (r realWorktreeSetup) RepoRoot(path string) (string, error) {
+	return worktree.RepoRoot(r.pickCtx(), path)
+}
+func (r realWorktreeSetup) pickCtx() context.Context {
+	if r.ctx == nil {
+		return context.Background()
+	}
+	return r.ctx
 }
 
-type realThreadFetcher struct{}
+type realThreadFetcher struct{ ctx context.Context }
 
-func (realThreadFetcher) FetchThreads(repo string, prNum, maxThreads int) ([]ghapi.Thread, error) {
-	return ghapi.FetchThreads(repo, prNum, maxThreads)
+func (r realThreadFetcher) FetchThreads(repo string, prNum, maxThreads int) ([]ghapi.Thread, error) {
+	if r.ctx == nil {
+		return ghapi.FetchThreads(context.Background(), repo, prNum, maxThreads)
+	}
+	return ghapi.FetchThreads(r.ctx, repo, prNum, maxThreads)
 }
 
 // SetupPhase runs per-PR setup in parallel up to `concurrency` (capped by
 // SetupMaxConcurrency). The returned slice preserves input order from
 // opts.PRNums. run and tracker may be nil (tests use that to keep things
 // pure).
-func SetupPhase(opts BatchOptions, run *logs.Run, tracker *progress.Tracker, concurrency int) []PreparedPR {
-	return setupPhaseWith(opts, realPRFetcher{}, realWorktreeSetup{}, realThreadFetcher{}, run, tracker, concurrency)
+func SetupPhase(ctx context.Context, opts BatchOptions, run *logs.Run, tracker *progress.Tracker, concurrency int) []PreparedPR {
+	return setupPhaseWith(opts, realPRFetcher{ctx: ctx}, realWorktreeSetup{ctx: ctx}, realThreadFetcher{ctx: ctx}, run, tracker, concurrency)
 }
 
 // setupPhaseWith is the testable core of SetupPhase.
@@ -201,13 +239,15 @@ func setupOnePR(
 	logMaster("branch=%q base=%q title=%q", info.HeadRefName, info.BaseRefName, info.Title)
 	logPR("branch=%q base=%q title=%q", info.HeadRefName, info.BaseRefName, info.Title)
 
-	// 2. Resolve repo root.
+	// 2. Resolve repo root. A generic "worktree setup failed" here leaves
+	// users guessing — surface the two common root causes explicitly so they
+	// know how to recover.
 	repoRoot := opts.RepoRoot
 	if repoRoot == "" {
 		rr, rerr := wt.RepoRoot(".")
 		if rerr != nil {
 			pr.Status = "failed"
-			pr.Reason = "worktree setup failed"
+			pr.Reason = "not in a git repository — cd into your clone or set GH_CRFIX_DIR=/path/to/clone"
 			logMaster("could not resolve repo root: %v", rerr)
 			logPR("could not resolve repo root: %v", rerr)
 			setStep(progress.Failed, pr.Reason)
@@ -215,6 +255,22 @@ func setupOnePR(
 			return pr
 		}
 		repoRoot = rr
+	}
+
+	// Validate the resolved repo root actually points at the target PR's
+	// repo. A mismatched origin is the other common "worktree setup failed"
+	// root cause — users run gh crfix from a different clone than the PR.
+	owner, repoName := splitOwnerRepo(opts.Repo)
+	if owner != "" && repoName != "" {
+		if ok, mismatchMsg, werr := worktree.MatchesRepo(repoRoot, owner, repoName); werr == nil && !ok {
+			pr.Status = "failed"
+			pr.Reason = mismatchMsg
+			logMaster("origin mismatch: %s", mismatchMsg)
+			logPR("origin mismatch: %s", mismatchMsg)
+			setStep(progress.Failed, pr.Reason)
+			markStatus(false)
+			return pr
+		}
 	}
 
 	// 3. Set up worktree.

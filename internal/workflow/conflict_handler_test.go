@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"sync/atomic"
@@ -16,12 +17,12 @@ func TestFixConflictMarkers_Clean(t *testing.T) {
 
 	var plainCalls int32
 	detectMarkersFn = func(string) ([]string, error) { return nil, nil }
-	runPlainFn = func(ai.Backend, string, string, string) error {
+	runPlainFn = func(context.Context, ai.Backend, string, string, string) error {
 		atomic.AddInt32(&plainCalls, 1)
 		return nil
 	}
 
-	if err := fixConflictMarkers(branchBaseOpts(t), t.TempDir(), noopLog); err != nil {
+	if err := fixConflictMarkers(context.Background(), branchBaseOpts(t), t.TempDir(), noopLog); err != nil {
 		t.Fatalf("want nil err on clean tree; got %v", err)
 	}
 	if atomic.LoadInt32(&plainCalls) != 0 {
@@ -35,14 +36,14 @@ func TestFixConflictMarkers_DryRun(t *testing.T) {
 	installSeams(t)
 
 	detectMarkersFn = func(string) ([]string, error) { return []string{"a.go"}, nil }
-	runPlainFn = func(ai.Backend, string, string, string) error {
+	runPlainFn = func(context.Context, ai.Backend, string, string, string) error {
 		t.Fatalf("runPlain must not be called in dry-run")
 		return nil
 	}
 
 	opts := branchBaseOpts(t)
 	opts.DryRun = true
-	if err := fixConflictMarkers(opts, t.TempDir(), noopLog); err != nil {
+	if err := fixConflictMarkers(context.Background(), opts, t.TempDir(), noopLog); err != nil {
 		t.Fatalf("want nil err in dry-run (swallow); got %v", err)
 	}
 }
@@ -61,12 +62,12 @@ func TestFixConflictMarkers_LLMResolves(t *testing.T) {
 		return nil, nil
 	}
 	var ranLLM int32
-	runPlainFn = func(ai.Backend, string, string, string) error {
+	runPlainFn = func(context.Context, ai.Backend, string, string, string) error {
 		atomic.AddInt32(&ranLLM, 1)
 		return nil
 	}
 
-	if err := fixConflictMarkers(branchBaseOpts(t), t.TempDir(), noopLog); err != nil {
+	if err := fixConflictMarkers(context.Background(), branchBaseOpts(t), t.TempDir(), noopLog); err != nil {
 		t.Fatalf("want nil; got %v", err)
 	}
 	if atomic.LoadInt32(&ranLLM) != 1 {
@@ -83,11 +84,11 @@ func TestFixConflictMarkers_LLMFails(t *testing.T) {
 	installSeams(t)
 
 	detectMarkersFn = func(string) ([]string, error) { return []string{"a.go"}, nil }
-	runPlainFn = func(ai.Backend, string, string, string) error {
+	runPlainFn = func(context.Context, ai.Backend, string, string, string) error {
 		return errors.New("no model available")
 	}
 
-	err := fixConflictMarkers(branchBaseOpts(t), t.TempDir(), noopLog)
+	err := fixConflictMarkers(context.Background(), branchBaseOpts(t), t.TempDir(), noopLog)
 	if err == nil {
 		t.Fatal("want error propagated from LLM")
 	}
@@ -104,9 +105,9 @@ func TestFixConflictMarkers_MarkersRemainAfterLLM(t *testing.T) {
 	detectMarkersFn = func(string) ([]string, error) {
 		return []string{"unresolved.go"}, nil
 	}
-	runPlainFn = func(ai.Backend, string, string, string) error { return nil }
+	runPlainFn = func(context.Context, ai.Backend, string, string, string) error { return nil }
 
-	err := fixConflictMarkers(branchBaseOpts(t), t.TempDir(), noopLog)
+	err := fixConflictMarkers(context.Background(), branchBaseOpts(t), t.TempDir(), noopLog)
 	if err == nil {
 		t.Fatal("want error when markers persist after LLM")
 	}

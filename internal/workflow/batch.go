@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -24,7 +25,10 @@ type BatchOptions struct {
 // "ready" PRs up to opts.Concurrency in parallel.
 //
 // Returns one Result per PR, in the order given.
-func ProcessBatch(opts BatchOptions) []Result {
+func ProcessBatch(ctx context.Context, opts BatchOptions) []Result {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if opts.Out == nil {
 		opts.Out = discardWriter{}
 	}
@@ -61,7 +65,7 @@ func ProcessBatch(opts BatchOptions) []Result {
 	if setupConc <= 0 {
 		setupConc = SetupMaxConcurrency
 	}
-	prepared := SetupPhase(opts, run, tracker, setupConc)
+	prepared := SetupPhase(ctx, opts, run, tracker, setupConc)
 
 	// ── 4. One-line summary of ready/skipped/failed per PR ─────────────────
 	printSetupSummary(opts.Out, prepared)
@@ -104,7 +108,7 @@ func ProcessBatch(opts BatchOptions) []Result {
 			fmt.Fprintf(opts.Out, "── PR #%d ──────────────────────────────────────────────\n", p.PRNum)
 			o := opts.Base
 			o.PRNum = p.PRNum
-			results[i] = ProcessPR(o)
+			results[i] = ProcessPR(ctx, o)
 			fmt.Fprintln(opts.Out)
 		}
 		return results
@@ -121,7 +125,7 @@ func ProcessBatch(opts BatchOptions) []Result {
 			p := prepared[i]
 			o := opts.Base
 			o.PRNum = p.PRNum
-			results[i] = ProcessPR(o)
+			results[i] = ProcessPR(ctx, o)
 		}(i)
 	}
 	wg.Wait()

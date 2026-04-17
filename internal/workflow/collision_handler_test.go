@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"sync/atomic"
@@ -16,12 +17,12 @@ func TestHandleCaseCollisions_Clean(t *testing.T) {
 
 	var plainCalls int32
 	detectCaseCollisionsFn = func(string) ([][]string, error) { return nil, nil }
-	runPlainFn = func(ai.Backend, string, string, string) error {
+	runPlainFn = func(context.Context, ai.Backend, string, string, string) error {
 		atomic.AddInt32(&plainCalls, 1)
 		return nil
 	}
 
-	if err := handleCaseCollisions(branchBaseOpts(t), t.TempDir(), "feature"); err != nil {
+	if err := handleCaseCollisions(context.Background(), branchBaseOpts(t), t.TempDir(), "feature"); err != nil {
 		t.Fatalf("want nil err; got %v", err)
 	}
 	if atomic.LoadInt32(&plainCalls) != 0 {
@@ -37,14 +38,14 @@ func TestHandleCaseCollisions_DryRun(t *testing.T) {
 	detectCaseCollisionsFn = func(string) ([][]string, error) {
 		return [][]string{{"Foo.go", "foo.go"}}, nil
 	}
-	runPlainFn = func(ai.Backend, string, string, string) error {
+	runPlainFn = func(context.Context, ai.Backend, string, string, string) error {
 		t.Fatalf("runPlain must not be called in dry-run")
 		return nil
 	}
 
 	opts := branchBaseOpts(t)
 	opts.DryRun = true
-	err := handleCaseCollisions(opts, t.TempDir(), "feature")
+	err := handleCaseCollisions(context.Background(), opts, t.TempDir(), "feature")
 	if err == nil {
 		t.Fatal("want error in dry-run mode")
 	}
@@ -68,12 +69,12 @@ func TestHandleCaseCollisions_LLMSucceedsCleanAfter(t *testing.T) {
 		return nil, nil
 	}
 	var ranLLM int32
-	runPlainFn = func(ai.Backend, string, string, string) error {
+	runPlainFn = func(context.Context, ai.Backend, string, string, string) error {
 		atomic.AddInt32(&ranLLM, 1)
 		return nil
 	}
 
-	if err := handleCaseCollisions(branchBaseOpts(t), t.TempDir(), "feature"); err != nil {
+	if err := handleCaseCollisions(context.Background(), branchBaseOpts(t), t.TempDir(), "feature"); err != nil {
 		t.Fatalf("want nil err after clean-up; got %v", err)
 	}
 	if atomic.LoadInt32(&ranLLM) != 1 {
@@ -92,9 +93,9 @@ func TestHandleCaseCollisions_LLMRemainingAfter(t *testing.T) {
 	detectCaseCollisionsFn = func(string) ([][]string, error) {
 		return [][]string{{"Foo.go", "foo.go"}}, nil
 	}
-	runPlainFn = func(ai.Backend, string, string, string) error { return nil }
+	runPlainFn = func(context.Context, ai.Backend, string, string, string) error { return nil }
 
-	err := handleCaseCollisions(branchBaseOpts(t), t.TempDir(), "feature")
+	err := handleCaseCollisions(context.Background(), branchBaseOpts(t), t.TempDir(), "feature")
 	if err == nil {
 		t.Fatal("want error when collisions remain after LLM")
 	}
@@ -111,11 +112,11 @@ func TestHandleCaseCollisions_LLMError(t *testing.T) {
 	detectCaseCollisionsFn = func(string) ([][]string, error) {
 		return [][]string{{"Foo.go", "foo.go"}}, nil
 	}
-	runPlainFn = func(ai.Backend, string, string, string) error {
+	runPlainFn = func(context.Context, ai.Backend, string, string, string) error {
 		return errors.New("model crashed")
 	}
 
-	err := handleCaseCollisions(branchBaseOpts(t), t.TempDir(), "feature")
+	err := handleCaseCollisions(context.Background(), branchBaseOpts(t), t.TempDir(), "feature")
 	if err == nil {
 		t.Fatal("want error propagated from LLM")
 	}

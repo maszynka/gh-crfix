@@ -292,7 +292,7 @@ func runBatchPlain(ctx context.Context, plan runPlan) []workflow.Result {
 		return results
 	default:
 	}
-	return processBatchFn(workflow.BatchOptions{
+	return processBatchFn(ctx, workflow.BatchOptions{
 		PRNums:      plan.prNums,
 		Concurrency: plan.concurrency,
 		Base:        plan.opts,

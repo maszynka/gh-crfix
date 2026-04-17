@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -23,22 +24,22 @@ import (
 // test's t.Cleanup can restore them. Each branch test calls installSeams(t)
 // which both resets defaults and registers the restore.
 type seamBackup struct {
-	fetchPR              func(string, int) (ghapi.PRInfo, error)
-	fetchThreads         func(string, int, int) ([]ghapi.Thread, error)
-	postComment          func(string, int, string) error
-	replyToThread        func(string, string) error
-	resolveThread        func(string) error
-	fetchFailingChecks   func(string, string) ([]ghapi.CICheck, error)
-	requestCopilotReview func(string, int) error
-	repoRoot             func(string) (string, error)
-	setupWorktree        func(string, string, int) (string, error)
+	fetchPR              func(context.Context, string, int) (ghapi.PRInfo, error)
+	fetchThreads         func(context.Context, string, int, int) ([]ghapi.Thread, error)
+	postComment          func(context.Context, string, int, string) error
+	replyToThread        func(context.Context, string, string) error
+	resolveThread        func(context.Context, string) error
+	fetchFailingChecks   func(context.Context, string, string) ([]ghapi.CICheck, error)
+	requestCopilotReview func(context.Context, string, int) error
+	repoRoot             func(context.Context, string) (string, error)
+	setupWorktree        func(context.Context, string, string, int) (string, error)
 	dirtyStatus          func(string) (string, error)
-	mergeBase            func(string, string) error
+	mergeBase            func(context.Context, string, string) error
 	detectCaseCollisions func(string) ([][]string, error)
 	detectMarkers        func(string) ([]string, error)
-	runGate              func(ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error)
-	runFix               func(ai.Backend, string, string, string) error
-	runPlain             func(ai.Backend, string, string, string) error
+	runGate              func(context.Context, ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error)
+	runFix               func(context.Context, ai.Backend, string, string, string) error
+	runPlain             func(context.Context, ai.Backend, string, string, string) error
 	sleep                func(time.Duration)
 }
 
@@ -92,26 +93,26 @@ func installSeams(t *testing.T) {
 	prev := snapshotSeams()
 	t.Cleanup(func() { restoreSeams(prev) })
 
-	fetchPRFn = func(string, int) (ghapi.PRInfo, error) {
+	fetchPRFn = func(context.Context, string, int) (ghapi.PRInfo, error) {
 		return ghapi.PRInfo{State: "OPEN", HeadRefName: "feature", BaseRefName: "main", Title: "t", HeadSHA: ""}, nil
 	}
-	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) { return nil, nil }
-	postCommentFn = func(string, int, string) error { return nil }
-	replyToThreadFn = func(string, string) error { return nil }
-	resolveThreadFn = func(string) error { return nil }
-	fetchFailingChecksFn = func(string, string) ([]ghapi.CICheck, error) { return nil, nil }
-	requestCopilotReviewFn = func(string, int) error { return nil }
-	repoRootFn = func(string) (string, error) { return "/repo", nil }
-	setupWorktreeFn = func(string, string, int) (string, error) { return t.TempDir(), nil }
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) { return nil, nil }
+	postCommentFn = func(context.Context, string, int, string) error { return nil }
+	replyToThreadFn = func(context.Context, string, string) error { return nil }
+	resolveThreadFn = func(context.Context, string) error { return nil }
+	fetchFailingChecksFn = func(context.Context, string, string) ([]ghapi.CICheck, error) { return nil, nil }
+	requestCopilotReviewFn = func(context.Context, string, int) error { return nil }
+	repoRootFn = func(context.Context, string) (string, error) { return "/repo", nil }
+	setupWorktreeFn = func(context.Context, string, string, int) (string, error) { return t.TempDir(), nil }
 	dirtyStatusFn = func(string) (string, error) { return "", nil }
-	mergeBaseFn = func(string, string) error { return nil }
+	mergeBaseFn = func(context.Context, string, string) error { return nil }
 	detectCaseCollisionsFn = func(string) ([][]string, error) { return nil, nil }
 	detectMarkersFn = func(string) ([]string, error) { return nil, nil }
-	runGateFn = func(ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
+	runGateFn = func(context.Context, ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
 		return ai.GateOutput{}, nil
 	}
-	runFixFn = func(ai.Backend, string, string, string) error { return nil }
-	runPlainFn = func(ai.Backend, string, string, string) error { return nil }
+	runFixFn = func(context.Context, ai.Backend, string, string, string) error { return nil }
+	runPlainFn = func(context.Context, ai.Backend, string, string, string) error { return nil }
 	sleepFn = func(time.Duration) {}
 }
 
@@ -142,11 +143,11 @@ func branchBaseOpts(t *testing.T) Options {
 
 func TestProcessPR_PRClosedSkipped(t *testing.T) {
 	installSeams(t)
-	fetchPRFn = func(string, int) (ghapi.PRInfo, error) {
+	fetchPRFn = func(context.Context, string, int) (ghapi.PRInfo, error) {
 		return ghapi.PRInfo{State: "CLOSED", HeadRefName: "feature", Title: "t"}, nil
 	}
 
-	res := ProcessPR(branchBaseOpts(t))
+	res := ProcessPR(context.Background(), branchBaseOpts(t))
 	if res.Status != "skipped" {
 		t.Fatalf("status=%q want skipped", res.Status)
 	}
@@ -159,11 +160,11 @@ func TestProcessPR_PRClosedSkipped(t *testing.T) {
 
 func TestProcessPR_FetchPRError(t *testing.T) {
 	installSeams(t)
-	fetchPRFn = func(string, int) (ghapi.PRInfo, error) {
+	fetchPRFn = func(context.Context, string, int) (ghapi.PRInfo, error) {
 		return ghapi.PRInfo{}, errors.New("gh not found")
 	}
 
-	res := ProcessPR(branchBaseOpts(t))
+	res := ProcessPR(context.Background(), branchBaseOpts(t))
 	if res.Status != "failed" {
 		t.Fatalf("status=%q want failed", res.Status)
 	}
@@ -184,7 +185,7 @@ func TestProcessPR_NoThreadsSkipped(t *testing.T) {
 	}
 
 	// Threads already default to nil via installSeams.
-	res := ProcessPR(opts)
+	res := ProcessPR(context.Background(), opts)
 	if res.Status != "skipped" || res.Reason != "no unresolved threads" {
 		t.Fatalf("want skipped/no unresolved threads, got %+v", res)
 	}
@@ -202,7 +203,7 @@ func TestProcessPR_NoThreadsSkipped(t *testing.T) {
 
 func TestProcessPR_SetupOnlySkipped(t *testing.T) {
 	installSeams(t)
-	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) {
 		return []ghapi.Thread{{ID: "t1", Path: "a.go", Line: 1, Comments: []ghapi.Comment{
 			{Author: "alice", Body: "please fix"},
 		}}}, nil
@@ -210,7 +211,7 @@ func TestProcessPR_SetupOnlySkipped(t *testing.T) {
 	opts := branchBaseOpts(t)
 	opts.SetupOnly = true
 
-	res := ProcessPR(opts)
+	res := ProcessPR(context.Background(), opts)
 	if res.Status != "skipped" || res.Reason != "setup-only" {
 		t.Fatalf("want skipped/setup-only; got %+v", res)
 	}
@@ -231,9 +232,9 @@ func TestProcessPR_GateBelowThresholdSkipped(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
 		t.Fatalf("write a.go: %v", err)
 	}
-	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+	setupWorktreeFn = func(context.Context, string, string, int) (string, error) { return wt, nil }
 
-	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) {
 		return []ghapi.Thread{{
 			ID: "t1", Path: "a.go", Line: 1,
 			Comments: []ghapi.Comment{{Author: "alice", Body: "thoughtful review needing semantic thought"}},
@@ -243,14 +244,14 @@ func TestProcessPR_GateBelowThresholdSkipped(t *testing.T) {
 	// Track reply calls + their bodies so we can assert the skipped-by-score message.
 	var mu sync.Mutex
 	var replyBodies []string
-	replyToThreadFn = func(id, body string) error {
+	replyToThreadFn = func(_ context.Context, id, body string) error {
 		mu.Lock()
 		defer mu.Unlock()
 		replyBodies = append(replyBodies, body)
 		return nil
 	}
 	// gate below threshold means RunGate should NOT be called — fail if it is.
-	runGateFn = func(ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
+	runGateFn = func(context.Context, ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
 		t.Fatalf("runGate must not be called when score is below threshold")
 		return ai.GateOutput{}, nil
 	}
@@ -259,7 +260,7 @@ func TestProcessPR_GateBelowThresholdSkipped(t *testing.T) {
 	// Make sure total score is < 1: only NeedsLLM=0.5, PRComment=0 (no empty path), TestFailure=0.
 	opts.Weights = gate.ScoreWeights{NeedsLLM: 0.5, PRComment: 0.5, TestFailure: 1.0}
 
-	res := ProcessPR(opts)
+	res := ProcessPR(context.Background(), opts)
 	if res.Status != "ok" {
 		t.Fatalf("status=%q (reason=%q) want ok", res.Status, res.Reason)
 	}
@@ -289,9 +290,9 @@ func TestProcessPR_GateDeclinesAdvancedModel(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
 		t.Fatalf("write a.go: %v", err)
 	}
-	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+	setupWorktreeFn = func(context.Context, string, string, int) (string, error) { return wt, nil }
 
-	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) {
 		return []ghapi.Thread{{
 			ID: "t1", Path: "a.go", Line: 1,
 			Comments: []ghapi.Comment{{Author: "alice", Body: "needs semantic review of this"}},
@@ -299,19 +300,19 @@ func TestProcessPR_GateDeclinesAdvancedModel(t *testing.T) {
 	}
 
 	gateCalled := int32(0)
-	runGateFn = func(ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
+	runGateFn = func(context.Context, ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
 		atomic.AddInt32(&gateCalled, 1)
 		return ai.GateOutput{NeedsAdvancedModel: false, Reason: "not needed"}, nil
 	}
 	fixCalled := int32(0)
-	runFixFn = func(ai.Backend, string, string, string) error {
+	runFixFn = func(context.Context, ai.Backend, string, string, string) error {
 		atomic.AddInt32(&fixCalled, 1)
 		return nil
 	}
 
 	var mu sync.Mutex
 	var replyBodies []string
-	replyToThreadFn = func(_, body string) error {
+	replyToThreadFn = func(_ context.Context, _, body string) error {
 		mu.Lock()
 		replyBodies = append(replyBodies, body)
 		mu.Unlock()
@@ -322,7 +323,7 @@ func TestProcessPR_GateDeclinesAdvancedModel(t *testing.T) {
 	// NeedsLLM=1.0 guarantees total score ≥ 1 → gate runs.
 	opts.Weights = gate.ScoreWeights{NeedsLLM: 1.0}
 
-	res := ProcessPR(opts)
+	res := ProcessPR(context.Background(), opts)
 	if res.Status != "ok" {
 		t.Fatalf("status=%q want ok (reason=%q)", res.Status, res.Reason)
 	}
@@ -355,9 +356,9 @@ func TestProcessPR_DryRun(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
 		t.Fatalf("write a.go: %v", err)
 	}
-	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+	setupWorktreeFn = func(context.Context, string, string, int) (string, error) { return wt, nil }
 
-	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) {
 		return []ghapi.Thread{{
 			ID: "t1", Path: "a.go", Line: 1,
 			Comments: []ghapi.Comment{{Author: "alice", Body: "needs semantic review"}},
@@ -365,20 +366,20 @@ func TestProcessPR_DryRun(t *testing.T) {
 	}
 
 	var postCalled, replyCalled, resolveCalled int32
-	postCommentFn = func(string, int, string) error { atomic.AddInt32(&postCalled, 1); return nil }
-	replyToThreadFn = func(string, string) error { atomic.AddInt32(&replyCalled, 1); return nil }
-	resolveThreadFn = func(string) error { atomic.AddInt32(&resolveCalled, 1); return nil }
+	postCommentFn = func(context.Context, string, int, string) error { atomic.AddInt32(&postCalled, 1); return nil }
+	replyToThreadFn = func(context.Context, string, string) error { atomic.AddInt32(&replyCalled, 1); return nil }
+	resolveThreadFn = func(context.Context, string) error { atomic.AddInt32(&resolveCalled, 1); return nil }
 	// Gate and fix should not run in dry mode.
-	runGateFn = func(ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
+	runGateFn = func(context.Context, ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
 		t.Fatalf("RunGate should not run in dry-run mode")
 		return ai.GateOutput{}, nil
 	}
-	runFixFn = func(ai.Backend, string, string, string) error {
+	runFixFn = func(context.Context, ai.Backend, string, string, string) error {
 		t.Fatalf("RunFix should not run in dry-run mode")
 		return nil
 	}
 	// Copilot re-review seam may still fire if !opts.DryRun — with DryRun=true it should not.
-	requestCopilotReviewFn = func(string, int) error {
+	requestCopilotReviewFn = func(context.Context, string, int) error {
 		t.Fatalf("RequestCopilotReview should not run in dry-run mode")
 		return nil
 	}
@@ -386,7 +387,7 @@ func TestProcessPR_DryRun(t *testing.T) {
 	opts := branchBaseOpts(t)
 	opts.DryRun = true
 
-	res := ProcessPR(opts)
+	res := ProcessPR(context.Background(), opts)
 	if res.Status != "ok" {
 		t.Fatalf("status=%q want ok (reason=%q)", res.Status, res.Reason)
 	}
@@ -414,9 +415,9 @@ func TestProcessPR_NoResolve(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
 		t.Fatalf("write a.go: %v", err)
 	}
-	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+	setupWorktreeFn = func(context.Context, string, string, int) (string, error) { return wt, nil }
 
-	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) {
 		return []ghapi.Thread{{
 			ID: "t1", Path: "a.go", Line: 1,
 			Comments: []ghapi.Comment{{Author: "alice", Body: "needs semantic review"}},
@@ -424,8 +425,8 @@ func TestProcessPR_NoResolve(t *testing.T) {
 	}
 
 	var replyCalled, resolveCalled int32
-	replyToThreadFn = func(string, string) error { atomic.AddInt32(&replyCalled, 1); return nil }
-	resolveThreadFn = func(string) error { atomic.AddInt32(&resolveCalled, 1); return nil }
+	replyToThreadFn = func(context.Context, string, string) error { atomic.AddInt32(&replyCalled, 1); return nil }
+	resolveThreadFn = func(context.Context, string) error { atomic.AddInt32(&resolveCalled, 1); return nil }
 
 	opts := branchBaseOpts(t)
 	opts.NoResolve = true
@@ -433,7 +434,7 @@ func TestProcessPR_NoResolve(t *testing.T) {
 	// test focused on the "no reply/resolve even outside dry-run" check.
 	opts.Weights = gate.ScoreWeights{NeedsLLM: 0.5, TestFailure: 1.0}
 
-	res := ProcessPR(opts)
+	res := ProcessPR(context.Background(), opts)
 	if res.Status != "ok" {
 		t.Fatalf("status=%q want ok", res.Status)
 	}
@@ -455,32 +456,32 @@ func TestProcessPR_AllSkipped(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
 		t.Fatalf("write a.go: %v", err)
 	}
-	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+	setupWorktreeFn = func(context.Context, string, string, int) (string, error) { return wt, nil }
 
 	// All threads are "lgtm" (non-actionable → skip, ResolveWhenSkipped=true).
-	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) {
 		return []ghapi.Thread{
 			{ID: "t1", Path: "a.go", Line: 1, Comments: []ghapi.Comment{{Author: "x", Body: "lgtm"}}},
 			{ID: "t2", Path: "a.go", Line: 2, Comments: []ghapi.Comment{{Author: "y", Body: "lgtm"}}},
 		}, nil
 	}
 
-	runGateFn = func(ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
+	runGateFn = func(context.Context, ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
 		t.Fatalf("gate must not run when all threads are skipped")
 		return ai.GateOutput{}, nil
 	}
-	runFixFn = func(ai.Backend, string, string, string) error {
+	runFixFn = func(context.Context, ai.Backend, string, string, string) error {
 		t.Fatalf("fix must not run when all threads are skipped")
 		return nil
 	}
 
 	var replies []string
-	replyToThreadFn = func(_, body string) error {
+	replyToThreadFn = func(_ context.Context, _, body string) error {
 		replies = append(replies, body)
 		return nil
 	}
 
-	res := ProcessPR(branchBaseOpts(t))
+	res := ProcessPR(context.Background(), branchBaseOpts(t))
 	if res.Status != "ok" {
 		t.Fatalf("status=%q want ok (reason=%q)", res.Status, res.Reason)
 	}
@@ -505,13 +506,13 @@ func TestReplyAndResolve_CountsAndSkipsEmptyBodies(t *testing.T) {
 		replied     []string
 		resolves    []string
 	)
-	replyToThreadFn = func(id, _ string) error {
+	replyToThreadFn = func(_ context.Context, id, _ string) error {
 		repliesMu.Lock()
 		replied = append(replied, id)
 		repliesMu.Unlock()
 		return nil
 	}
-	resolveThreadFn = func(id string) error {
+	resolveThreadFn = func(_ context.Context, id string) error {
 		repliesMu.Lock()
 		resolves = append(resolves, id)
 		repliesMu.Unlock()
@@ -534,6 +535,7 @@ func TestReplyAndResolve_CountsAndSkipsEmptyBodies(t *testing.T) {
 	}
 
 	replies, resolved, skippedUnresolved := replyAndResolve(
+		context.Background(),
 		responses,
 		false, // resolveSkipped
 		func(string, ...interface{}) {},
@@ -563,17 +565,18 @@ func TestReplyAndResolve_ResolveSkippedFlag(t *testing.T) {
 	installSeams(t)
 
 	var resolved []string
-	resolveThreadFn = func(id string) error {
+	resolveThreadFn = func(_ context.Context, id string) error {
 		resolved = append(resolved, id)
 		return nil
 	}
-	replyToThreadFn = func(string, string) error { return nil }
+	replyToThreadFn = func(context.Context, string, string) error { return nil }
 
 	responses := []ThreadResponse{
 		{ThreadID: "a", Action: "skipped", Comment: "c1"},
 		{ThreadID: "b", Action: "skipped", Comment: ""},
 	}
 	_, resolvedCount, skippedUnresolved := replyAndResolve(
+		context.Background(),
 		responses,
 		true, // resolveSkipped=true → resolve every skipped
 		func(string, ...interface{}) {},
@@ -598,9 +601,9 @@ func TestProcessPR_FixModelWritesResponses(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
 		t.Fatalf("write a.go: %v", err)
 	}
-	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+	setupWorktreeFn = func(context.Context, string, string, int) (string, error) { return wt, nil }
 
-	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) {
 		return []ghapi.Thread{{
 			ID: "t1", Path: "a.go", Line: 1,
 			Comments: []ghapi.Comment{{Author: "alice", Body: "needs semantic review please"}},
@@ -608,12 +611,12 @@ func TestProcessPR_FixModelWritesResponses(t *testing.T) {
 	}
 
 	// Gate says "run the advanced model".
-	runGateFn = func(ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
+	runGateFn = func(context.Context, ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
 		return ai.GateOutput{NeedsAdvancedModel: true, ThreadsToFix: []string{"t1"}}, nil
 	}
 
 	fixCalled := int32(0)
-	runFixFn = func(_ ai.Backend, _ string, _ string, workdir string) error {
+	runFixFn = func(_ context.Context, _ ai.Backend, _ string, _ string, workdir string) error {
 		atomic.AddInt32(&fixCalled, 1)
 		body := `[{"thread_id":"t1","action":"fixed","comment":"replaced the bug with a fix"}]`
 		return os.WriteFile(filepath.Join(workdir, "thread-responses.json"), []byte(body), 0o644)
@@ -622,7 +625,7 @@ func TestProcessPR_FixModelWritesResponses(t *testing.T) {
 	var replyMu sync.Mutex
 	var replyBodies []string
 	var replyIDs []string
-	replyToThreadFn = func(id, body string) error {
+	replyToThreadFn = func(_ context.Context, id, body string) error {
 		replyMu.Lock()
 		replyIDs = append(replyIDs, id)
 		replyBodies = append(replyBodies, body)
@@ -630,7 +633,7 @@ func TestProcessPR_FixModelWritesResponses(t *testing.T) {
 		return nil
 	}
 	resolveCount := int32(0)
-	resolveThreadFn = func(string) error {
+	resolveThreadFn = func(context.Context, string) error {
 		atomic.AddInt32(&resolveCount, 1)
 		return nil
 	}
@@ -638,7 +641,7 @@ func TestProcessPR_FixModelWritesResponses(t *testing.T) {
 	opts := branchBaseOpts(t)
 	opts.Weights = gate.ScoreWeights{NeedsLLM: 1.0}
 
-	res := ProcessPR(opts)
+	res := ProcessPR(context.Background(), opts)
 	if res.Status != "ok" {
 		t.Fatalf("status=%q (reason=%q) want ok", res.Status, res.Reason)
 	}
@@ -691,9 +694,9 @@ func TestProcessPR_AutofixHookDetectedAndRan(t *testing.T) {
 	if err := os.WriteFile(hookPath, []byte(hookBody), 0o755); err != nil {
 		t.Fatalf("write hook: %v", err)
 	}
-	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+	setupWorktreeFn = func(context.Context, string, string, int) (string, error) { return wt, nil }
 
-	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) {
 		return []ghapi.Thread{{
 			ID: "t1", Path: "a.go", Line: 1,
 			Comments: []ghapi.Comment{{Author: "alice", Body: "needs semantic review"}},
@@ -706,7 +709,7 @@ func TestProcessPR_AutofixHookDetectedAndRan(t *testing.T) {
 	// Gate should stay below threshold → keep the test focused on the autofix branch.
 	opts.Weights = gate.ScoreWeights{NeedsLLM: 0.5, TestFailure: 1.0}
 
-	res := ProcessPR(opts)
+	res := ProcessPR(context.Background(), opts)
 	if res.Status != "ok" {
 		t.Fatalf("status=%q (reason=%q) want ok", res.Status, res.Reason)
 	}
@@ -753,12 +756,12 @@ func TestCleanupThreadResponsesArtifact_NoOp(t *testing.T) {
 
 func TestProcessPR_RepoRootAutoDetectError(t *testing.T) {
 	installSeams(t)
-	repoRootFn = func(string) (string, error) { return "", errors.New("no git") }
+	repoRootFn = func(context.Context, string) (string, error) { return "", errors.New("no git") }
 
 	opts := branchBaseOpts(t)
 	opts.RepoRoot = "" // force auto-detect branch.
 
-	res := ProcessPR(opts)
+	res := ProcessPR(context.Background(), opts)
 	if res.Status != "failed" {
 		t.Fatalf("status=%q want failed", res.Status)
 	}
@@ -774,11 +777,11 @@ func TestProcessPR_RepoRootAutoDetectError(t *testing.T) {
 
 func TestProcessPR_WorktreeSetupError(t *testing.T) {
 	installSeams(t)
-	setupWorktreeFn = func(string, string, int) (string, error) {
+	setupWorktreeFn = func(context.Context, string, string, int) (string, error) {
 		return "", errors.New("worktree add failed")
 	}
 
-	res := ProcessPR(branchBaseOpts(t))
+	res := ProcessPR(context.Background(), branchBaseOpts(t))
 	if res.Status != "failed" {
 		t.Fatalf("status=%q want failed", res.Status)
 	}
@@ -791,11 +794,11 @@ func TestProcessPR_WorktreeSetupError(t *testing.T) {
 
 func TestProcessPR_FetchThreadsError(t *testing.T) {
 	installSeams(t)
-	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) {
 		return nil, errors.New("gh api threads boom")
 	}
 
-	res := ProcessPR(branchBaseOpts(t))
+	res := ProcessPR(context.Background(), branchBaseOpts(t))
 	if res.Status != "failed" {
 		t.Fatalf("status=%q want failed (reason=%q)", res.Status, res.Reason)
 	}
@@ -813,18 +816,18 @@ func TestProcessPR_MergeBaseErrorContinues(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
 		t.Fatalf("write a.go: %v", err)
 	}
-	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+	setupWorktreeFn = func(context.Context, string, string, int) (string, error) { return wt, nil }
 
-	mergeBaseFn = func(string, string) error { return errors.New("merge conflict") }
+	mergeBaseFn = func(context.Context, string, string) error { return errors.New("merge conflict") }
 	// Keep below threshold so we don't also call gate.
-	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) {
 		return []ghapi.Thread{{
 			ID: "t1", Path: "a.go", Line: 1,
 			Comments: []ghapi.Comment{{Author: "x", Body: "lgtm"}},
 		}}, nil
 	}
 
-	res := ProcessPR(branchBaseOpts(t))
+	res := ProcessPR(context.Background(), branchBaseOpts(t))
 	if res.Status != "ok" {
 		t.Fatalf("status=%q want ok (reason=%q)", res.Status, res.Reason)
 	}
@@ -840,9 +843,9 @@ func TestProcessPR_ConflictMarkersUnresolvable(t *testing.T) {
 	detectMarkersFn = func(string) ([]string, error) {
 		return []string{"bad.go"}, nil
 	}
-	runPlainFn = func(ai.Backend, string, string, string) error { return nil }
+	runPlainFn = func(context.Context, ai.Backend, string, string, string) error { return nil }
 
-	res := ProcessPR(branchBaseOpts(t))
+	res := ProcessPR(context.Background(), branchBaseOpts(t))
 	if res.Status == "ok" {
 		t.Fatalf("want non-ok status when conflict markers persist; got %+v", res)
 	}
@@ -860,15 +863,15 @@ func TestProcessPR_FixModelError(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
 		t.Fatalf("write a.go: %v", err)
 	}
-	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+	setupWorktreeFn = func(context.Context, string, string, int) (string, error) { return wt, nil }
 
-	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) {
 		return []ghapi.Thread{{
 			ID: "t1", Path: "a.go", Line: 1,
 			Comments: []ghapi.Comment{{Author: "alice", Body: "semantic thought needed"}},
 		}}, nil
 	}
-	runGateFn = func(ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
+	runGateFn = func(context.Context, ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
 		// Return empty ThreadsToFix → exercises the `len(selected) == 0 &&
 		// len(activeNeedsLLM) > 0` branch where ProcessPR populates from
 		// activeNeedsLLM.
@@ -876,7 +879,7 @@ func TestProcessPR_FixModelError(t *testing.T) {
 	}
 	fixErr := errors.New("claude exited 1")
 	var fixCalled int32
-	runFixFn = func(ai.Backend, string, string, string) error {
+	runFixFn = func(context.Context, ai.Backend, string, string, string) error {
 		atomic.AddInt32(&fixCalled, 1)
 		return fixErr
 	}
@@ -884,7 +887,7 @@ func TestProcessPR_FixModelError(t *testing.T) {
 	opts := branchBaseOpts(t)
 	opts.Weights = gate.ScoreWeights{NeedsLLM: 1.0}
 
-	res := ProcessPR(opts)
+	res := ProcessPR(context.Background(), opts)
 	if res.Status != "ok" {
 		t.Fatalf("status=%q want ok even after fix error (reason=%q)", res.Status, res.Reason)
 	}
@@ -905,10 +908,10 @@ func TestProcessPR_PostFixCycleTriggered(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
 		t.Fatalf("write a.go: %v", err)
 	}
-	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+	setupWorktreeFn = func(context.Context, string, string, int) (string, error) { return wt, nil }
 
 	var fetchCount int32
-	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) {
 		// First fetch = initial threads; second fetch = post-fix cycle.
 		n := atomic.AddInt32(&fetchCount, 1)
 		if n == 1 {
@@ -927,7 +930,7 @@ func TestProcessPR_PostFixCycleTriggered(t *testing.T) {
 	opts.NoPostFix = false // enable postFixReviewCycle
 	opts.ReviewWaitSecs = 1
 
-	res := ProcessPR(opts)
+	res := ProcessPR(context.Background(), opts)
 	if res.Status != "ok" {
 		t.Fatalf("status=%q want ok (reason=%q)", res.Status, res.Reason)
 	}
@@ -948,7 +951,7 @@ func TestProcessPR_DirtyWorktreeHandledByCollisions(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
 		t.Fatalf("write a.go: %v", err)
 	}
-	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+	setupWorktreeFn = func(context.Context, string, string, int) (string, error) { return wt, nil }
 
 	// Dirty first, clean after LLM resolves.
 	var dirtyCalls int32
@@ -968,12 +971,12 @@ func TestProcessPR_DirtyWorktreeHandledByCollisions(t *testing.T) {
 		return nil, nil
 	}
 	var plainCalls int32
-	runPlainFn = func(ai.Backend, string, string, string) error {
+	runPlainFn = func(context.Context, ai.Backend, string, string, string) error {
 		atomic.AddInt32(&plainCalls, 1)
 		return nil
 	}
 
-	res := ProcessPR(branchBaseOpts(t))
+	res := ProcessPR(context.Background(), branchBaseOpts(t))
 	if res.Status != "skipped" && res.Status != "ok" {
 		// With no threads returned the overall result is "skipped (no
 		// unresolved threads)". Either way, what we care about is that the
@@ -994,13 +997,13 @@ func TestProcessPR_DirtyWorktreePersistsReason(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
 		t.Fatalf("write a.go: %v", err)
 	}
-	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+	setupWorktreeFn = func(context.Context, string, string, int) (string, error) { return wt, nil }
 
 	dirtyStatusFn = func(string) (string, error) { return " M x.go", nil }
 	// No collisions → handler returns immediately, re-check still dirty.
 	detectCaseCollisionsFn = func(string) ([][]string, error) { return nil, nil }
 
-	res := ProcessPR(branchBaseOpts(t))
+	res := ProcessPR(context.Background(), branchBaseOpts(t))
 	if !strings.Contains(res.Reason, "dirty") {
 		t.Fatalf("want reason mentioning 'dirty'; got %q", res.Reason)
 	}
@@ -1068,26 +1071,26 @@ func TestProcessPR_GateModelError(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
 		t.Fatalf("write a.go: %v", err)
 	}
-	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+	setupWorktreeFn = func(context.Context, string, string, int) (string, error) { return wt, nil }
 
-	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) {
 		return []ghapi.Thread{{
 			ID: "t1", Path: "a.go", Line: 1,
 			Comments: []ghapi.Comment{{Author: "alice", Body: "needs semantic review"}},
 		}}, nil
 	}
-	runGateFn = func(ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
+	runGateFn = func(context.Context, ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
 		return ai.GateOutput{}, errors.New("gate crashed")
 	}
 	var fixCalled int32
-	runFixFn = func(ai.Backend, string, string, string) error {
+	runFixFn = func(context.Context, ai.Backend, string, string, string) error {
 		atomic.AddInt32(&fixCalled, 1)
 		return nil
 	}
 
 	opts := branchBaseOpts(t)
 	opts.Weights = gate.ScoreWeights{NeedsLLM: 1.0}
-	res := ProcessPR(opts)
+	res := ProcessPR(context.Background(), opts)
 	if res.Status != "ok" {
 		t.Fatalf("status=%q want ok (gate error shouldn't fail the run)", res.Status)
 	}
@@ -1105,21 +1108,21 @@ func TestProcessPR_FetchFailingChecksInvoked(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
 		t.Fatalf("write a.go: %v", err)
 	}
-	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+	setupWorktreeFn = func(context.Context, string, string, int) (string, error) { return wt, nil }
 
-	fetchPRFn = func(string, int) (ghapi.PRInfo, error) {
+	fetchPRFn = func(context.Context, string, int) (ghapi.PRInfo, error) {
 		return ghapi.PRInfo{
 			State: "OPEN", HeadRefName: "feature", BaseRefName: "main", Title: "t", HeadSHA: "abc123",
 		}, nil
 	}
-	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) {
 		return []ghapi.Thread{{
 			ID: "t1", Path: "a.go", Line: 1,
 			Comments: []ghapi.Comment{{Author: "alice", Body: "lgtm"}},
 		}}, nil
 	}
 	var ciCalls int32
-	fetchFailingChecksFn = func(_ string, sha string) ([]ghapi.CICheck, error) {
+	fetchFailingChecksFn = func(_ context.Context, _ string, sha string) ([]ghapi.CICheck, error) {
 		atomic.AddInt32(&ciCalls, 1)
 		if sha != "abc123" {
 			t.Errorf("CI called with sha=%q want abc123", sha)
@@ -1127,7 +1130,7 @@ func TestProcessPR_FetchFailingChecksInvoked(t *testing.T) {
 		return []ghapi.CICheck{{Name: "build", LogText: "boom"}}, nil
 	}
 
-	res := ProcessPR(branchBaseOpts(t))
+	res := ProcessPR(context.Background(), branchBaseOpts(t))
 	if res.Status != "ok" {
 		t.Fatalf("status=%q want ok (reason=%q)", res.Status, res.Reason)
 	}
@@ -1145,18 +1148,18 @@ func TestProcessPR_PostCommentAndCopilotErrorsSwallowed(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
 		t.Fatalf("write a.go: %v", err)
 	}
-	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+	setupWorktreeFn = func(context.Context, string, string, int) (string, error) { return wt, nil }
 
-	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) {
 		return []ghapi.Thread{{
 			ID: "t1", Path: "a.go", Line: 1,
 			Comments: []ghapi.Comment{{Author: "alice", Body: "lgtm"}},
 		}}, nil
 	}
-	postCommentFn = func(string, int, string) error { return errors.New("post boom") }
-	requestCopilotReviewFn = func(string, int) error { return errors.New("copilot boom") }
+	postCommentFn = func(context.Context, string, int, string) error { return errors.New("post boom") }
+	requestCopilotReviewFn = func(context.Context, string, int) error { return errors.New("copilot boom") }
 
-	res := ProcessPR(branchBaseOpts(t))
+	res := ProcessPR(context.Background(), branchBaseOpts(t))
 	if res.Status != "ok" {
 		t.Fatalf("status=%q want ok (errors should be swallowed)", res.Status)
 	}
@@ -1171,19 +1174,19 @@ func TestProcessPR_ReplyResolveErrors(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
 		t.Fatalf("write a.go: %v", err)
 	}
-	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+	setupWorktreeFn = func(context.Context, string, string, int) (string, error) { return wt, nil }
 
 	// Produce a thread that classifies as already-fixed/skipped.
-	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) {
 		return []ghapi.Thread{{
 			ID: "t1", Path: "a.go", Line: 1,
 			Comments: []ghapi.Comment{{Author: "x", Body: "lgtm"}},
 		}}, nil
 	}
-	replyToThreadFn = func(string, string) error { return errors.New("reply boom") }
-	resolveThreadFn = func(string) error { return errors.New("resolve boom") }
+	replyToThreadFn = func(context.Context, string, string) error { return errors.New("reply boom") }
+	resolveThreadFn = func(context.Context, string) error { return errors.New("resolve boom") }
 
-	res := ProcessPR(branchBaseOpts(t))
+	res := ProcessPR(context.Background(), branchBaseOpts(t))
 	if res.Status != "ok" {
 		t.Fatalf("status=%q want ok (reply/resolve errors should be swallowed)", res.Status)
 	}
@@ -1202,9 +1205,9 @@ func TestProcessPR_GateFlagFalseButThreadsToFixNonEmpty(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
 		t.Fatalf("write a.go: %v", err)
 	}
-	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+	setupWorktreeFn = func(context.Context, string, string, int) (string, error) { return wt, nil }
 
-	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) {
 		return []ghapi.Thread{{
 			ID: "t1", Path: "a.go", Line: 1,
 			Comments: []ghapi.Comment{{Author: "alice", Body: "needs semantic review"}},
@@ -1214,7 +1217,7 @@ func TestProcessPR_GateFlagFalseButThreadsToFixNonEmpty(t *testing.T) {
 		}}, nil
 	}
 
-	runGateFn = func(ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
+	runGateFn = func(context.Context, ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
 		// The contradictory shape: flag says "no", but caller still lists 2 IDs.
 		return ai.GateOutput{
 			NeedsAdvancedModel: false,
@@ -1225,7 +1228,7 @@ func TestProcessPR_GateFlagFalseButThreadsToFixNonEmpty(t *testing.T) {
 
 	fixCalled := int32(0)
 	var fixedIDs []string
-	runFixFn = func(_ ai.Backend, _ string, prompt, _ string) error {
+	runFixFn = func(_ context.Context, _ ai.Backend, _ string, prompt, _ string) error {
 		atomic.AddInt32(&fixCalled, 1)
 		// Record which IDs the prompt targets so the assertion can compare.
 		for _, id := range []string{"t1", "t2"} {
@@ -1239,7 +1242,7 @@ func TestProcessPR_GateFlagFalseButThreadsToFixNonEmpty(t *testing.T) {
 	opts := branchBaseOpts(t)
 	opts.Weights = gate.ScoreWeights{NeedsLLM: 1.0}
 
-	res := ProcessPR(opts)
+	res := ProcessPR(context.Background(), opts)
 	if res.Status != "ok" {
 		t.Fatalf("status=%q want ok (reason=%q)", res.Status, res.Reason)
 	}
@@ -1268,16 +1271,16 @@ func TestProcessPR_MasterLogCapturesProcessPhase(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a"), 0o644); err != nil {
 		t.Fatalf("write a.go: %v", err)
 	}
-	setupWorktreeFn = func(string, string, int) (string, error) { return wt, nil }
+	setupWorktreeFn = func(context.Context, string, string, int) (string, error) { return wt, nil }
 
 	// One thread that flows all the way through.
-	fetchThreadsFn = func(string, int, int) ([]ghapi.Thread, error) {
+	fetchThreadsFn = func(context.Context, string, int, int) ([]ghapi.Thread, error) {
 		return []ghapi.Thread{{
 			ID: "t1", Path: "a.go", Line: 1,
 			Comments: []ghapi.Comment{{Author: "alice", Body: "needs semantic review"}},
 		}}, nil
 	}
-	runGateFn = func(ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
+	runGateFn = func(context.Context, ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
 		return ai.GateOutput{NeedsAdvancedModel: true, ThreadsToFix: []string{"t1"}}, nil
 	}
 
@@ -1293,7 +1296,7 @@ func TestProcessPR_MasterLogCapturesProcessPhase(t *testing.T) {
 	opts.Run = run
 	opts.Weights = gate.ScoreWeights{NeedsLLM: 1.0}
 
-	res := ProcessPR(opts)
+	res := ProcessPR(context.Background(), opts)
 	if res.Status != "ok" {
 		t.Fatalf("status=%q want ok (reason=%q)", res.Status, res.Reason)
 	}
