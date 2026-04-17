@@ -70,11 +70,15 @@ func Run(worktreePath string, r Runner) Result {
 	}
 
 	var cmd *exec.Cmd
+	jsonOut := filepath.Join(worktreePath, ".gh-crfix/validation.json")
 	switch r.Kind {
 	case RunnerHook:
+		// Ensure we never read a stale JSON result from a previous run —
+		// preserved worktrees would otherwise short-circuit to the old data.
+		_ = os.Remove(jsonOut)
 		cmd = exec.Command(r.Command)
 		cmd.Env = append(os.Environ(),
-			"GH_CRFIX_VALIDATION_OUT="+filepath.Join(worktreePath, ".gh-crfix/validation.json"),
+			"GH_CRFIX_VALIDATION_OUT="+jsonOut,
 		)
 	case RunnerBuiltin:
 		parts := strings.Fields(r.Command)
@@ -91,7 +95,7 @@ func Run(worktreePath string, r Runner) Result {
 
 	// Hook may write a JSON file with structured results.
 	if r.Kind == RunnerHook {
-		if res, ok := readHookJSON(filepath.Join(worktreePath, ".gh-crfix/validation.json")); ok {
+		if res, ok := readHookJSON(jsonOut); ok {
 			return res
 		}
 	}

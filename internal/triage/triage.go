@@ -3,6 +3,7 @@ package triage
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -157,15 +158,53 @@ func ClassifyThread(worktreePath string, t Thread, includeOutdated bool) Classif
 		return base
 	}
 
-	// 6. simple mechanical
+	// 6. file changed after the most recent comment: mechanical bodies are
+	//    most likely already addressed. Mirrors the Bash
+	//    file_changed_after_comment + is_simple_mechanical check.
+	if IsSimpleMechanical(body) && fileChangedAfterComment(worktreePath, path, lastCreatedAt(t)) {
+		base.Decision = "already_likely_fixed"
+		base.Reason = "file changed after comment and issue looks mechanical"
+		return base
+	}
+
+	// 7. simple mechanical
 	if IsSimpleMechanical(body) {
 		base.Decision = "auto"
 		base.Reason = "mechanical/simple comment"
 		return base
 	}
 
-	// 7. default
+	// 8. default
 	base.Decision = "needs_llm"
 	base.Reason = "needs semantic review"
 	return base
+}
+
+// lastCreatedAt returns the most recent non-empty CreatedAt from a thread's
+// comments. Matches the Bash `thread_last_created_at` helper.
+func lastCreatedAt(t Thread) string {
+	for i := len(t.Comments) - 1; i >= 0; i-- {
+		if ts := strings.TrimSpace(t.Comments[i].CreatedAt); ts != "" {
+			return ts
+		}
+	}
+	return ""
+}
+
+// fileChangedAfterComment reports whether git log shows any commits touching
+// `file` in the worktree after timestamp `ts`. When any input is missing it
+// returns false (caller falls through to the normal auto/needs_llm branches).
+func fileChangedAfterComment(worktreePath, file, ts string) bool {
+	if file == "" || ts == "" {
+		return false
+	}
+	// `git log --since=<ts> --format=%H -- <file>` prints a SHA per matching
+	// commit. Any non-empty output means the file changed after ts.
+	cmd := exec.Command("git", "-C", worktreePath,
+		"log", "--since="+ts, "--format=%H", "--", file)
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) != ""
 }
