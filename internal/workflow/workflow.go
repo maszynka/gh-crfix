@@ -293,6 +293,24 @@ func ProcessPR(ctx context.Context, opts Options) Result {
 	// ── 8. Build deterministic responses ──────────────────────────────────
 	responses := deterministicResponses(skipList, alreadyFixedList)
 
+	// ── 8.5 Regenerate lockfile review threads deterministically ──────────
+	// Before spending gate + fix tokens on the threads, intercept any thread
+	// whose file is a lockfile (`bun.lock`, `pnpm-lock.yaml`, …). Those are
+	// almost always "regenerate the lock" asks — which is `<pm> install`, a
+	// deterministic, zero-token operation. We handle them here, emit
+	// `fixed` responses, and drop them from the pools the gate will see.
+	//
+	// Skipped silently in dry-run (running install mutates the worktree).
+	if !opts.DryRun {
+		lockfixResponses, handled := regenerateLockfileThreads(
+			ctx, opts, wtPath, &needsLLMList, &autoList, log,
+		)
+		responses = append(responses, lockfixResponses...)
+		if handled > 0 {
+			log("pre-gate: %d lockfile thread(s) handled deterministically — gate+fix will not see them", handled)
+		}
+	}
+
 	// ── 9. Run autofix hook ───────────────────────────────────────────────
 	autofixRan := false
 	if !opts.NoAutofix {
