@@ -238,30 +238,31 @@ func runBatch(
 	dashCtx, dashCancel := context.WithCancel(ctx)
 	defer dashCancel()
 
-	// Dashboard mode: a one-liner on stderr before the framebuffer takes over
-	// so the user knows something is happening during setup. stderr isn't
-	// redirected to the log file the way stdout is below.
+	// Dashboard mode: print a one-liner before the framebuffer takes over
+	// so the user can see something happened in the scrollback once the alt
+	// screen exits. It has to go out before we redirect stderr below.
 	fmt.Fprintf(os.Stderr, "Setting up %d PR(s)...\n", len(plan.prNums))
-	// Per-setupOnePR progress goes to stderr too (not stdout, which we're
-	// about to redirect into the master log). These lines will interleave
-	// with the dashboard briefly during setup, but they land on stderr which
-	// bubbletea's framebuffer doesn't touch — they'll scroll above the
-	// dashboard at worst. Better than 30s of silence.
-	plan.opts.ProgressOut = os.Stderr
 
-	// Silence per-PR stdout during dashboard so the two surfaces don't
-	// overlap. All those writes go to the master log via the usual tee in
-	// logs.Run, so nothing is lost — only the live terminal mirror is
-	// suppressed. See design note below.
-	origStdout := os.Stdout
+	// The dashboard uses the alt screen buffer, so any text that lands on
+	// the terminal during its runtime gets painted over (or worse, visibly
+	// flickers on top of the dashboard). We route both stdout and stderr
+	// — plus setup-progress lines and any subprocess hook output — into
+	// the master log file for the duration. Users still see the setup
+	// progress in the dashboard's detail pane, which tails that same log.
+	// After the batch returns we restore stdout/stderr so PrintResults
+	// and the done banner render to the terminal normally.
+	origStdout, origStderr := os.Stdout, os.Stderr
 	devNullOrLog, _ := os.OpenFile(runLog.MasterLog(),
 		os.O_WRONLY|os.O_APPEND, 0o644)
 	if devNullOrLog == nil {
 		devNullOrLog, _ = os.Open(os.DevNull)
 	}
 	os.Stdout = devNullOrLog
+	os.Stderr = devNullOrLog
+	plan.opts.ProgressOut = devNullOrLog
 	defer func() {
 		os.Stdout = origStdout
+		os.Stderr = origStderr
 		if devNullOrLog != nil {
 			_ = devNullOrLog.Close()
 		}
@@ -818,16 +819,21 @@ Config: %s
 
 // --- Design note: dashboard vs per-PR stdout --------------------------------
 //
-// ProcessPR writes per-PR status lines to os.Stdout via plain fmt.Printf.
-// The dashboard runs in-place (no altscreen) and repaints the terminal on
-// every 250ms tick, so if we let ProcessPR keep writing, the two surfaces
-// tear into each other.
+// ProcessPR writes per-PR status lines to os.Stdout via plain fmt.Printf,
+// and hook subprocesses (autofix, validation — notably `bun test`) inherit
+// os.Stdout/os.Stderr. The dashboard runs on the alternate screen buffer
+// with bubbletea managing a framebuffer. Any stray write to the real tty
+// while bubbletea has it in raw mode shows up as a cascading staircase
+// (raw-mode "\n" is line-feed-without-carriage-return), on top of
+// corrupting the dashboard's own rendering.
 //
-// The simplest fix that doesn't require changing ProcessPR's signature is
-// to swap os.Stdout to the master log file handle for the duration of the
-// dashboard. Per-PR narration still lands in run.log and is visible in the
-// dashboard's detail pane (it tails that file). After the batch returns we
-// restore the real stdout so PrintResults + the done banner render normally.
+// The fix that doesn't require changing ProcessPR's signature or touching
+// every subprocess is to swap both os.Stdout and os.Stderr to the master
+// log file handle for the duration of the dashboard, and point opts.
+// ProgressOut at the same file. Per-PR narration and subprocess output
+// still land in run.log and are visible in the dashboard's detail pane
+// (it tails that file). After the batch returns we restore the real
+// stdout/stderr so PrintResults + the done banner render normally.
 //
 // This is documented here because it is load-bearing for the e2e test:
 // without it the "Setup" / "Done" banners still appear (they are written

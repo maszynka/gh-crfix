@@ -54,11 +54,19 @@ type DashboardConfig struct {
 // Run starts the dashboard synchronously and blocks until the user quits
 // or ctx is cancelled. It is intended to be called from the main
 // goroutine with a TTY attached.
+//
+// The program runs on the alternate screen buffer. This isolates the
+// dashboard's framebuffer from stray writes on the underlying tty (raw
+// mode turns bare "\n" into line-feeds-without-carriage-return, which
+// otherwise produces a cascading staircase of text as stderr from
+// subprocess hooks — autofix, validation — bleeds through). When the
+// dashboard exits the primary screen is restored, and the caller's
+// summary banners render normally.
 func Run(ctx context.Context, cfg DashboardConfig) error {
 	if cfg.Refresh <= 0 {
 		cfg.Refresh = 250 * time.Millisecond
 	}
-	p := tea.NewProgram(newModel(cfg))
+	p := tea.NewProgram(newModel(cfg), tea.WithAltScreen())
 
 	// Forward ctx cancellation into the program so callers can tear us
 	// down cleanly.
