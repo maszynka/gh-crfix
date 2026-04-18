@@ -625,11 +625,44 @@ func fixConflictMarkers(ctx context.Context, opts Options, wtPath string, log fu
 	if err != nil || len(files) == 0 {
 		return err
 	}
-	log("conflict-markers: %d file(s) need fixing", len(files))
+	log("conflict-markers: %d file(s) with markers", len(files))
 	if opts.DryRun {
 		return nil
 	}
-	if err := runPlainFn(ctx, opts.AIBackend, opts.FixModel, conflict.BuildFixPrompt(files), wtPath); err != nil {
+
+	// Before burning tokens on the fix-model, resolve any conflicts whose
+	// outcome is deterministic — lockfiles (→ theirs), changelogs/CI
+	// config/artifacts (→ ours). On a pure lockfile conflict the LLM is
+	// never called, saving both time and tokens. Mirrors bash
+	// merge_base_branch's auto-resolve block.
+	ar := autoResolveFn(ctx, wtPath)
+	result, arErr := ar.Apply()
+	if arErr != nil {
+		log("auto-resolve: %v (continuing to LLM)", arErr)
+	}
+	for p, side := range result.Resolved {
+		log("auto-resolve: %s (--%s)", p, string(side))
+	}
+	autoResolvedEverything := arErr == nil && len(result.Resolved) > 0 && len(result.Remaining) == 0
+	if autoResolvedEverything {
+		if cerr := ar.CommitAndPush(); cerr != nil {
+			log("auto-resolve: commit/push failed: %v (falling through to LLM)", cerr)
+			autoResolvedEverything = false
+		} else {
+			log("auto-resolve: resolved %d file(s), committed and pushed", len(result.Resolved))
+			return nil
+		}
+	}
+
+	// Auto-resolve handled some but not all (or failed). Narrow the LLM
+	// prompt to the files it didn't handle so we don't re-process
+	// already-handled lockfiles.
+	llmTargets := files
+	if len(result.Remaining) > 0 {
+		llmTargets = result.Remaining
+	}
+	log("fix-model: %d file(s) need LLM resolution (%v)", len(llmTargets), llmTargets)
+	if err := runPlainFn(ctx, opts.AIBackend, opts.FixModel, conflict.BuildFixPrompt(llmTargets), wtPath); err != nil {
 		return err
 	}
 	remaining, _ := detectMarkersFn(wtPath)

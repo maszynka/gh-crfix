@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/maszynka/gh-crfix/internal/ai"
+	"github.com/maszynka/gh-crfix/internal/autoresolve"
 	"github.com/maszynka/gh-crfix/internal/conflict"
 	ghapi "github.com/maszynka/gh-crfix/internal/github"
 	"github.com/maszynka/gh-crfix/internal/worktree"
@@ -54,6 +55,19 @@ func detectCaseCollisionsAdapter(path string) ([][]string, error) {
 
 // Conflict detection seam.
 var detectMarkersFn = conflict.DetectMarkers
+
+// autoResolver is the interface ProcessPR uses to drive the deterministic
+// conflict-resolution pass. Keeps the test seam tiny — a real
+// autoresolve.Runner returns the concrete struct, fakes implement this.
+type autoResolver interface {
+	Apply() (autoresolve.Result, error)
+	CommitAndPush() error
+}
+
+// autoResolveFn is a test seam for creating the autoresolver.
+var autoResolveFn = func(ctx context.Context, wtPath string) autoResolver {
+	return autoresolve.NewRunner(ctx, wtPath)
+}
 
 // AI seams.
 var (
