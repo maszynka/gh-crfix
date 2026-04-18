@@ -69,6 +69,20 @@ var autoResolveFn = func(ctx context.Context, wtPath string) autoResolver {
 	return autoresolve.NewRunner(ctx, wtPath)
 }
 
+// lockfileRegenerator is the seam interface for regenerating a lockfile
+// without invoking any AI model. Production impl uses `<pm> install`;
+// tests swap in a fake that records calls.
+type lockfileRegenerator interface {
+	Regenerate(ctx context.Context, kind autoresolve.LockfileKind) error
+}
+
+// lockfileRegeneratorFn is swapped by tests to avoid shelling out to bun /
+// npm / pnpm during unit tests. The production default points at the real
+// autoresolve.LockfileRegenerator.
+var lockfileRegeneratorFn = func(wtPath string) lockfileRegenerator {
+	return autoresolve.NewLockfileRegenerator(wtPath)
+}
+
 // AI seams.
 var (
 	runGateFn  = ai.RunGate
