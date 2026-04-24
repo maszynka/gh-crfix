@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/maszynka/gh-crfix/internal/conflict"
 	ghapi "github.com/maszynka/gh-crfix/internal/github"
 	"github.com/maszynka/gh-crfix/internal/logs"
 	"github.com/maszynka/gh-crfix/internal/progress"
@@ -31,16 +32,17 @@ func splitOwnerRepo(repo string) (string, string) {
 // PreparedPR is one PR after the setup phase. Status is one of
 // "ready" | "skipped" | "failed".
 type PreparedPR struct {
-	PRNum      int
-	Title      string
-	HeadBranch string
-	BaseBranch string
-	HeadSHA    string
-	Worktree   string
-	Threads    int
-	HasCaseCol bool
-	Status     string
-	Reason     string
+	PRNum            int
+	Title            string
+	HeadBranch       string
+	BaseBranch       string
+	HeadSHA          string
+	Worktree         string
+	Threads          int
+	HasCaseCol       bool
+	HasMergeConflicts bool
+	Status           string
+	Reason           string
 }
 
 // --- Small interfaces used by setupOnePR so tests can fake I/O --------------
@@ -140,6 +142,12 @@ func setupPhaseWith(
 	}
 	if concurrency > len(opts.PRNums) && len(opts.PRNums) > 0 {
 		concurrency = len(opts.PRNums)
+	}
+
+	// Wrap ProgressOut so concurrent setup goroutines emit clean lines without
+	// interleaving. All goroutines share the pointer, so one mutex suffices.
+	if opts.Base.ProgressOut != nil {
+		opts.Base.ProgressOut = &lockedWriter{w: opts.Base.ProgressOut}
 	}
 
 	out := make([]PreparedPR, len(opts.PRNums))
@@ -365,14 +373,28 @@ func setupOnePR(
 	pr.Threads = len(threads)
 
 	if pr.Threads == 0 {
-		pr.Status = "skipped"
-		pr.Reason = "no unresolved threads"
-		logMaster("no unresolved threads -- skipping")
-		logPR("no unresolved threads")
-		prog("skipped (%s)", pr.Reason)
-		setStep(progress.Skipped, pr.Reason)
-		markStatus(true)
-		return pr
+		// Before skipping, check whether the PR has merge conflicts that
+		// can be auto-resolved deterministically (e.g. lockfile regeneration)
+		// even without review threads.
+		hasMarkers := false
+		if markers, _ := conflict.DetectMarkers(wtPath); len(markers) > 0 {
+			hasMarkers = true
+		}
+		if !hasMarkers && info.MergeableState != "CONFLICTING" {
+			pr.Status = "skipped"
+			pr.Reason = "no unresolved threads"
+			logMaster("no unresolved threads -- skipping")
+			logPR("no unresolved threads")
+			prog("skipped (%s)", pr.Reason)
+			setStep(progress.Skipped, pr.Reason)
+			markStatus(true)
+			return pr
+		}
+		pr.HasMergeConflicts = true
+		logMaster("no unresolved threads but merge conflicts detected -- processing")
+		logPR("no unresolved threads but merge conflicts detected (MergeableState=%s hasMarkers=%v)",
+			info.MergeableState, hasMarkers)
+		prog("ready (merge conflicts)")
 	}
 
 	pr.Status = "ready"

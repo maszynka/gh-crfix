@@ -18,12 +18,13 @@ const defaultGHTimeout = 2 * time.Minute
 
 // PRInfo is basic metadata about a pull request.
 type PRInfo struct {
-	HeadRefName string
-	Title       string
-	State       string
-	IsDraft     bool
-	HeadSHA     string
-	BaseRefName string
+	HeadRefName    string
+	Title          string
+	State          string
+	IsDraft        bool
+	HeadSHA        string
+	BaseRefName    string
+	MergeableState string // "MERGEABLE" | "CONFLICTING" | "UNKNOWN"
 }
 
 // Comment is a single comment within a review thread.
@@ -56,7 +57,7 @@ type CICheck struct {
 // FetchPR returns basic info about a pull request.
 func FetchPR(ctx context.Context, repo string, prNum int) (PRInfo, error) {
 	out, err := gh(ctx, "pr", "view", fmt.Sprintf("%d", prNum), "--repo", repo,
-		"--json", "headRefName,baseRefName,title,state,isDraft,headRefOid")
+		"--json", "headRefName,baseRefName,title,state,isDraft,headRefOid,mergeable")
 	if err != nil {
 		return PRInfo{}, err
 	}
@@ -67,17 +68,19 @@ func FetchPR(ctx context.Context, repo string, prNum int) (PRInfo, error) {
 		State       string `json:"state"`
 		IsDraft     bool   `json:"isDraft"`
 		HeadRefOid  string `json:"headRefOid"`
+		Mergeable   string `json:"mergeable"`
 	}
 	if err := json.Unmarshal(out, &raw); err != nil {
 		return PRInfo{}, fmt.Errorf("parse pr: %w", err)
 	}
 	return PRInfo{
-		HeadRefName: raw.HeadRefName,
-		BaseRefName: raw.BaseRefName,
-		Title:       raw.Title,
-		State:       raw.State,
-		IsDraft:     raw.IsDraft,
-		HeadSHA:     raw.HeadRefOid,
+		HeadRefName:    raw.HeadRefName,
+		BaseRefName:    raw.BaseRefName,
+		Title:          raw.Title,
+		State:          raw.State,
+		IsDraft:        raw.IsDraft,
+		HeadSHA:        raw.HeadRefOid,
+		MergeableState: raw.Mergeable,
 	}, nil
 }
 

@@ -227,6 +227,12 @@ func ProcessPR(ctx context.Context, opts Options) Result {
 	}
 
 	// ── 5. Fix committed conflict markers ─────────────────────────────────
+	// Snapshot whether conflict markers exist before fixing — used below to
+	// distinguish "conflicts resolved" from "nothing to do" when there are
+	// zero review threads.
+	preFixMarkers, _ := detectMarkersFn(wtPath)
+	hadConflicts := len(preFixMarkers) > 0
+
 	setStep(progress.StepResolveConflicts, progress.Running, "")
 	if err := fixConflictMarkers(ctx, opts, wtPath, log); err != nil {
 		res.Reason = fmt.Sprintf("committed conflict markers could not be auto-fixed: %v", err)
@@ -251,6 +257,14 @@ func ProcessPR(ctx context.Context, opts Options) Result {
 	setStep(progress.StepFetchThreads, progress.Done, fmt.Sprintf("%d threads", len(rawThreads)))
 
 	if len(rawThreads) == 0 {
+		if hadConflicts {
+			// Merge conflicts were present and auto-resolved (fixConflictMarkers
+			// committed and pushed the resolution). No threads needed.
+			res.Status = "ok"
+			res.Reason = "resolved merge conflicts"
+			log("no review threads — done (merge conflicts were resolved)")
+			return res
+		}
 		res.Status = "skipped"
 		res.Reason = "no unresolved threads"
 		return res

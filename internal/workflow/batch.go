@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -125,6 +126,7 @@ func ProcessBatch(ctx context.Context, opts BatchOptions) []Result {
 
 	sem := make(chan struct{}, effectiveConc)
 	var wg sync.WaitGroup
+	var printMu sync.Mutex
 	for _, i := range readyIdx {
 		wg.Add(1)
 		sem <- struct{}{}
@@ -134,7 +136,19 @@ func ProcessBatch(ctx context.Context, opts BatchOptions) []Result {
 			p := prepared[i]
 			o := opts.Base
 			o.PRNum = p.PRNum
+			// Buffer this PR's output so concurrent goroutines don't interleave
+			// lines on the terminal. ProgressOut (validation streaming) is routed
+			// into the same buffer so bun/jest output also stays contained.
+			var buf bytes.Buffer
+			o.Out = &buf
+			o.ProgressOut = &buf
 			results[i] = ProcessPR(ctx, o)
+			// Print the complete PR block atomically once processing is done.
+			printMu.Lock()
+			fmt.Fprintf(opts.Out, "── PR #%d ──────────────────────────────────────────────\n", p.PRNum)
+			_, _ = io.Copy(opts.Out, &buf)
+			fmt.Fprintln(opts.Out)
+			printMu.Unlock()
 		}(i)
 	}
 	wg.Wait()
@@ -247,3 +261,16 @@ func PrintResults(w io.Writer, results []Result) {
 type discardWriter struct{}
 
 func (discardWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+// lockedWriter serialises Write calls so concurrent goroutines don't produce
+// interleaved output lines on the terminal.
+type lockedWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (lw *lockedWriter) Write(p []byte) (n int, err error) {
+	lw.mu.Lock()
+	defer lw.mu.Unlock()
+	return lw.w.Write(p)
+}
