@@ -32,17 +32,18 @@ func splitOwnerRepo(repo string) (string, string) {
 // PreparedPR is one PR after the setup phase. Status is one of
 // "ready" | "skipped" | "failed".
 type PreparedPR struct {
-	PRNum            int
-	Title            string
-	HeadBranch       string
-	BaseBranch       string
-	HeadSHA          string
-	Worktree         string
-	Threads          int
-	HasCaseCol       bool
+	PRNum             int
+	Title             string
+	HeadBranch        string
+	BaseBranch        string
+	HeadSHA           string
+	Worktree          string
+	RepoRoot          string // resolved once in setupOnePR; reused for cleanup
+	Threads           int
+	HasCaseCol        bool
 	HasMergeConflicts bool
-	Status           string
-	Reason           string
+	Status            string
+	Reason            string
 }
 
 // --- Small interfaces used by setupOnePR so tests can fake I/O --------------
@@ -297,6 +298,7 @@ func setupOnePR(
 		}
 		repoRoot = rr
 	}
+	pr.RepoRoot = repoRoot
 
 	// Validate the resolved repo root actually points at the target PR's
 	// repo. A mismatched origin is the other common "worktree setup failed"

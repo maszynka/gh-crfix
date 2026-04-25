@@ -61,6 +61,7 @@ type runPlan struct {
 
 func run(ctx context.Context, args []string) int {
 	// --- Fast-path flags ------------------------------------------------------
+	wantSetup := false
 	for _, a := range args {
 		switch a {
 		case "--version", "-v":
@@ -69,6 +70,8 @@ func run(ctx context.Context, args []string) int {
 		case "--help", "-h", "help":
 			usage()
 			return 0
+		case "--setup", "-s":
+			wantSetup = true
 		}
 	}
 
@@ -78,6 +81,26 @@ func run(ctx context.Context, args []string) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not load config: %v\n", err)
 		cfg = config.Defaults()
+	}
+
+	// --- First-run / explicit setup wizard -----------------------------------
+	// Auto-trigger on first invocation (no config file yet) when both std
+	// streams are TTYs. Skip in non-TTY contexts (CI, pipes) so automation
+	// doesn't hang on stdin.
+	stdinIsTTY := isTerminalFn(os.Stdin)
+	stdoutIsTTY := isTerminalFn(stdoutFileFn())
+	if wantSetup || (firstRunNeeded(cfgPath) && stdinIsTTY && stdoutIsTTY) {
+		newCfg, werr := runSetupWizard(os.Stdin, os.Stdout, cfg, cfgPath)
+		if werr != nil {
+			fmt.Fprintf(os.Stderr, "setup: %v\n", werr)
+			return 1
+		}
+		cfg = newCfg
+		if wantSetup {
+			// Explicit re-config: don't try to also run a PR in the same
+			// invocation. The user can re-run with a PR target now.
+			return 0
+		}
 	}
 
 	// Environment overrides mirror the bash script's behaviour. The registry
@@ -499,7 +522,7 @@ func splitArgsAndFlags(args []string) (prSpec string, flags, unknown []string) {
 		"--gate-model": true, "--fix-model": true,
 		"--score-needs-llm": true, "--score-pr-comment": true, "--score-test-failure": true,
 		"--max-threads": true, "--autofix-hook": true, "--validate-hook": true,
-		"--review-wait": true,
+		"--review-wait": true, "--worktree-mode": true,
 	}
 	booleanFlags := map[string]bool{
 		"--dry-run": true, "--no-resolve": true, "--resolve-skipped": true,
@@ -507,6 +530,7 @@ func splitArgsAndFlags(args []string) (prSpec string, flags, unknown []string) {
 		"--setup-only": true, "--exclude-outdated": true, "--include-outdated": true,
 		"--verbose": true, "--no-tui": true, "--no-notify": true,
 		"--version": true, "-v": true, "--help": true, "-h": true, "--seq": true,
+		"--setup": true, "-s": true,
 	}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -616,6 +640,14 @@ func applyFlags(flags []string, cfg *config.Config) {
 			}
 		case "--seq":
 			cfg.Concurrency = 1
+		case "--worktree-mode":
+			if i+1 < len(flags) {
+				i++
+				switch flags[i] {
+				case "temp", "reuse", "stash":
+					cfg.WorktreeMode = flags[i]
+				}
+			}
 		}
 	}
 }
@@ -687,6 +719,14 @@ func applyWorkflowFlags(flags []string, opts *workflow.Options) {
 			opts.IncludeOutdated = true
 		case "--verbose":
 			opts.Verbose = true
+		case "--worktree-mode":
+			if i+1 < len(flags) {
+				i++
+				switch flags[i] {
+				case "temp", "reuse", "stash":
+					opts.WorktreeMode = flags[i]
+				}
+			}
 		}
 	}
 }
@@ -793,6 +833,8 @@ Flags:
   --score-test-failure N   gate score weight [0,1]
   --no-tui                 disable the Bubble Tea dashboard even on TTY
   --no-notify              suppress the completion notification
+  --worktree-mode MODE     temp|reuse|stash (default: temp)
+  --setup, -s              run the interactive setup wizard
   --verbose                verbose output
   --version, -v            show version
   --help, -h               show this help

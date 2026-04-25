@@ -222,6 +222,51 @@ CONCURRENCY=4
 	})
 }
 
+// TestWorktreeMode covers the parsing rules for the WORKTREE_MODE config
+// key: defaults to "temp" when missing, accepts the three valid values, and
+// silently rejects unknown values (defensive against typos).
+func TestWorktreeMode(t *testing.T) {
+	t.Run("Defaults to temp", func(t *testing.T) {
+		c := Defaults()
+		if c.WorktreeMode != "temp" {
+			t.Errorf("Defaults().WorktreeMode = %q, want %q", c.WorktreeMode, "temp")
+		}
+	})
+
+	for _, mode := range []string{"temp", "reuse", "stash"} {
+		t.Run("accepts "+mode, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "defaults")
+			if err := os.WriteFile(path, []byte("WORKTREE_MODE="+mode+"\n"), 0o644); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			c, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if c.WorktreeMode != mode {
+				t.Errorf("WorktreeMode = %q, want %q", c.WorktreeMode, mode)
+			}
+		})
+	}
+
+	t.Run("rejects unknown value (keeps default)", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "defaults")
+		if err := os.WriteFile(path, []byte("WORKTREE_MODE=garbage\n"), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		c, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if c.WorktreeMode != "temp" {
+			t.Errorf("WorktreeMode = %q, want default %q after rejecting garbage",
+				c.WorktreeMode, "temp")
+		}
+	})
+}
+
 func TestSaveAndLoad(t *testing.T) {
 	t.Run("round-trip", func(t *testing.T) {
 		dir := t.TempDir()
@@ -235,6 +280,7 @@ func TestSaveAndLoad(t *testing.T) {
 			ScoreNeedsLLM:    0.750,
 			ScorePRComment:   0.250,
 			ScoreTestFailure: 0.500,
+			WorktreeMode:     "stash",
 		}
 		if err := Save(path, original); err != nil {
 			t.Fatalf("Save error: %v", err)
@@ -242,6 +288,9 @@ func TestSaveAndLoad(t *testing.T) {
 		loaded, err := Load(path)
 		if err != nil {
 			t.Fatalf("Load error: %v", err)
+		}
+		if loaded.WorktreeMode != original.WorktreeMode {
+			t.Errorf("WorktreeMode = %q, want %q", loaded.WorktreeMode, original.WorktreeMode)
 		}
 		if loaded.AIBackend != original.AIBackend {
 			t.Errorf("AIBackend = %q, want %q", loaded.AIBackend, original.AIBackend)

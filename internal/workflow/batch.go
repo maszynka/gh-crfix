@@ -9,6 +9,7 @@ import (
 
 	"github.com/maszynka/gh-crfix/internal/logs"
 	"github.com/maszynka/gh-crfix/internal/progress"
+	"github.com/maszynka/gh-crfix/internal/worktree"
 )
 
 // BatchOptions drives multi-PR processing.
@@ -61,6 +62,11 @@ func ProcessBatch(ctx context.Context, opts BatchOptions) []Result {
 	opts.Base.Tracker = tracker
 
 	// ── 3. Setup phase ─────────────────────────────────────────────────────
+	// Install the configured worktree mode before any Setup runs. SetMode is
+	// idempotent and process-global; matches the way the rest of the pipeline
+	// resolves config (one mode per invocation).
+	worktree.SetMode(worktree.ParseMode(opts.Base.WorktreeMode))
+
 	setupConc := opts.Base.SetupMaxConc
 	if setupConc <= 0 {
 		setupConc = SetupMaxConcurrency
@@ -118,7 +124,15 @@ func ProcessBatch(ctx context.Context, opts BatchOptions) []Result {
 			o := opts.Base
 			o.PRNum = p.PRNum
 			results[i] = ProcessPR(ctx, o)
+			cleanupAfterPR(ctx, o, p)
 			fmt.Fprintln(opts.Out)
+		}
+		// Pre-ready (skipped/failed) PRs may have set up worktrees too; clean
+		// them up so temp-mode doesn't leak directories on the skip path.
+		for _, p := range prepared {
+			if p.Status != "ready" {
+				cleanupAfterPR(ctx, opts.Base, p)
+			}
 		}
 		return results
 	}
@@ -155,10 +169,29 @@ func ProcessBatch(ctx context.Context, opts BatchOptions) []Result {
 			outBuf.Flush()
 			progBuf.Flush()
 			fmt.Fprintln(sink)
+			cleanupAfterPR(ctx, o, p)
 		}(i)
 	}
 	wg.Wait()
+	for _, p := range prepared {
+		if p.Status != "ready" {
+			cleanupAfterPR(ctx, opts.Base, p)
+		}
+	}
 	return results
+}
+
+// cleanupAfterPR runs worktree.Cleanup unless the user opted to keep the
+// worktree (--setup-only). It is safe on PRs whose Setup never registered
+// state — Cleanup is a no-op in that case.
+func cleanupAfterPR(ctx context.Context, opts Options, p PreparedPR) {
+	if opts.SetupOnly {
+		return
+	}
+	if p.RepoRoot == "" || p.PRNum == 0 {
+		return
+	}
+	_ = worktree.Cleanup(ctx, p.RepoRoot, p.PRNum)
 }
 
 // resultFromPrepared converts a non-ready PreparedPR into a Result so batch

@@ -19,6 +19,10 @@ type Config struct {
 	ScoreNeedsLLM    float64
 	ScorePRComment   float64
 	ScoreTestFailure float64
+	// WorktreeMode controls per-PR worktree lifecycle. One of:
+	// "temp" (default; remove after run), "reuse" (keep, fail if dirty),
+	// "stash" (stash dirty changes before reset, pop after run).
+	WorktreeMode string
 }
 
 // Defaults returns a Config populated with built-in default values.
@@ -31,6 +35,7 @@ func Defaults() Config {
 		ScoreNeedsLLM:    1.0,
 		ScorePRComment:   0.4,
 		ScoreTestFailure: 1.0,
+		WorktreeMode:     "temp",
 	}
 }
 
@@ -102,6 +107,11 @@ func Load(path string) (Config, error) {
 			if err == nil && isValidScore(v) {
 				c.ScoreTestFailure = v
 			}
+		case "WORKTREE_MODE":
+			switch value {
+			case "temp", "reuse", "stash":
+				c.WorktreeMode = value
+			}
 		// unknown keys: silently ignore
 		}
 	}
@@ -143,6 +153,11 @@ func Save(path string, c Config) error {
 	write("SCORE_NEEDS_LLM=%.3f\n", c.ScoreNeedsLLM)
 	write("SCORE_PR_COMMENT=%.3f\n", c.ScorePRComment)
 	write("SCORE_TEST_FAILURE=%.3f\n", c.ScoreTestFailure)
+	mode := c.WorktreeMode
+	if mode == "" {
+		mode = "temp"
+	}
+	write("WORKTREE_MODE=%s\n", mode)
 	if writeErr != nil {
 		f.Close()
 		return writeErr

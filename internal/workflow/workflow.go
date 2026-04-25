@@ -51,6 +51,7 @@ type Options struct {
 	NoAutofix       bool
 	NoValidate      bool
 	SetupOnly       bool
+	WorktreeMode    string // "temp" | "reuse" | "stash" (empty = "temp")
 	ReviewWaitSecs  int
 	Weights         gate.ScoreWeights
 	Verbose         bool
@@ -99,6 +100,10 @@ type Result struct {
 
 // OptionsFromConfig builds Options from a Config and overrides.
 func OptionsFromConfig(cfg config.Config, repo string, prNum int) Options {
+	mode := cfg.WorktreeMode
+	if mode == "" {
+		mode = "temp"
+	}
 	return Options{
 		Repo:            repo,
 		PRNum:           prNum,
@@ -107,6 +112,7 @@ func OptionsFromConfig(cfg config.Config, repo string, prNum int) Options {
 		FixModel:        cfg.FixModel,
 		MaxThreads:      100,
 		IncludeOutdated: true,
+		WorktreeMode:    mode,
 		// 90s matches the bash `GH_CRFIX_REVIEW_WAIT` default and the README.
 		ReviewWaitSecs: 90,
 		Weights: gate.ScoreWeights{
