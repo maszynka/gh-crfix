@@ -36,6 +36,8 @@ type fakeWorktreeSetup struct {
 	err        error
 	dirty      string
 	collisions [][]string
+	markers    []string
+	markersErr error
 }
 
 func (w *fakeWorktreeSetup) Setup(repoRoot, branch string, prNum int) (string, error) {
@@ -44,6 +46,9 @@ func (w *fakeWorktreeSetup) Setup(repoRoot, branch string, prNum int) (string, e
 func (w *fakeWorktreeSetup) DirtyStatus(path string) (string, error)          { return w.dirty, nil }
 func (w *fakeWorktreeSetup) DetectCaseCollisions(path string) ([][]string, error) {
 	return w.collisions, nil
+}
+func (w *fakeWorktreeSetup) DetectMarkers(path string) ([]string, error) {
+	return w.markers, w.markersErr
 }
 func (w *fakeWorktreeSetup) RepoRoot(path string) (string, error) { return "/repo", nil }
 

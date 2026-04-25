@@ -123,6 +123,13 @@ func ProcessBatch(ctx context.Context, opts BatchOptions) []Result {
 		return results
 	}
 
+	// Stream output through a shared locked sink, line-buffered per PR. This
+	// keeps memory bounded (~1 line per goroutine) so verbose validation
+	// runners can't OOM the process the way the previous bytes.Buffer per-PR
+	// approach did. Lines from different PRs may interleave on the terminal,
+	// but ProcessPR's `[PR #N]` prefix on every log line keeps it readable —
+	// and the master log file is still the source of truth via opts.Run.
+	sink := &lockedWriter{w: opts.Out}
 	sem := make(chan struct{}, effectiveConc)
 	var wg sync.WaitGroup
 	for _, i := range readyIdx {
@@ -134,7 +141,20 @@ func ProcessBatch(ctx context.Context, opts BatchOptions) []Result {
 			p := prepared[i]
 			o := opts.Base
 			o.PRNum = p.PRNum
+			// Per-goroutine line buffers so partial writes from validation
+			// streams (e.g. byte-level output from a child process pipe) don't
+			// interleave at sub-line granularity across PRs.
+			outBuf := newLineBufferedWriter(sink)
+			progBuf := newLineBufferedWriter(sink)
+			o.Out = outBuf
+			o.ProgressOut = progBuf
+			// Header: emitted as a single Write so it lands contiguously
+			// against the shared sink lock.
+			fmt.Fprintf(sink, "── PR #%d ──────────────────────────────────────────────\n", p.PRNum)
 			results[i] = ProcessPR(ctx, o)
+			outBuf.Flush()
+			progBuf.Flush()
+			fmt.Fprintln(sink)
 		}(i)
 	}
 	wg.Wait()
@@ -247,3 +267,68 @@ func PrintResults(w io.Writer, results []Result) {
 type discardWriter struct{}
 
 func (discardWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+// lockedWriter serialises Write calls so concurrent goroutines don't produce
+// interleaved output lines on the terminal.
+type lockedWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (lw *lockedWriter) Write(p []byte) (n int, err error) {
+	lw.mu.Lock()
+	defer lw.mu.Unlock()
+	return lw.w.Write(p)
+}
+
+// lineBufferedWriter buffers up to one line of output, then flushes complete
+// lines to the wrapped sink in a single Write call. This guarantees that
+// concurrent goroutines writing to the same locked sink never interleave at
+// sub-line granularity, while keeping memory bounded to ~one line per
+// goroutine (replaces the unbounded bytes.Buffer per-PR approach that risked
+// OOMs on verbose validation runners).
+type lineBufferedWriter struct {
+	sink io.Writer
+	buf  []byte
+}
+
+func newLineBufferedWriter(sink io.Writer) *lineBufferedWriter {
+	return &lineBufferedWriter{sink: sink}
+}
+
+func (w *lineBufferedWriter) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	for {
+		i := indexByte(w.buf, '\n')
+		if i < 0 {
+			break
+		}
+		if _, err := w.sink.Write(w.buf[:i+1]); err != nil {
+			return 0, err
+		}
+		w.buf = w.buf[i+1:]
+	}
+	return len(p), nil
+}
+
+// Flush emits any trailing partial line. Called once per PR after ProcessPR
+// returns so that final non-newline-terminated output isn't dropped.
+func (w *lineBufferedWriter) Flush() {
+	if len(w.buf) == 0 {
+		return
+	}
+	// Append a newline so the partial line is visually terminated; otherwise
+	// it would butt against the next PR's header.
+	w.buf = append(w.buf, '\n')
+	_, _ = w.sink.Write(w.buf)
+	w.buf = w.buf[:0]
+}
+
+func indexByte(b []byte, c byte) int {
+	for i := range b {
+		if b[i] == c {
+			return i
+		}
+	}
+	return -1
+}

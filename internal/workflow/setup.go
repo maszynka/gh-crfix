@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/maszynka/gh-crfix/internal/conflict"
 	ghapi "github.com/maszynka/gh-crfix/internal/github"
 	"github.com/maszynka/gh-crfix/internal/logs"
 	"github.com/maszynka/gh-crfix/internal/progress"
@@ -31,16 +32,17 @@ func splitOwnerRepo(repo string) (string, string) {
 // PreparedPR is one PR after the setup phase. Status is one of
 // "ready" | "skipped" | "failed".
 type PreparedPR struct {
-	PRNum      int
-	Title      string
-	HeadBranch string
-	BaseBranch string
-	HeadSHA    string
-	Worktree   string
-	Threads    int
-	HasCaseCol bool
-	Status     string
-	Reason     string
+	PRNum            int
+	Title            string
+	HeadBranch       string
+	BaseBranch       string
+	HeadSHA          string
+	Worktree         string
+	Threads          int
+	HasCaseCol       bool
+	HasMergeConflicts bool
+	Status           string
+	Reason           string
 }
 
 // --- Small interfaces used by setupOnePR so tests can fake I/O --------------
@@ -62,6 +64,7 @@ type worktreeSetup interface {
 	Setup(repoRoot, branch string, prNum int) (string, error)
 	DirtyStatus(path string) (string, error)
 	DetectCaseCollisions(path string) ([][]string, error)
+	DetectMarkers(path string) ([]string, error)
 	RepoRoot(path string) (string, error)
 }
 
@@ -94,6 +97,9 @@ func (r realWorktreeSetup) DirtyStatus(path string) (string, error) {
 }
 func (r realWorktreeSetup) DetectCaseCollisions(path string) ([][]string, error) {
 	return worktree.DetectCaseCollisions(path)
+}
+func (r realWorktreeSetup) DetectMarkers(path string) ([]string, error) {
+	return conflict.DetectMarkers(path)
 }
 func (r realWorktreeSetup) RepoRoot(path string) (string, error) {
 	return worktree.RepoRoot(r.pickCtx(), path)
@@ -140,6 +146,12 @@ func setupPhaseWith(
 	}
 	if concurrency > len(opts.PRNums) && len(opts.PRNums) > 0 {
 		concurrency = len(opts.PRNums)
+	}
+
+	// Wrap ProgressOut so concurrent setup goroutines emit clean lines without
+	// interleaving. All goroutines share the pointer, so one mutex suffices.
+	if opts.Base.ProgressOut != nil {
+		opts.Base.ProgressOut = &lockedWriter{w: opts.Base.ProgressOut}
 	}
 
 	out := make([]PreparedPR, len(opts.PRNums))
@@ -365,14 +377,36 @@ func setupOnePR(
 	pr.Threads = len(threads)
 
 	if pr.Threads == 0 {
-		pr.Status = "skipped"
-		pr.Reason = "no unresolved threads"
-		logMaster("no unresolved threads -- skipping")
-		logPR("no unresolved threads")
-		prog("skipped (%s)", pr.Reason)
-		setStep(progress.Skipped, pr.Reason)
-		markStatus(true)
-		return pr
+		// Before skipping, check whether the PR has merge conflicts that
+		// can be auto-resolved deterministically (e.g. lockfile regeneration)
+		// even without review threads.
+		// Routed through the worktreeSetup interface so unit tests can fake
+		// it without shelling out to git. A non-nil error is logged but
+		// otherwise treated as "no markers" — DetectMarkers shells out to
+		// `git ls-files`, and a hard failure shouldn't escalate a skippable
+		// PR into a hard failure here. The PR will still be skipped, just
+		// without the merge-conflict bypass.
+		markers, mErr := wt.DetectMarkers(wtPath)
+		if mErr != nil {
+			logMaster("DetectMarkers failed: %v -- treating as no markers", mErr)
+			logPR("DetectMarkers failed: %v", mErr)
+		}
+		hasMarkers := len(markers) > 0
+		if !hasMarkers && info.MergeableState != "CONFLICTING" {
+			pr.Status = "skipped"
+			pr.Reason = "no unresolved threads"
+			logMaster("no unresolved threads -- skipping")
+			logPR("no unresolved threads")
+			prog("skipped (%s)", pr.Reason)
+			setStep(progress.Skipped, pr.Reason)
+			markStatus(true)
+			return pr
+		}
+		pr.HasMergeConflicts = true
+		logMaster("no unresolved threads but merge conflicts detected -- processing")
+		logPR("no unresolved threads but merge conflicts detected (MergeableState=%s hasMarkers=%v)",
+			info.MergeableState, hasMarkers)
+		prog("ready (merge conflicts)")
 	}
 
 	pr.Status = "ready"

@@ -18,12 +18,13 @@ const defaultGHTimeout = 2 * time.Minute
 
 // PRInfo is basic metadata about a pull request.
 type PRInfo struct {
-	HeadRefName string
-	Title       string
-	State       string
-	IsDraft     bool
-	HeadSHA     string
-	BaseRefName string
+	HeadRefName    string
+	Title          string
+	State          string
+	IsDraft        bool
+	HeadSHA        string
+	BaseRefName    string
+	MergeableState string // "MERGEABLE" | "CONFLICTING" | "UNKNOWN"
 }
 
 // Comment is a single comment within a review thread.
@@ -56,7 +57,7 @@ type CICheck struct {
 // FetchPR returns basic info about a pull request.
 func FetchPR(ctx context.Context, repo string, prNum int) (PRInfo, error) {
 	out, err := gh(ctx, "pr", "view", fmt.Sprintf("%d", prNum), "--repo", repo,
-		"--json", "headRefName,baseRefName,title,state,isDraft,headRefOid")
+		"--json", "headRefName,baseRefName,title,state,isDraft,headRefOid,mergeable")
 	if err != nil {
 		return PRInfo{}, err
 	}
@@ -67,17 +68,19 @@ func FetchPR(ctx context.Context, repo string, prNum int) (PRInfo, error) {
 		State       string `json:"state"`
 		IsDraft     bool   `json:"isDraft"`
 		HeadRefOid  string `json:"headRefOid"`
+		Mergeable   string `json:"mergeable"`
 	}
 	if err := json.Unmarshal(out, &raw); err != nil {
 		return PRInfo{}, fmt.Errorf("parse pr: %w", err)
 	}
 	return PRInfo{
-		HeadRefName: raw.HeadRefName,
-		BaseRefName: raw.BaseRefName,
-		Title:       raw.Title,
-		State:       raw.State,
-		IsDraft:     raw.IsDraft,
-		HeadSHA:     raw.HeadRefOid,
+		HeadRefName:    raw.HeadRefName,
+		BaseRefName:    raw.BaseRefName,
+		Title:          raw.Title,
+		State:          raw.State,
+		IsDraft:        raw.IsDraft,
+		HeadSHA:        raw.HeadRefOid,
+		MergeableState: raw.Mergeable,
 	}, nil
 }
 
@@ -227,6 +230,13 @@ func RequestCopilotReview(ctx context.Context, repo string, prNum int) error {
 var runIDRe = regexp.MustCompile(`/runs/([0-9]+)`)
 
 // FetchFailingChecks returns failing CI checks with log snippets.
+//
+// API failures are surfaced as a non-nil error (wrapping the underlying
+// `gh api` error) so the caller can log a visible warning. Callers that
+// treat CI context as best-effort should log+continue rather than abort —
+// CI surfacing is a "make the gate/fix model more informed" feature, not
+// a hard requirement, but silent failures here have masked regressions in
+// the past, so the error must reach the master log.
 func FetchFailingChecks(ctx context.Context, repo, headSHA string) ([]CICheck, error) {
 	out, err := gh(ctx, "api",
 		fmt.Sprintf("repos/%s/commits/%s/check-runs", repo, headSHA),
@@ -234,8 +244,7 @@ func FetchFailingChecks(ctx context.Context, repo, headSHA string) ([]CICheck, e
 		"--jq", `.check_runs[] | select(.conclusion == "failure") | {name, details_url}`,
 	)
 	if err != nil {
-		// Non-fatal: CI checks not available.
-		return nil, nil
+		return nil, fmt.Errorf("fetch CI checks: %w", err)
 	}
 
 	var checks []CICheck
