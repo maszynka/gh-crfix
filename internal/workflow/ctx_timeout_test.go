@@ -240,6 +240,9 @@ func (w *fakeWorktreeSetupWithRepoRootErr) DirtyStatus(_ string) (string, error)
 func (w *fakeWorktreeSetupWithRepoRootErr) DetectCaseCollisions(_ string) ([][]string, error) {
 	return nil, nil
 }
+func (w *fakeWorktreeSetupWithRepoRootErr) DetectMarkers(_ string) ([]string, error) {
+	return nil, nil
+}
 func (w *fakeWorktreeSetupWithRepoRootErr) RepoRoot(_ string) (string, error) {
 	return "", w.repoRootErr
 }

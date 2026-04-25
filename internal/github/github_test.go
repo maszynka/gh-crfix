@@ -332,15 +332,18 @@ exit 0
 	}
 }
 
-func TestFetchFailingChecks_APIFailureNonFatal(t *testing.T) {
+func TestFetchFailingChecks_APIFailureSurfacesError(t *testing.T) {
 	dir := isolatePATH(t)
 	writeScript(t, dir, "gh", `#!/bin/sh
 echo "api error" 1>&2
 exit 1
 `)
 	checks, err := FetchFailingChecks(context.Background(), "owner/repo", "deadbeef")
-	if err != nil {
-		t.Fatalf("expected nil error on api failure (non-fatal), got: %v", err)
+	// Caller-of-record (workflow.ProcessPR) treats this as best-effort and
+	// logs the error; the contract here is that the error MUST surface so
+	// callers can log it. Silent nil error masked CI regressions previously.
+	if err == nil {
+		t.Fatalf("expected non-nil error on api failure, got nil")
 	}
 	if checks != nil {
 		t.Fatalf("expected nil checks on api failure, got: %+v", checks)

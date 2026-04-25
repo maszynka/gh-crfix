@@ -64,6 +64,7 @@ type worktreeSetup interface {
 	Setup(repoRoot, branch string, prNum int) (string, error)
 	DirtyStatus(path string) (string, error)
 	DetectCaseCollisions(path string) ([][]string, error)
+	DetectMarkers(path string) ([]string, error)
 	RepoRoot(path string) (string, error)
 }
 
@@ -96,6 +97,9 @@ func (r realWorktreeSetup) DirtyStatus(path string) (string, error) {
 }
 func (r realWorktreeSetup) DetectCaseCollisions(path string) ([][]string, error) {
 	return worktree.DetectCaseCollisions(path)
+}
+func (r realWorktreeSetup) DetectMarkers(path string) ([]string, error) {
+	return conflict.DetectMarkers(path)
 }
 func (r realWorktreeSetup) RepoRoot(path string) (string, error) {
 	return worktree.RepoRoot(r.pickCtx(), path)
@@ -376,10 +380,18 @@ func setupOnePR(
 		// Before skipping, check whether the PR has merge conflicts that
 		// can be auto-resolved deterministically (e.g. lockfile regeneration)
 		// even without review threads.
-		hasMarkers := false
-		if markers, _ := conflict.DetectMarkers(wtPath); len(markers) > 0 {
-			hasMarkers = true
+		// Routed through the worktreeSetup interface so unit tests can fake
+		// it without shelling out to git. A non-nil error is logged but
+		// otherwise treated as "no markers" — DetectMarkers shells out to
+		// `git ls-files`, and a hard failure shouldn't escalate a skippable
+		// PR into a hard failure here. The PR will still be skipped, just
+		// without the merge-conflict bypass.
+		markers, mErr := wt.DetectMarkers(wtPath)
+		if mErr != nil {
+			logMaster("DetectMarkers failed: %v -- treating as no markers", mErr)
+			logPR("DetectMarkers failed: %v", mErr)
 		}
+		hasMarkers := len(markers) > 0
 		if !hasMarkers && info.MergeableState != "CONFLICTING" {
 			pr.Status = "skipped"
 			pr.Reason = "no unresolved threads"

@@ -258,6 +258,17 @@ func ProcessPR(ctx context.Context, opts Options) Result {
 
 	if len(rawThreads) == 0 {
 		if hadConflicts {
+			// In dry-run mode fixConflictMarkers exits early without committing
+			// or pushing the resolution, so the branch on origin is unchanged.
+			// Reporting "ok / resolved merge conflicts" here would be misleading
+			// for users and any automation that treats `ok` as a real
+			// remediation. Surface dry-run as skipped instead.
+			if opts.DryRun {
+				res.Status = "skipped"
+				res.Reason = "dry-run: merge conflicts detected (would resolve)"
+				log("dry-run: merge conflicts detected, skipping resolution")
+				return res
+			}
 			// Merge conflicts were present and auto-resolved (fixConflictMarkers
 			// committed and pushed the resolution). No threads needed.
 			res.Status = "ok"
@@ -335,7 +346,7 @@ func ProcessPR(ctx context.Context, opts Options) Result {
 		if hookPath != "" {
 			log("running autofix hook...")
 			setStep(progress.StepAutofix, progress.Running, hookPath)
-			if herr := runHook(context.Background(), hookPath, wtPath); herr != nil {
+			if herr := runHook(ctx, hookPath, wtPath); herr != nil {
 				// Autofix is best-effort; surface the error but continue.
 				log("autofix hook failed: %v", herr)
 				setStep(progress.StepAutofix, progress.Failed, herr.Error())
@@ -381,10 +392,17 @@ func ProcessPR(ctx context.Context, opts Options) Result {
 	}
 
 	// ── 11. Fetch failing CI checks ───────────────────────────────────────
+	// CI surfacing is best-effort but the error must be visible — silent
+	// `nil, nil` previously masked regressions where the gate stopped
+	// receiving CI context entirely.
 	var ciChecks []ghapi.CICheck
 	if pr.HeadSHA != "" {
 		log("fetching CI check results...")
-		ciChecks, _ = fetchFailingChecksFn(ctx, opts.Repo, pr.HeadSHA)
+		var ciErr error
+		ciChecks, ciErr = fetchFailingChecksFn(ctx, opts.Repo, pr.HeadSHA)
+		if ciErr != nil {
+			log("warning: fetch CI checks failed: %v (continuing without CI context)", ciErr)
+		}
 		if len(ciChecks) > 0 {
 			log("%d failing CI check(s)", len(ciChecks))
 		}
