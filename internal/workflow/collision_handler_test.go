@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -17,7 +18,7 @@ func TestHandleCaseCollisions_Clean(t *testing.T) {
 
 	var plainCalls int32
 	detectCaseCollisionsFn = func(string) ([][]string, error) { return nil, nil }
-	runPlainFn = func(context.Context, ai.Backend, string, string, string) error {
+	runPlainFn = func(context.Context, ai.Backend, string, string, string, io.Writer, io.Writer) error {
 		atomic.AddInt32(&plainCalls, 1)
 		return nil
 	}
@@ -38,7 +39,7 @@ func TestHandleCaseCollisions_DryRun(t *testing.T) {
 	detectCaseCollisionsFn = func(string) ([][]string, error) {
 		return [][]string{{"Foo.go", "foo.go"}}, nil
 	}
-	runPlainFn = func(context.Context, ai.Backend, string, string, string) error {
+	runPlainFn = func(context.Context, ai.Backend, string, string, string, io.Writer, io.Writer) error {
 		t.Fatalf("runPlain must not be called in dry-run")
 		return nil
 	}
@@ -69,7 +70,7 @@ func TestHandleCaseCollisions_LLMSucceedsCleanAfter(t *testing.T) {
 		return nil, nil
 	}
 	var ranLLM int32
-	runPlainFn = func(context.Context, ai.Backend, string, string, string) error {
+	runPlainFn = func(context.Context, ai.Backend, string, string, string, io.Writer, io.Writer) error {
 		atomic.AddInt32(&ranLLM, 1)
 		return nil
 	}
@@ -93,7 +94,7 @@ func TestHandleCaseCollisions_LLMRemainingAfter(t *testing.T) {
 	detectCaseCollisionsFn = func(string) ([][]string, error) {
 		return [][]string{{"Foo.go", "foo.go"}}, nil
 	}
-	runPlainFn = func(context.Context, ai.Backend, string, string, string) error { return nil }
+	runPlainFn = func(context.Context, ai.Backend, string, string, string, io.Writer, io.Writer) error { return nil }
 
 	err := handleCaseCollisions(context.Background(), branchBaseOpts(t), t.TempDir(), "feature")
 	if err == nil {
@@ -112,7 +113,7 @@ func TestHandleCaseCollisions_LLMError(t *testing.T) {
 	detectCaseCollisionsFn = func(string) ([][]string, error) {
 		return [][]string{{"Foo.go", "foo.go"}}, nil
 	}
-	runPlainFn = func(context.Context, ai.Backend, string, string, string) error {
+	runPlainFn = func(context.Context, ai.Backend, string, string, string, io.Writer, io.Writer) error {
 		return errors.New("model crashed")
 	}
 

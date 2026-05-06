@@ -224,7 +224,7 @@ func TestRunFix_Claude_Happy(t *testing.T) {
 	writeScript(t, dir, "claude", `#!/bin/sh
 exit 0
 `)
-	if err := RunFix(context.Background(), BackendClaude, "sonnet", "prompt", t.TempDir()); err != nil {
+	if err := RunFix(context.Background(), BackendClaude, "sonnet", "prompt", t.TempDir(), nil, nil); err != nil {
 		t.Fatalf("RunFix: %v", err)
 	}
 }
@@ -234,7 +234,7 @@ func TestRunFix_Claude_NonZeroExit(t *testing.T) {
 	writeScript(t, dir, "claude", `#!/bin/sh
 exit 2
 `)
-	if err := RunFix(context.Background(), BackendClaude, "sonnet", "prompt", t.TempDir()); err == nil {
+	if err := RunFix(context.Background(), BackendClaude, "sonnet", "prompt", t.TempDir(), nil, nil); err == nil {
 		t.Fatal("expected non-nil error on non-zero exit")
 	}
 }
@@ -247,7 +247,7 @@ echo "hello" > marker.txt
 exit 0
 `)
 	workDir := t.TempDir()
-	if err := RunFix(context.Background(), BackendClaude, "sonnet", "prompt", workDir); err != nil {
+	if err := RunFix(context.Background(), BackendClaude, "sonnet", "prompt", workDir, nil, nil); err != nil {
 		t.Fatalf("RunFix: %v", err)
 	}
 	p := filepath.Join(workDir, "marker.txt")
@@ -265,14 +265,14 @@ func TestRunFix_Codex_Happy(t *testing.T) {
 	writeScript(t, dir, "codex", `#!/bin/sh
 exit 0
 `)
-	if err := RunFix(context.Background(), BackendCodex, "gpt", "p", t.TempDir()); err != nil {
+	if err := RunFix(context.Background(), BackendCodex, "gpt", "p", t.TempDir(), nil, nil); err != nil {
 		t.Fatalf("RunFix codex: %v", err)
 	}
 }
 
 func TestRunFix_NoBackendAvailable(t *testing.T) {
 	exclusivePATH(t)
-	err := RunFix(context.Background(), BackendAuto, "m", "p", t.TempDir())
+	err := RunFix(context.Background(), BackendAuto, "m", "p", t.TempDir(), nil, nil)
 	if err == nil {
 		t.Fatal("expected no-backend error")
 	}
@@ -286,7 +286,7 @@ func TestRunPlain_DelegatesToRunFix(t *testing.T) {
 	writeScript(t, dir, "claude", `#!/bin/sh
 exit 0
 `)
-	if err := RunPlain(context.Background(), BackendClaude, "m", "p", t.TempDir()); err != nil {
+	if err := RunPlain(context.Background(), BackendClaude, "m", "p", t.TempDir(), nil, nil); err != nil {
 		t.Fatalf("RunPlain: %v", err)
 	}
 }

@@ -1,0 +1,8 @@
+ PR#   Status      Step           Elapsed   Title
+────────────────────────────────────────────────────────────────────────────────────────────────────
+▸ 201   ● running gate           —         feat: change 1
+  202   ✗ failed  —              —         feat: change 2
+  203   ○ queued  —              —         feat: change 3
+
+ 1 running | 0 done | 1 failed | 1 queued
+ ↑↓ navigate  ⏎ detail  q quit

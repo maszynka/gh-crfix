@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -18,7 +19,7 @@ func TestFixConflictMarkers_Clean(t *testing.T) {
 
 	var plainCalls int32
 	detectMarkersFn = func(string) ([]string, error) { return nil, nil }
-	runPlainFn = func(context.Context, ai.Backend, string, string, string) error {
+	runPlainFn = func(context.Context, ai.Backend, string, string, string, io.Writer, io.Writer) error {
 		atomic.AddInt32(&plainCalls, 1)
 		return nil
 	}
@@ -37,7 +38,7 @@ func TestFixConflictMarkers_DryRun(t *testing.T) {
 	installSeams(t)
 
 	detectMarkersFn = func(string) ([]string, error) { return []string{"a.go"}, nil }
-	runPlainFn = func(context.Context, ai.Backend, string, string, string) error {
+	runPlainFn = func(context.Context, ai.Backend, string, string, string, io.Writer, io.Writer) error {
 		t.Fatalf("runPlain must not be called in dry-run")
 		return nil
 	}
@@ -63,7 +64,7 @@ func TestFixConflictMarkers_LLMResolves(t *testing.T) {
 		return nil, nil
 	}
 	var ranLLM int32
-	runPlainFn = func(context.Context, ai.Backend, string, string, string) error {
+	runPlainFn = func(context.Context, ai.Backend, string, string, string, io.Writer, io.Writer) error {
 		atomic.AddInt32(&ranLLM, 1)
 		return nil
 	}
@@ -85,7 +86,7 @@ func TestFixConflictMarkers_LLMFails(t *testing.T) {
 	installSeams(t)
 
 	detectMarkersFn = func(string) ([]string, error) { return []string{"a.go"}, nil }
-	runPlainFn = func(context.Context, ai.Backend, string, string, string) error {
+	runPlainFn = func(context.Context, ai.Backend, string, string, string, io.Writer, io.Writer) error {
 		return errors.New("no model available")
 	}
 
@@ -106,7 +107,7 @@ func TestFixConflictMarkers_MarkersRemainAfterLLM(t *testing.T) {
 	detectMarkersFn = func(string) ([]string, error) {
 		return []string{"unresolved.go"}, nil
 	}
-	runPlainFn = func(context.Context, ai.Backend, string, string, string) error { return nil }
+	runPlainFn = func(context.Context, ai.Backend, string, string, string, io.Writer, io.Writer) error { return nil }
 
 	err := fixConflictMarkers(context.Background(), branchBaseOpts(t), t.TempDir(), noopLog)
 	if err == nil {
@@ -131,7 +132,7 @@ func TestFixConflictMarkers_LockfileOnlyDoesNotInvokeLLM(t *testing.T) {
 		return []string{"bun.lock", "apps/psypapka/CHANGELOG.md"}, nil
 	}
 	var llmCalls int32
-	runPlainFn = func(context.Context, ai.Backend, string, string, string) error {
+	runPlainFn = func(context.Context, ai.Backend, string, string, string, io.Writer, io.Writer) error {
 		atomic.AddInt32(&llmCalls, 1)
 		return nil
 	}
@@ -176,7 +177,7 @@ func TestFixConflictMarkers_MixedPromptsLLMOnlyForUndeterministic(t *testing.T) 
 	}
 
 	var capturedPrompt string
-	runPlainFn = func(_ context.Context, _ ai.Backend, _ string, prompt, _ string) error {
+	runPlainFn = func(_ context.Context, _ ai.Backend, _ string, prompt, _ string, _, _ io.Writer) error {
 		capturedPrompt = prompt
 		return nil
 	}
@@ -220,7 +221,7 @@ func TestFixConflictMarkers_AutoResolveCommitFailureFallsThrough(t *testing.T) {
 		return nil, nil
 	}
 	var llmCalls int32
-	runPlainFn = func(context.Context, ai.Backend, string, string, string) error {
+	runPlainFn = func(context.Context, ai.Backend, string, string, string, io.Writer, io.Writer) error {
 		atomic.AddInt32(&llmCalls, 1)
 		return nil
 	}

@@ -109,7 +109,7 @@ func Load(path string) (Config, error) {
 			}
 		case "WORKTREE_MODE":
 			switch value {
-			case "temp", "reuse", "stash":
+			case "temp", "reuse", "stash", "isolated":
 				c.WorktreeMode = value
 			}
 		// unknown keys: silently ignore

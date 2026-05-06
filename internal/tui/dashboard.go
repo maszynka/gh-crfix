@@ -9,6 +9,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -49,16 +50,42 @@ type DashboardConfig struct {
 	Tracker *progress.Tracker
 	Run     *logs.Run
 	Refresh time.Duration // default 250ms
+	// Output, when non-nil, is the writer bubbletea renders to. Callers
+	// must set this if they have already swapped os.Stdout (e.g. to redirect
+	// per-PR writes into the master log) — otherwise the dashboard would
+	// render into the redirected sink instead of the user's terminal.
+	Output io.Writer
 }
 
 // Run starts the dashboard synchronously and blocks until the user quits
 // or ctx is cancelled. It is intended to be called from the main
 // goroutine with a TTY attached.
+//
+// The bubbletea program is configured with WithAltScreen so its frames
+// render on the terminal's alternate screen buffer. Without this, frames
+// interleave with whatever else is writing to stdout/stderr (subprocess
+// output, log lines, …) and the terminal gets clobbered.
 func Run(ctx context.Context, cfg DashboardConfig) error {
+	return runWithIO(ctx, cfg, cfg.Output, nil)
+}
+
+// runWithIO is the testable seam used by Run. When out is non-nil it is
+// passed to bubbletea via tea.WithOutput; production code uses this to pin
+// the dashboard to the original terminal after swapping os.Stdout for log
+// redirection. When in is non-nil it is wired via tea.WithInput, which tests
+// use to keep bubbletea from trying to read the test process's stdin.
+func runWithIO(ctx context.Context, cfg DashboardConfig, out io.Writer, in io.Reader) error {
 	if cfg.Refresh <= 0 {
 		cfg.Refresh = 250 * time.Millisecond
 	}
-	p := tea.NewProgram(newModel(cfg))
+	opts := []tea.ProgramOption{tea.WithAltScreen()}
+	if out != nil {
+		opts = append(opts, tea.WithOutput(out))
+	}
+	if in != nil {
+		opts = append(opts, tea.WithInput(in))
+	}
+	p := tea.NewProgram(newModel(cfg), opts...)
 
 	// Forward ctx cancellation into the program so callers can tear us
 	// down cleanly.

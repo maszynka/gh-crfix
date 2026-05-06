@@ -31,6 +31,12 @@ func runSetupWizard(in io.Reader, out io.Writer, cfg config.Config, cfgPath stri
 	fmt.Fprintln(out, "  stash  — git stash uncommitted changes before reset; pop after run")
 	fmt.Fprintln(out, "           Pros: rerun safely with dirty trees; nothing is lost.")
 	fmt.Fprintln(out, "           Cons: stash conflicts on pop need manual cleanup.")
+	fmt.Fprintln(out, "  isolated — never borrow another worktree; create a private")
+	fmt.Fprintln(out, "             detached-HEAD checkout at .gh-crfix/worktrees/pr-<N>.")
+	fmt.Fprintln(out, "           Pros: zero risk of touching files in other tools'")
+	fmt.Fprintln(out, "                 worktrees (.claude/worktrees/, etc).")
+	fmt.Fprintln(out, "           Cons: each PR pays a fresh fetch+add cost; commits land")
+	fmt.Fprintln(out, "                 detached so push needs HEAD:<branch> (fast-forward).")
 	fmt.Fprintln(out)
 
 	cur := cfg.WorktreeMode
@@ -47,7 +53,7 @@ func runSetupWizard(in io.Reader, out io.Writer, cfg config.Config, cfgPath stri
 		choice = cur
 	}
 	switch choice {
-	case "temp", "reuse", "stash":
+	case "temp", "reuse", "stash", "isolated":
 		cfg.WorktreeMode = choice
 	default:
 		fmt.Fprintf(out, "  warning: unknown mode %q; using %q\n", choice, cur)

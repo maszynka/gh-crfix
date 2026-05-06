@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -28,6 +29,11 @@ const (
 	defaultGateTimeout = 5 * time.Minute
 	defaultFixTimeout  = 15 * time.Minute
 )
+
+// caveman is appended to all Claude system prompts to keep outputs terse and
+// reduce output-token costs. Technical precision is preserved; only filler
+// and pleasantries are suppressed.
+const caveman = "Be terse. No filler, articles, pleasantries, hedging. Technical terms exact. Code blocks unchanged. Thread response comments ≤2 sentences. Commit subject ≤50 chars."
 
 // ParseBackend parses a backend string into a Backend constant.
 func ParseBackend(s string) Backend {
@@ -128,7 +134,12 @@ func RunGate(ctx context.Context, backend Backend, model, prompt string, schema 
 // RunFix runs the fix model in dir with filesystem access. Honors ctx
 // cancellation/deadline and caps the call at GH_CRFIX_FIX_TIMEOUT (15m).
 // The model is expected to make code changes and write thread-responses.json.
-func RunFix(ctx context.Context, backend Backend, model, prompt, dir string) error {
+//
+// out and errw receive the subprocess's stdout/stderr respectively. Pass nil
+// to fall back to os.Stdout / os.Stderr (plain-mode default). Routing these
+// through writers is what lets dashboard mode capture subprocess noise into
+// the master log instead of leaking it onto the raw-mode TTY.
+func RunFix(ctx context.Context, backend Backend, model, prompt, dir string, out, errw io.Writer) error {
 	effective := resolveBackend(backend)
 
 	pf, err := os.CreateTemp("", "gh-crfix-fix-prompt-*.txt")
@@ -147,9 +158,9 @@ func RunFix(ctx context.Context, backend Backend, model, prompt, dir string) err
 
 	switch effective {
 	case BackendClaude:
-		return runClaudeFix(ctx, model, pf.Name(), dir)
+		return runClaudeFix(ctx, model, pf.Name(), dir, out, errw)
 	case BackendCodex:
-		return runCodexFix(ctx, model, pf.Name(), dir)
+		return runCodexFix(ctx, model, pf.Name(), dir, out, errw)
 	default:
 		return fmt.Errorf("no AI backend available (install claude or codex)")
 	}
@@ -157,9 +168,10 @@ func RunFix(ctx context.Context, backend Backend, model, prompt, dir string) err
 
 // RunPlain runs the fix model with filesystem access on a free-form prompt.
 // Unlike RunFix it does not expect thread-responses.json — used for case
-// collision normalization and committed conflict marker fixes.
-func RunPlain(ctx context.Context, backend Backend, model, prompt, dir string) error {
-	return RunFix(ctx, backend, model, prompt, dir)
+// collision normalization and committed conflict marker fixes. See RunFix
+// for the writer semantics.
+func RunPlain(ctx context.Context, backend Backend, model, prompt, dir string, out, errw io.Writer) error {
+	return RunFix(ctx, backend, model, prompt, dir, out, errw)
 }
 
 func resolveBackend(b Backend) Backend {
@@ -209,6 +221,7 @@ func runClaudeStructured(ctx context.Context, model, promptFile, schemaFile stri
 		"--model", model,
 		"--output-format", "json",
 		"--json-schema", string(schemaBytes),
+		"--append-system-prompt", caveman,
 	)
 	cmd.Stdin = strings.NewReader(string(promptBytes))
 	out, err := cmd.Output()
@@ -245,7 +258,7 @@ func runCodexStructured(ctx context.Context, model, promptFile, schemaFile strin
 	return os.ReadFile(outFile.Name())
 }
 
-func runClaudeFix(ctx context.Context, model, promptFile, dir string) error {
+func runClaudeFix(ctx context.Context, model, promptFile, dir string, out, errw io.Writer) error {
 	promptBytes, err := os.ReadFile(promptFile)
 	if err != nil {
 		return err
@@ -253,18 +266,20 @@ func runClaudeFix(ctx context.Context, model, promptFile, dir string) error {
 	cmd := exec.CommandContext(ctx, "claude", "-p",
 		"--model", model,
 		"--dangerously-skip-permissions",
+		"--bare",
+		"--append-system-prompt", caveman,
 	)
 	cmd.Dir = dir
 	cmd.Stdin = strings.NewReader(string(promptBytes))
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = pickWriter(out, os.Stdout)
+	cmd.Stderr = pickWriter(errw, os.Stderr)
 	if err := cmd.Run(); err != nil {
 		return wrapExecErr(ctx, err, "claude")
 	}
 	return nil
 }
 
-func runCodexFix(ctx context.Context, model, promptFile, dir string) error {
+func runCodexFix(ctx context.Context, model, promptFile, dir string, out, errw io.Writer) error {
 	promptBytes, err := os.ReadFile(promptFile)
 	if err != nil {
 		return err
@@ -277,12 +292,21 @@ func runCodexFix(ctx context.Context, model, promptFile, dir string) error {
 	)
 	cmd.Dir = dir
 	cmd.Stdin = strings.NewReader(string(promptBytes))
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = pickWriter(out, os.Stdout)
+	cmd.Stderr = pickWriter(errw, os.Stderr)
 	if err := cmd.Run(); err != nil {
 		return wrapExecErr(ctx, err, "codex")
 	}
 	return nil
+}
+
+// pickWriter returns w if non-nil, otherwise fallback. Used to keep nil-arg
+// callers (plain mode) inheriting the parent's stdio.
+func pickWriter(w, fallback io.Writer) io.Writer {
+	if w != nil {
+		return w
+	}
+	return fallback
 }
 
 // wrapExecErr maps exec errors into context-aware errors so callers can use

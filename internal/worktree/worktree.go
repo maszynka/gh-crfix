@@ -31,6 +31,16 @@ const (
 	// resetting, then pops the stash at Cleanup time. If the pop conflicts,
 	// the stash is left in place so the user can recover manually.
 	ModeStash Mode = "stash"
+	// ModeIsolated bypasses the borrow logic entirely. Even if the target
+	// branch is checked out in another worktree (e.g. .claude/worktrees/X),
+	// gh-crfix creates its own worktree at .gh-crfix/worktrees/pr-<N> with
+	// a *detached HEAD* on origin/<branch>. The user's other worktree keeps
+	// exclusive ownership of the branch ref, so nothing in their workspace
+	// can be touched by accident. Use this when auto-stash on borrow would
+	// be too intrusive (e.g. you have a long-running feature branch open
+	// in another tool's worktree and don't want gh-crfix wiggling files
+	// underneath it).
+	ModeIsolated Mode = "isolated"
 )
 
 // ParseMode normalizes a raw config string into a Mode. Unknown values fall
@@ -41,6 +51,8 @@ func ParseMode(s string) Mode {
 		return ModeReuse
 	case ModeStash:
 		return ModeStash
+	case ModeIsolated:
+		return ModeIsolated
 	default:
 		return ModeTemp
 	}
@@ -110,6 +122,14 @@ func Setup(ctx context.Context, repoRoot, branch string, prNum int) (string, err
 		return "", fmt.Errorf("mkdir worktrees dir: %w", err)
 	}
 
+	// Isolated mode short-circuits the borrow logic entirely: we always
+	// build a private detached-HEAD worktree at our own path. Useful when
+	// the user keeps the branch open in another tool's worktree and doesn't
+	// want gh-crfix's auto-stash anywhere near their files.
+	if mode == ModeIsolated {
+		return setupIsolated(ctx, repoRoot, branch, prNum, wt)
+	}
+
 	// 1. Look for the branch in any existing worktree. If our designated path
 	// already hosts it, that's a normal "second-call" reuse. If something
 	// else (e.g. .claude/worktrees/<branch>) hosts it, borrow that worktree.
@@ -118,9 +138,28 @@ func Setup(ctx context.Context, repoRoot, branch string, prNum int) (string, err
 
 	if otherForBranch != "" && wtAtOurPath == "" {
 		// Branch is checked out elsewhere. Borrow it: Cleanup leaves it alone.
-		recordState(repoRoot, prNum, &setupState{
-			Mode: mode, Path: otherForBranch, Borrowed: true,
-		})
+		// If the user had uncommitted work there, stash it now so the rest of
+		// the pipeline sees a clean tree; Cleanup will pop the stash back. We
+		// do this regardless of `mode` because borrow is the case where the
+		// dirty state belongs to the *user*, not to a previous gh-crfix run,
+		// and refusing to run was the explicit pain point users hit.
+		state := &setupState{Mode: mode, Path: otherForBranch, Borrowed: true}
+		if dirty, _ := DirtyStatus(otherForBranch); dirty != "" {
+			ref := fmt.Sprintf("gh-crfix/borrow/pr-%d", prNum)
+			if err := gitIn(ctx, otherForBranch, "stash", "push",
+				"--include-untracked", "-m", ref); err != nil {
+				return "", fmt.Errorf(
+					"borrowed worktree %s is dirty and gh-crfix could not stash: %w\n"+
+						"  fix: commit or stash your changes there, or rerun with --isolated",
+					otherForBranch, err)
+			}
+			state.StashRef = ref
+		}
+		// Ensure the borrowed branch tracks origin so `git push` works without
+		// --set-upstream. The branch may have been created manually or by
+		// another tool without tracking configured.
+		_ = gitIn(ctx, otherForBranch, "branch", "--set-upstream-to=origin/"+branch, branch)
+		recordState(repoRoot, prNum, state)
 		return otherForBranch, nil
 	}
 
@@ -150,6 +189,10 @@ func Setup(ctx context.Context, repoRoot, branch string, prNum int) (string, err
 	var addErr error
 	if localExists {
 		addErr = gitIn(ctx, repoRoot, "worktree", "add", wt, branch)
+		// The local branch may lack tracking — wire it up so `git push` works.
+		if addErr == nil {
+			_ = gitIn(ctx, wt, "branch", "--set-upstream-to=origin/"+branch, branch)
+		}
 	} else {
 		addErr = gitIn(ctx, repoRoot, "worktree", "add", wt,
 			"--track", "-b", branch, "origin/"+branch)
@@ -197,6 +240,31 @@ func prepareExistingWorktree(ctx context.Context, wtPath, branch string, prNum i
 	default: // ModeTemp
 		return cleanWorktree(ctx, wtPath, branch)
 	}
+}
+
+// setupIsolated creates a private detached-HEAD worktree at wt rooted on
+// origin/<branch>. If a worktree already exists at wt (e.g. a previous
+// isolated run), it is removed first so we always start from a known clean
+// state. The branch ref itself is never claimed — that's the whole point.
+func setupIsolated(ctx context.Context, repoRoot, branch string, prNum int, wt string) (string, error) {
+	if err := gitIn(ctx, repoRoot, "fetch", "--quiet", "origin", branch); err != nil {
+		return "", fmt.Errorf("fetch %s: %w", branch, err)
+	}
+	// Remove any prior isolated worktree at our path so we don't pile up
+	// detached-HEAD checkouts. Errors are non-fatal — the next add will
+	// fail loudly if there's a real conflict.
+	if _, err := os.Stat(wt); err == nil {
+		_ = gitIn(ctx, repoRoot, "worktree", "remove", "--force", wt)
+		_ = os.RemoveAll(wt)
+	}
+	if err := gitIn(ctx, repoRoot, "worktree", "add", "--detach",
+		wt, "origin/"+branch); err != nil {
+		return "", fmt.Errorf("isolated worktree add: %w", err)
+	}
+	recordState(repoRoot, prNum, &setupState{
+		Mode: ModeIsolated, Path: wt,
+	})
+	return wt, nil
 }
 
 func recordState(repoRoot string, prNum int, s *setupState) {

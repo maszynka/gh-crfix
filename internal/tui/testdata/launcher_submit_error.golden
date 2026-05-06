@@ -1,0 +1,14 @@
+gh crfix launcher
+Enter a PR number, range, list, or full GitHub URL. Use arrows on the rest.
+
+ > Target:        [_]
+   AI backend:    < auto >
+   Gate model:    < sonnet >
+   Fix model:     < sonnet >
+   Concurrency:   < 1 >
+   needs_llm:     < 0.0 >
+   pr_comment:    < 0.0 >
+   test_failure:  < 0.0 >
+
+[Enter] run   [s] save defaults   [q] cancel   up/down navigate   left/right change
+error: Target is required.

@@ -1,0 +1,22 @@
+ PR #301 — feat: change 1  [● running]
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ Checklist:
+ ✓ Setup worktree
+ ○ Normalize case
+ ○ Merge base branch
+ ○ Resolve conflict markers
+ ○ Fetch review threads
+ ○ Triage threads
+ ○ Autofix hook
+ ○ Validation
+ ● Gate model
+ ○ Fix model
+ ○ Reply & resolve
+ ○ Cleanup artifact
+ ○ Request re-review
+ ○ Post-fix review cycle
+
+ Recent log:
+ (no log yet)
+
+ ← back  ↑↓ scroll  q quit

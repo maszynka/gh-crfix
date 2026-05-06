@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -38,8 +39,8 @@ type seamBackup struct {
 	detectCaseCollisions func(string) ([][]string, error)
 	detectMarkers        func(string) ([]string, error)
 	runGate              func(context.Context, ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error)
-	runFix               func(context.Context, ai.Backend, string, string, string) error
-	runPlain             func(context.Context, ai.Backend, string, string, string) error
+	runFix               func(context.Context, ai.Backend, string, string, string, io.Writer, io.Writer) error
+	runPlain             func(context.Context, ai.Backend, string, string, string, io.Writer, io.Writer) error
 	sleep                func(time.Duration)
 }
 
@@ -111,8 +112,8 @@ func installSeams(t *testing.T) {
 	runGateFn = func(context.Context, ai.Backend, string, string, map[string]interface{}) (ai.GateOutput, error) {
 		return ai.GateOutput{}, nil
 	}
-	runFixFn = func(context.Context, ai.Backend, string, string, string) error { return nil }
-	runPlainFn = func(context.Context, ai.Backend, string, string, string) error { return nil }
+	runFixFn = func(context.Context, ai.Backend, string, string, string, io.Writer, io.Writer) error { return nil }
+	runPlainFn = func(context.Context, ai.Backend, string, string, string, io.Writer, io.Writer) error { return nil }
 	sleepFn = func(time.Duration) {}
 }
 
@@ -305,7 +306,7 @@ func TestProcessPR_GateDeclinesAdvancedModel(t *testing.T) {
 		return ai.GateOutput{NeedsAdvancedModel: false, Reason: "not needed"}, nil
 	}
 	fixCalled := int32(0)
-	runFixFn = func(context.Context, ai.Backend, string, string, string) error {
+	runFixFn = func(context.Context, ai.Backend, string, string, string, io.Writer, io.Writer) error {
 		atomic.AddInt32(&fixCalled, 1)
 		return nil
 	}
@@ -374,7 +375,7 @@ func TestProcessPR_DryRun(t *testing.T) {
 		t.Fatalf("RunGate should not run in dry-run mode")
 		return ai.GateOutput{}, nil
 	}
-	runFixFn = func(context.Context, ai.Backend, string, string, string) error {
+	runFixFn = func(context.Context, ai.Backend, string, string, string, io.Writer, io.Writer) error {
 		t.Fatalf("RunFix should not run in dry-run mode")
 		return nil
 	}
@@ -470,7 +471,7 @@ func TestProcessPR_AllSkipped(t *testing.T) {
 		t.Fatalf("gate must not run when all threads are skipped")
 		return ai.GateOutput{}, nil
 	}
-	runFixFn = func(context.Context, ai.Backend, string, string, string) error {
+	runFixFn = func(context.Context, ai.Backend, string, string, string, io.Writer, io.Writer) error {
 		t.Fatalf("fix must not run when all threads are skipped")
 		return nil
 	}
@@ -616,7 +617,7 @@ func TestProcessPR_FixModelWritesResponses(t *testing.T) {
 	}
 
 	fixCalled := int32(0)
-	runFixFn = func(_ context.Context, _ ai.Backend, _ string, _ string, workdir string) error {
+	runFixFn = func(_ context.Context, _ ai.Backend, _ string, _ string, workdir string, _, _ io.Writer) error {
 		atomic.AddInt32(&fixCalled, 1)
 		body := `[{"thread_id":"t1","action":"fixed","comment":"replaced the bug with a fix"}]`
 		return os.WriteFile(filepath.Join(workdir, "thread-responses.json"), []byte(body), 0o644)
@@ -843,7 +844,7 @@ func TestProcessPR_ConflictMarkersUnresolvable(t *testing.T) {
 	detectMarkersFn = func(string) ([]string, error) {
 		return []string{"bad.go"}, nil
 	}
-	runPlainFn = func(context.Context, ai.Backend, string, string, string) error { return nil }
+	runPlainFn = func(context.Context, ai.Backend, string, string, string, io.Writer, io.Writer) error { return nil }
 
 	res := ProcessPR(context.Background(), branchBaseOpts(t))
 	if res.Status == "ok" {
@@ -879,7 +880,7 @@ func TestProcessPR_FixModelError(t *testing.T) {
 	}
 	fixErr := errors.New("claude exited 1")
 	var fixCalled int32
-	runFixFn = func(context.Context, ai.Backend, string, string, string) error {
+	runFixFn = func(context.Context, ai.Backend, string, string, string, io.Writer, io.Writer) error {
 		atomic.AddInt32(&fixCalled, 1)
 		return fixErr
 	}
@@ -971,7 +972,7 @@ func TestProcessPR_DirtyWorktreeHandledByCollisions(t *testing.T) {
 		return nil, nil
 	}
 	var plainCalls int32
-	runPlainFn = func(context.Context, ai.Backend, string, string, string) error {
+	runPlainFn = func(context.Context, ai.Backend, string, string, string, io.Writer, io.Writer) error {
 		atomic.AddInt32(&plainCalls, 1)
 		return nil
 	}
@@ -1083,7 +1084,7 @@ func TestProcessPR_GateModelError(t *testing.T) {
 		return ai.GateOutput{}, errors.New("gate crashed")
 	}
 	var fixCalled int32
-	runFixFn = func(context.Context, ai.Backend, string, string, string) error {
+	runFixFn = func(context.Context, ai.Backend, string, string, string, io.Writer, io.Writer) error {
 		atomic.AddInt32(&fixCalled, 1)
 		return nil
 	}
@@ -1228,7 +1229,7 @@ func TestProcessPR_GateFlagFalseButThreadsToFixNonEmpty(t *testing.T) {
 
 	fixCalled := int32(0)
 	var fixedIDs []string
-	runFixFn = func(_ context.Context, _ ai.Backend, _ string, prompt, _ string) error {
+	runFixFn = func(_ context.Context, _ ai.Backend, _ string, prompt, _ string, _, _ io.Writer) error {
 		atomic.AddInt32(&fixCalled, 1)
 		// Record which IDs the prompt targets so the assertion can compare.
 		for _, id := range []string{"t1", "t2"} {

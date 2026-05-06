@@ -261,34 +261,42 @@ func runBatch(
 	dashCtx, dashCancel := context.WithCancel(ctx)
 	defer dashCancel()
 
-	// Dashboard mode: a one-liner on stderr before the framebuffer takes over
-	// so the user knows something is happening during setup. stderr isn't
-	// redirected to the log file the way stdout is below.
+	// Dashboard mode: print the "Setting up..." banner BEFORE we swap stdio
+	// — this is the user's last visual cue before bubbletea enters the alt
+	// screen and the regular terminal goes quiet for the duration of the run.
 	fmt.Fprintf(os.Stderr, "Setting up %d PR(s)...\n", len(plan.prNums))
-	// Per-setupOnePR progress goes to stderr too (not stdout, which we're
-	// about to redirect into the master log). These lines will interleave
-	// with the dashboard briefly during setup, but they land on stderr which
-	// bubbletea's framebuffer doesn't touch — they'll scroll above the
-	// dashboard at worst. Better than 30s of silence.
-	plan.opts.ProgressOut = os.Stderr
 
-	// Silence per-PR stdout during dashboard so the two surfaces don't
-	// overlap. All those writes go to the master log via the usual tee in
-	// logs.Run, so nothing is lost — only the live terminal mirror is
-	// suppressed. See design note below.
-	origStdout := os.Stdout
+	// Open the master log file as the sink for everything that would
+	// otherwise hit the terminal. Falls back to /dev/null if the log file
+	// can't be opened — better silent than corrupting the dashboard.
 	devNullOrLog, _ := os.OpenFile(runLog.MasterLog(),
 		os.O_WRONLY|os.O_APPEND, 0o644)
 	if devNullOrLog == nil {
 		devNullOrLog, _ = os.Open(os.DevNull)
 	}
+
+	// Both stdout AND stderr need to be redirected. The previous version
+	// only redirected stdout, leaving stderr inheriting the raw-mode TTY.
+	// Subprocesses (bun test, vitest, claude) and Fprintf(os.Stderr, …)
+	// callers would write LF-only lines that the raw TTY interpreted
+	// without auto-CR — producing the stair-stepped output the user saw.
+	origStdout := os.Stdout
+	origStderr := os.Stderr
 	os.Stdout = devNullOrLog
+	os.Stderr = devNullOrLog
 	defer func() {
 		os.Stdout = origStdout
+		os.Stderr = origStderr
 		if devNullOrLog != nil {
 			_ = devNullOrLog.Close()
 		}
 	}()
+
+	// All progress + subprocess output streams go to the master log so the
+	// dashboard owns the terminal exclusively. The dashboard surfaces the
+	// same information visually via the per-step tracker.
+	plan.opts.ProgressOut = devNullOrLog
+	plan.opts.SubprocessOut = devNullOrLog
 
 	var dashWg sync.WaitGroup
 	dashWg.Add(1)
@@ -299,6 +307,11 @@ func runBatch(
 			Tracker: tracker,
 			Run:     runLog,
 			Refresh: 250 * time.Millisecond,
+			// Pin bubbletea to the *original* stdout so it renders to the
+			// real terminal even though we just swapped os.Stdout to point
+			// at the master log. Without this, the dashboard would write
+			// its frames into the log file the user can't see.
+			Output: origStdout,
 		})
 		// Dashboard exited (user pressed q or ctx done) — cancel so the
 		// batch worker also winds up.
@@ -530,7 +543,7 @@ func splitArgsAndFlags(args []string) (prSpec string, flags, unknown []string) {
 		"--setup-only": true, "--exclude-outdated": true, "--include-outdated": true,
 		"--verbose": true, "--no-tui": true, "--no-notify": true,
 		"--version": true, "-v": true, "--help": true, "-h": true, "--seq": true,
-		"--setup": true, "-s": true,
+		"--setup": true, "-s": true, "--isolated": true,
 	}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -644,10 +657,12 @@ func applyFlags(flags []string, cfg *config.Config) {
 			if i+1 < len(flags) {
 				i++
 				switch flags[i] {
-				case "temp", "reuse", "stash":
+				case "temp", "reuse", "stash", "isolated":
 					cfg.WorktreeMode = flags[i]
 				}
 			}
+		case "--isolated":
+			cfg.WorktreeMode = "isolated"
 		}
 	}
 }
@@ -723,10 +738,12 @@ func applyWorkflowFlags(flags []string, opts *workflow.Options) {
 			if i+1 < len(flags) {
 				i++
 				switch flags[i] {
-				case "temp", "reuse", "stash":
+				case "temp", "reuse", "stash", "isolated":
 					opts.WorktreeMode = flags[i]
 				}
 			}
+		case "--isolated":
+			opts.WorktreeMode = "isolated"
 		}
 	}
 }
@@ -833,7 +850,10 @@ Flags:
   --score-test-failure N   gate score weight [0,1]
   --no-tui                 disable the Bubble Tea dashboard even on TTY
   --no-notify              suppress the completion notification
-  --worktree-mode MODE     temp|reuse|stash (default: temp)
+  --worktree-mode MODE     temp|reuse|stash|isolated (default: temp)
+  --isolated               shorthand for --worktree-mode=isolated:
+                           never borrow another worktree, always create
+                           a private detached-HEAD checkout
   --setup, -s              run the interactive setup wizard
   --verbose                verbose output
   --version, -v            show version

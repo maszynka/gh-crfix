@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -19,6 +20,12 @@ import (
 // `pnpm test`, or custom hook doesn't stall the whole pipeline. Override via
 // env `GH_CRFIX_VALIDATE_TIMEOUT` (Go duration, e.g. "30m").
 const defaultValidateTimeout = 15 * time.Minute
+
+// defaultHeartbeatInterval is how often a "still running" line is written to
+// the stream during a long validation. Override via env
+// `GH_CRFIX_VALIDATE_HEARTBEAT` (Go duration, e.g. "1m"). Set to "0" to
+// disable.
+const defaultHeartbeatInterval = 30 * time.Second
 
 // RunnerKind identifies what kind of runner is available.
 type RunnerKind int
@@ -128,13 +135,51 @@ func Run(ctx context.Context, worktreePath string, r Runner, stream io.Writer) R
 
 	// Stream stdout+stderr line-by-line while collecting the full output for
 	// the Summary. If stream is nil, we still collect but don't mirror.
+	//
+	// When stream is provided we wrap it in a heartbeatWriter so the heartbeat
+	// goroutine below can write concurrently without racing with cmd output.
 	var collected bytes.Buffer
-	var writer io.Writer = &collected
+	var hbw *heartbeatWriter
+	var cmdWriter io.Writer = &collected
 	if stream != nil {
-		writer = io.MultiWriter(&collected, stream)
+		hbw = &heartbeatWriter{w: stream, lastAt: time.Now()}
+		cmdWriter = io.MultiWriter(&collected, hbw)
 	}
-	cmd.Stdout = writer
-	cmd.Stderr = writer
+	cmd.Stdout = cmdWriter
+	cmd.Stderr = cmdWriter
+
+	// Heartbeat: periodically write a "still running" line to the stream so
+	// the TUI/log doesn't go silent during long test suites. The message also
+	// reports time since last subprocess output so hung processes are obvious.
+	heartbeatInterval := envDuration("GH_CRFIX_VALIDATE_HEARTBEAT", defaultHeartbeatInterval)
+	if heartbeatInterval > 0 && hbw != nil {
+		start := time.Now()
+		done := make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(heartbeatInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-done:
+					return
+				case <-ctx.Done():
+					return
+				case now := <-ticker.C:
+					elapsed := now.Sub(start).Round(time.Second)
+					since := hbw.sinceLastOutput()
+					var msg string
+					if since >= heartbeatInterval {
+						msg = fmt.Sprintf("[validation] still running — %s elapsed, no output for %s\n",
+							elapsed, since.Round(time.Second))
+					} else {
+						msg = fmt.Sprintf("[validation] still running — %s elapsed\n", elapsed)
+					}
+					hbw.writeMsg(msg)
+				}
+			}
+		}()
+		defer close(done)
+	}
 
 	err := cmd.Run()
 	success := err == nil
@@ -186,6 +231,36 @@ func readHookJSON(path string) (Result, bool) {
 		return Result{}, false
 	}
 	return r, true
+}
+
+// heartbeatWriter wraps an io.Writer with a mutex so the heartbeat goroutine
+// and the cmd output goroutine can write concurrently without interleaving.
+// It also tracks the last time output arrived from the subprocess.
+type heartbeatWriter struct {
+	mu     sync.Mutex
+	w      io.Writer
+	lastAt time.Time
+}
+
+func (h *heartbeatWriter) Write(p []byte) (int, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.lastAt = time.Now()
+	return h.w.Write(p)
+}
+
+// writeMsg writes a heartbeat line. Uses the same lock as Write so the two
+// goroutines never interleave mid-line.
+func (h *heartbeatWriter) writeMsg(s string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	_, _ = fmt.Fprint(h.w, s)
+}
+
+func (h *heartbeatWriter) sinceLastOutput() time.Duration {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return time.Since(h.lastAt)
 }
 
 func isExec(path string) bool {

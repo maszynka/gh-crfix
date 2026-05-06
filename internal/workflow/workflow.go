@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -78,6 +79,12 @@ type Options struct {
 	// even when stdout is redirected to the master log for a TUI. When nil,
 	// setupOnePR emits no progress lines.
 	ProgressOut io.Writer
+	// SubprocessOut receives both stdout and stderr from external CLI calls
+	// (autofix hook, claude/codex fix). When nil, those subprocesses inherit
+	// the parent process's stdio. Dashboard mode sets this to the master
+	// log so the TTY isn't trampled by raw-mode-incompatible output from
+	// test runners and AI CLIs.
+	SubprocessOut io.Writer
 }
 
 // Result summarises the outcome of a single ProcessPR call. Filled in even on
@@ -352,7 +359,7 @@ func ProcessPR(ctx context.Context, opts Options) Result {
 		if hookPath != "" {
 			log("running autofix hook...")
 			setStep(progress.StepAutofix, progress.Running, hookPath)
-			if herr := runHook(ctx, hookPath, wtPath); herr != nil {
+			if herr := runHook(ctx, hookPath, wtPath, opts.SubprocessOut, opts.SubprocessOut); herr != nil {
 				// Autofix is best-effort; surface the error but continue.
 				log("autofix hook failed: %v", herr)
 				setStep(progress.StepAutofix, progress.Failed, herr.Error())
@@ -490,6 +497,10 @@ func ProcessPR(ctx context.Context, opts Options) Result {
 	// a non-empty ThreadsToFix list. Some models respond with flag=false +
 	// non-empty list (contradictory but common); honoring the list prevents
 	// those threads from being silently dropped as "no code change needed".
+	//
+	// Large PRs are split into chunks of GH_CRFIX_FIX_CHUNK threads (default
+	// 20) so a single session never hits the context-deadline limit. Each
+	// chunk gets its own claude invocation; responses are merged.
 	shouldFix := gateOut.NeedsAdvancedModel || len(gateOut.ThreadsToFix) > 0
 	if shouldFix && !opts.DryRun && !gateFailed {
 		// If gate didn't nominate a list, send all active needs_llm threads.
@@ -498,19 +509,31 @@ func ProcessPR(ctx context.Context, opts Options) Result {
 				selected = append(selected, c.ThreadID)
 			}
 		}
-		log("running fix model (%s) on %d thread(s)...", opts.FixModel, len(selected))
-		setStep(progress.StepFix, progress.Running, fmt.Sprintf("%d thread(s)", len(selected)))
-		fixPrompt := buildFixPrompt(rawThreads, activeNeedsLLM, selected, validResult, ciChecks)
-		if ferr := runFixFn(ctx, opts.AIBackend, opts.FixModel, fixPrompt, wtPath); ferr != nil {
-			log("fix model error: %v", ferr)
-			setStep(progress.StepFix, progress.Failed, ferr.Error())
-		} else {
+		chunkSize := envIntWF("GH_CRFIX_FIX_CHUNK", 20)
+		chunks := chunkStrings(selected, chunkSize)
+		log("running fix model (%s) on %d thread(s) in %d chunk(s)...", opts.FixModel, len(selected), len(chunks))
+		setStep(progress.StepFix, progress.Running, fmt.Sprintf("%d thread(s), %d chunk(s)", len(selected), len(chunks)))
+
+		var fixFailed bool
+		for i, chunk := range chunks {
+			chunkPrompt := buildFixPrompt(rawThreads, activeNeedsLLM, chunk, validResult, ciChecks)
+			if len(chunks) > 1 {
+				chunkPrompt = fmt.Sprintf("## Chunk %d/%d — fix only these threads, commit after this chunk.\n\n%s", i+1, len(chunks), chunkPrompt)
+			}
+			if ferr := runFixFn(ctx, opts.AIBackend, opts.FixModel, chunkPrompt, wtPath, opts.SubprocessOut, opts.SubprocessOut); ferr != nil {
+				log("fix model chunk %d/%d error: %v", i+1, len(chunks), ferr)
+				setStep(progress.StepFix, progress.Failed, fmt.Sprintf("chunk %d/%d: %s", i+1, len(chunks), ferr.Error()))
+				fixFailed = true
+				break
+			}
+			if chunkResponses, rerr := readThreadResponses(wtPath); rerr == nil {
+				responses = append(responses, chunkResponses...)
+				_ = os.Remove(filepath.Join(wtPath, "thread-responses.json"))
+			}
+		}
+		if !fixFailed {
 			res.FixModelRan = true
 			setStep(progress.StepFix, progress.Done, opts.FixModel)
-		}
-		// Read thread-responses.json written by the fix model.
-		if fixResponses, rerr := readThreadResponses(wtPath); rerr == nil {
-			responses = append(responses, fixResponses...)
 		}
 	} else if gateCtx.ShouldRunGate && !shouldFix && !gateFailed && !opts.DryRun {
 		setStep(progress.StepFix, progress.Skipped, "gate said not needed")
@@ -666,7 +689,7 @@ Required approach:
 6. Do NOT create thread-responses.json.
 7. End with a clean git status.
 `)
-	if err := runPlainFn(ctx, opts.AIBackend, opts.FixModel, sb.String(), wtPath); err != nil {
+	if err := runPlainFn(ctx, opts.AIBackend, opts.FixModel, sb.String(), wtPath, opts.SubprocessOut, opts.SubprocessOut); err != nil {
 		return err
 	}
 	// Verify it's actually clean.
@@ -718,7 +741,7 @@ func fixConflictMarkers(ctx context.Context, opts Options, wtPath string, log fu
 		llmTargets = result.Remaining
 	}
 	log("fix-model: %d file(s) need LLM resolution (%v)", len(llmTargets), llmTargets)
-	if err := runPlainFn(ctx, opts.AIBackend, opts.FixModel, conflict.BuildFixPrompt(llmTargets), wtPath); err != nil {
+	if err := runPlainFn(ctx, opts.AIBackend, opts.FixModel, conflict.BuildFixPrompt(llmTargets), wtPath, opts.SubprocessOut, opts.SubprocessOut); err != nil {
 		return err
 	}
 	remaining, _ := detectMarkersFn(wtPath)
@@ -962,13 +985,25 @@ func detectAutofixHook(wtPath string) string {
 
 // runHook runs a shell hook in dir and propagates cmd.Run()'s error so the
 // caller can log or surface the failure. ctx is honored so Ctrl+C can stop
-// a hanging hook; hook stdout/stderr stream to the process's stdout/stderr.
-func runHook(ctx context.Context, hookPath, dir string) error {
+// a hanging hook.
+//
+// out/errw receive the hook's stdout/stderr. Pass nil to inherit the
+// process's stdio (plain-mode default). Routing through writers is what
+// keeps dashboard mode from leaking bun/vitest output onto the raw-mode TTY.
+func runHook(ctx context.Context, hookPath, dir string, out, errw io.Writer) error {
 	cmd := exec.CommandContext(ctx, hookPath)
 	cmd.Dir = dir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = pickWriter(out, os.Stdout)
+	cmd.Stderr = pickWriter(errw, os.Stderr)
 	return cmd.Run()
+}
+
+// pickWriter returns w if non-nil, otherwise fallback.
+func pickWriter(w, fallback io.Writer) io.Writer {
+	if w != nil {
+		return w
+	}
+	return fallback
 }
 
 func truncate(s string, maxLen int) string {
@@ -983,6 +1018,36 @@ func firstLine(s string) string {
 		return s[:i]
 	}
 	return s
+}
+
+// chunkStrings splits s into consecutive slices each of length at most size.
+func chunkStrings(s []string, size int) [][]string {
+	if size <= 0 {
+		size = 20
+	}
+	var out [][]string
+	for len(s) > 0 {
+		n := size
+		if n > len(s) {
+			n = len(s)
+		}
+		out = append(out, s[:n])
+		s = s[n:]
+	}
+	return out
+}
+
+// envIntWF reads an integer from env, returns fallback on empty/invalid.
+func envIntWF(key string, fallback int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
 }
 
 // prefixWriter wraps w so that every newline-terminated line written to the

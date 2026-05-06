@@ -77,7 +77,7 @@ sleep 30
 	}()
 
 	start := time.Now()
-	err := RunFix(ctx, BackendClaude, "sonnet", "prompt", t.TempDir())
+	err := RunFix(ctx, BackendClaude, "sonnet", "prompt", t.TempDir(), nil, nil)
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("expected error on context cancellation")
@@ -117,7 +117,7 @@ sleep 30
 	t.Setenv("GH_CRFIX_FIX_TIMEOUT", "150ms")
 
 	start := time.Now()
-	err := RunFix(context.Background(), BackendClaude, "sonnet", "prompt", t.TempDir())
+	err := RunFix(context.Background(), BackendClaude, "sonnet", "prompt", t.TempDir(), nil, nil)
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("expected timeout error")

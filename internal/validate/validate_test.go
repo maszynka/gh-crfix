@@ -437,6 +437,50 @@ func TestRun_HookJSONInvalid_FallsBackToStdout(t *testing.T) {
 	}
 }
 
+// ---------- heartbeat ----------
+
+func TestRun_HeartbeatAppearsInStream(t *testing.T) {
+	skipIfWindows(t)
+	wt := t.TempDir()
+	hook := filepath.Join(wt, ".gh-crfix", "validate.sh")
+	// Sleep long enough for the fast heartbeat to fire at least once.
+	writeExec(t, hook, "#!/bin/sh\nsleep 0.4\nexit 0\n")
+	t.Setenv("GH_CRFIX_VALIDATE_HEARTBEAT", "100ms")
+
+	var stream strings.Builder
+	res := Run(nil, wt, Runner{Kind: RunnerHook, Command: hook}, &stream)
+	if !res.Success {
+		t.Fatalf("expected success, got %+v", res)
+	}
+	if !strings.Contains(stream.String(), "[validation]") {
+		t.Fatalf("expected heartbeat line in stream, got: %q", stream.String())
+	}
+}
+
+func TestRun_HeartbeatDisabledWhenZero(t *testing.T) {
+	skipIfWindows(t)
+	wt := t.TempDir()
+	hook := filepath.Join(wt, ".gh-crfix", "validate.sh")
+	writeExec(t, hook, "#!/bin/sh\nsleep 0.1\nexit 0\n")
+	t.Setenv("GH_CRFIX_VALIDATE_HEARTBEAT", "0")
+
+	var stream strings.Builder
+	Run(nil, wt, Runner{Kind: RunnerHook, Command: hook}, &stream)
+	if strings.Contains(stream.String(), "[validation]") {
+		t.Fatalf("expected no heartbeat when interval=0, got: %q", stream.String())
+	}
+}
+
+func TestRun_HeartbeatNilStream_NoPanic(t *testing.T) {
+	skipIfWindows(t)
+	wt := t.TempDir()
+	hook := filepath.Join(wt, ".gh-crfix", "validate.sh")
+	writeExec(t, hook, "#!/bin/sh\nexit 0\n")
+	t.Setenv("GH_CRFIX_VALIDATE_HEARTBEAT", "10ms")
+	// Must not panic when stream is nil.
+	Run(nil, wt, Runner{Kind: RunnerHook, Command: hook}, nil)
+}
+
 // ---------- helpers ----------
 
 func tail(s string, n int) string {

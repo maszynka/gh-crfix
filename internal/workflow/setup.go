@@ -340,8 +340,18 @@ func setupOnePR(
 		} else {
 			pr.Status = "failed"
 			pr.Reason = "worktree not clean"
-			logMaster("worktree dirty with no recoverable case collisions -- failing")
-			logPR("worktree dirty: %s", firstLine(dirty))
+			// Friendly error: a dirty worktree at this point means either
+			// (a) reuse mode was selected and the user has uncommitted work
+			// in their own worktree, or (b) auto-stash on borrow failed for
+			// some unusual reason. Either way, point them at the exact
+			// remediation rather than just printing the cryptic dirty list.
+			hint := fmt.Sprintf(
+				"worktree %s has uncommitted changes:\n%s\n"+
+					"  fix: commit or stash the changes there, "+
+					"or rerun with --isolated to give gh-crfix its own private checkout",
+				wtPath, firstLine(dirty))
+			logMaster("worktree dirty with no recoverable case collisions -- failing\n%s", hint)
+			logPR("%s", hint)
 			prog("failed (%s)", pr.Reason)
 			setStep(progress.Failed, pr.Reason)
 			markStatus(false)

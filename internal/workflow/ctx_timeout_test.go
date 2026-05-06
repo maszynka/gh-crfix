@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -73,7 +74,7 @@ func TestProcessPR_CancellationAbortsBeforeFix(t *testing.T) {
 	}
 
 	var fixCalled int32
-	runFixFn = func(_ context.Context, _ ai.Backend, _, _, _ string) error {
+	runFixFn = func(_ context.Context, _ ai.Backend, _, _, _ string, _, _ io.Writer) error {
 		atomic.AddInt32(&fixCalled, 1)
 		return nil
 	}
@@ -163,7 +164,7 @@ func TestProcessPR_GateErrorDoesNotMarkThreadsAlreadyFixed(t *testing.T) {
 		return ai.GateOutput{}, errors.New("gate boom")
 	}
 	var fixCalled int32
-	runFixFn = func(context.Context, ai.Backend, string, string, string) error {
+	runFixFn = func(context.Context, ai.Backend, string, string, string, io.Writer, io.Writer) error {
 		atomic.AddInt32(&fixCalled, 1)
 		return nil
 	}
